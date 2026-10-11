@@ -49,7 +49,6 @@ MANUAL_REFRESH_SECONDS = 2
 MAX_RANGE_VIDEOS = 150
 MAX_DISCOVER = 5000
 MAX_DASHBOARDS = 100
-MAX_COMPLETED_USERS = 200
 THUMB_LIMIT = 256 * 1024  # Bounded read of Telegram's returned still-image thumbnail.
 THUMB_REQUEST = 64 * 1024
 COVER_CHECK_SECONDS = 20
@@ -443,8 +442,6 @@ class DownloaderBot:
         self.pending_ranges: dict[int, RangeRequest] = {}
         self.dashboards: dict[int, Dashboard] = {}
         self.status_lock = asyncio.Lock()  # Serialize /status replacements.
-        # Keep only five completed status snapshots per user for six hours.
-        self.completed: dict[int, list[tuple[float, str]]] = {}
         self.slot = asyncio.Semaphore(1)
         self.turn = asyncio.Condition()  # Preserve enqueue order even if status edits are slow.
         self.max_bytes = env_int("MAX_FILE_MB", MAX_MT_MB, 1, MAX_MT_MB) * 1024 * 1024
@@ -511,17 +508,11 @@ class DownloaderBot:
         return [[Button.inline("🔄 Refresh all", data=f"d:{dashboard.token}:refresh".encode())]]
 
     def format_dashboard(self, uid: int) -> str:
+        # Only running and queued jobs are shown; finished or cancelled jobs disappear at once.
         active = self.user_jobs(uid)
-        now = time.monotonic()
-        history = [(when, text) for when, text in self.completed.get(uid, []) if now - when < 6 * 3600]
-        if history:
-            self.completed[uid] = history
-        else:
-            self.completed.pop(uid, None)
         panels = [self.format_job(job, include_metrics=False) for job in active]
-        panels += [text for _, text in reversed(history[-5:])]
         if not panels:
-            panels = ["No active or recent transfers. Send a link to begin."]
+            panels = ["No active transfers. Send a link to begin."]
         body = "📋 Your downloads\n\n" + "\n\n──────────\n\n".join(panels)
         if uid in self.lookups:
             body += "\n\n🔎 Looking up a link…"
@@ -1063,14 +1054,7 @@ class DownloaderBot:
     async def archive_job(self, job: Job) -> None:
         async with self.turn:
             if self.jobs.get(job.token) is job:
-                if job.state == "finished":
-                    if job.user_id not in self.completed and len(self.completed) >= MAX_COMPLETED_USERS:
-                        oldest = min(self.completed, key=lambda uid: self.completed[uid][-1][0])
-                        self.completed.pop(oldest, None)
-                    history = self.completed.setdefault(job.user_id, [])
-                    history.append((time.monotonic(), self.format_job(job, include_metrics=False)))
-                    self.completed[job.user_id] = history[-5:]
-                self.jobs.pop(job.token, None)
+                self.jobs.pop(job.token, None)  # Completed/cancelled jobs leave the status.
             self.turn.notify_all()
         await self.render_dashboard(job.user_id, force=True)
 
