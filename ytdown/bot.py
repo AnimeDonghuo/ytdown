@@ -31,7 +31,7 @@ from .core import (AUDIO, VIDEO_QUALITIES, PlaylistEntry, Source, Video, extract
 from .terabox import (TERABOX_API_URL, TeraboxFile, TeraboxListing, normalize_terabox,
                       parse_terabox_source)
 from .metrics import ContainerMetrics, human_size
-from .media import MediaProbe, thumbnail_jpeg
+from .media import MediaProbe, thumbnail_jpeg, usable_still
 
 LOG = logging.getLogger(__name__)
 API_URL = "https://samra-youtube-api.antideploy.com/"
@@ -50,6 +50,9 @@ MAX_RANGE_VIDEOS = 150
 MAX_DISCOVER = 5000
 MAX_DASHBOARDS = 100
 MAX_COMPLETED_USERS = 200
+THUMB_LIMIT = 256 * 1024  # Bounded read of Telegram's returned still-image thumbnail.
+THUMB_REQUEST = 64 * 1024
+COVER_CHECK_SECONDS = 20
 
 
 class PublicResolver(aiohttp.abc.AbstractResolver):
@@ -84,10 +87,34 @@ class UnknownLength(Exception):
     pass
 
 
-def media_name(title: str, quality: str, max_length: int) -> str:
-    """Keep the [quality] suffix even when a long video title is shortened."""
-    suffix = f" [{quality.upper() if quality == AUDIO else quality}]"
+# Subtitle markers that providers put in titles, e.g. "Episode 15 [MultiSub]".
+SUBTITLE_MARK = re.compile(r"[\[(]\s*(?:eng|multi)\s*sub(?:titles?)?\s*[\])]|\b(?:engsub|multisub)\b",
+                           re.IGNORECASE)
+
+
+def split_subtitle_tag(title: str) -> tuple[str, str]:
+    """Return (title without subtitle marker, '[MultiSub]' | '[EngSub]' | '').
+
+    The marker is moved after the quality label. If both appear, MultiSub wins.
+    """
+    kinds = {"multi" if "multi" in match.group().lower() else "eng"
+             for match in SUBTITLE_MARK.finditer(title)}
+    clean = " ".join(SUBTITLE_MARK.sub(" ", title).split()).strip(" -–—|·:,;/")
+    tag = "[MultiSub]" if "multi" in kinds else "[EngSub]" if kinds else ""
+    return clean, tag
+
+
+def media_name(title: str, quality: str, max_length: int, tag: str = "") -> str:
+    """Keep the [quality] (and optional subtitle) suffix even when a title is shortened."""
+    suffix = f" [{quality.upper() if quality == AUDIO else quality}]" + (f" {tag}" if tag else "")
     return (title[:max_length - len(suffix)].rstrip() or "YouTube video") + suffix
+
+
+def media_label(title: str, quality: str, max_length: int, position: str = "") -> str:
+    """Caption/status label such as '2/39 · Title [360p] [MultiSub]'."""
+    clean, tag = split_subtitle_tag(title)
+    prefix = f"{position} · " if position else ""
+    return prefix + media_name(clean, quality, max_length - len(prefix), tag)
 
 
 def cancel_entities(text: str) -> list[types.MessageEntityBotCommand]:
@@ -460,13 +487,16 @@ class DownloaderBot:
         eta = human_eta((total - job.uploaded) / job.speed) if total and job.speed > 1 else "—"
         waiting = [j for j in self.jobs.values() if j.state == "queued"]
         item = f"{job.item_index}/{job.item_total}" if job.item_total else "—"
-        title = job.title[:95] or ("Playlist" if job.source.kind == "playlist" else
-                                  "Terabox files" if job.source.kind.startswith("terabox") else "YouTube video")
-        quality = f" [{job.quality}]" if job.quality else ""
+        clean, tag = split_subtitle_tag(job.title)
+        title = clean[:95] or ("Playlist" if job.source.kind == "playlist" else
+                               "Terabox files" if job.source.kind.startswith("terabox") else "YouTube video")
+        position = f"{job.item_index}/{job.item_total} · " if job.item_total > 1 and job.item_index else ""
+        quality = (f" [{'MP3' if job.quality == AUDIO else job.quality}]" if job.quality else "") + (
+            f" {tag}" if tag else "")
         status = (f"Telegram rate limit: waiting {human_eta(job.rate_limit_until - now)}"
                   if job.rate_limit_until > now else job.detail)
         queue_note = f" · Queue #{waiting.index(job) + 1}" if job in waiting else ""
-        return (f"🎬 {title}{quality}\n"
+        return (f"🎬 {position}{title}{quality}\n"
                 f"📋 Video {item} · {job.state.title()}{queue_note}\n\n"
                 f"{'█' * filled}{'░' * (12 - filled)}  {ratio * 100:.1f}%\n"
                 f"⬆ Telegram: {human_size(job.uploaded)} / {human_size(total) if total else 'unknown'}\n"
@@ -1232,6 +1262,55 @@ class DownloaderBot:
         job.thumb_size = thumb[1:] if thumb else (0, 0)
         return job.thumbnail, *job.thumb_size
 
+    async def returned_still(self, message) -> bytes | None:
+        """Bounded download of Telegram's returned still-image thumbnail (None if missing)."""
+        document = getattr(message, "document", None)
+        if not isinstance(document, types.Document):
+            return None
+        stills = [thumb for thumb in (document.thumbs or [])
+                  if isinstance(thumb, (types.PhotoSize, types.PhotoCachedSize))]
+        if not stills:
+            return None
+        best = max(stills, key=lambda thumb: thumb.w * thumb.h)
+        if isinstance(best, types.PhotoCachedSize):  # Telegram already inlined these bytes.
+            data = bytes(best.bytes)
+            return data if 0 < len(data) <= THUMB_LIMIT else None
+        if best.size > THUMB_LIMIT:
+            return None
+        location = types.InputDocumentFileLocation(id=document.id, access_hash=document.access_hash,
+                                                   file_reference=document.file_reference,
+                                                   thumb_size=best.type)
+        data = bytearray()
+        async for chunk in self.client.iter_download(location, file_size=best.size, request_size=THUMB_REQUEST):
+            data.extend(chunk)
+            if len(data) > THUMB_LIMIT:
+                return None
+        return bytes(data) or None
+
+    async def ensure_cover(self, job: Job, message, cover: bytes | None) -> None:
+        """Reply to the delivered video with our JPEG if Telegram's still is missing or white.
+
+        Failures are logged only. The video itself is never re-sent here.
+        """
+        if message is None:
+            return  # Nothing was returned to inspect.
+        try:
+            still = await asyncio.wait_for(self.returned_still(message), timeout=COVER_CHECK_SECONDS)
+            if still and await asyncio.to_thread(usable_still, still):
+                return
+        except Exception as exc:
+            LOG.info("Could not read Telegram's returned preview: %s", type(exc).__name__)
+        if not cover:
+            LOG.info("Telegram's preview is missing or white and no prepared cover exists")
+            return
+        try:
+            photo = io.BytesIO(cover)
+            photo.name = "cover.jpg"
+            await self.client.send_file(job.peer, photo, reply_to=message.id, force_document=False)
+            LOG.info("Sent a separate cover photo for the video")
+        except Exception:
+            LOG.warning("Could not send the cover photo; the video remains in the chat", exc_info=True)
+
     async def send_stream(self, job: Job, video: Video, quality: str, url: str, index: int, total: int,
                           source_file: TeraboxFile | None = None) -> None:
         suffix = (Path(source_file.filename).suffix.lower() if source_file else
@@ -1241,10 +1320,14 @@ class DownloaderBot:
         video_file = source_file.video if source_file else not audio
         streamable = video_file and suffix == ".mp4"
         job.thumbnail_urls = source_file.thumbnail_urls if source_file else ()
-        safe_title = re.sub(r"[^\w .-]", "_", video.title, flags=re.UNICODE).strip(" .") or "video"
-        filename = media_name(safe_title, quality, 100) + suffix
-        prefix = f"{index}/{total} · " if total > 1 else ""
-        caption = prefix + media_name(video.title, quality, 750 - len(prefix))
+        # Subtitle markers move after the quality; playlist items get "02-39" filenames
+        # and "2/39 ·" captions/status titles so that files sort in playlist order.
+        clean_title, subtitle_tag = split_subtitle_tag(video.title)
+        safe_title = re.sub(r"[^\w .-]", "_", clean_title, flags=re.UNICODE).strip(" .") or "video"
+        width = max(2, len(str(total)))
+        file_prefix = f"{index:0{width}d}-{total:0{width}d} " if total > 1 else ""
+        filename = file_prefix + media_name(safe_title, quality, 100 - len(file_prefix), subtitle_tag) + suffix
+        caption = media_label(video.title, quality, 750, position=f"{index}/{total}" if total > 1 else "")
         def on_total(count: int) -> None:
             job.total_bytes = count
 
@@ -1292,7 +1375,7 @@ class DownloaderBot:
                         job.source.kind)
         if audio:
             attributes = [types.DocumentAttributeAudio(duration=video.duration,
-                                                       title=media_name(video.title, quality, 64))]
+                                                       title=media_label(video.title, quality, 64))]
         elif video_file:
             # ffprobe inspects the actual MP4 head/tail. API duration and image
             # dimensions are fallbacks only if its metadata cannot be parsed.
@@ -1303,44 +1386,52 @@ class DownloaderBot:
         else:
             attributes = None
 
-        async def send_with_preview(*, document: bool = False, with_thumb: bool = True) -> None:
+        async def send_with_preview(*, document: bool = False, with_thumb: bool = True):
             thumb_file = None
             if thumb_data and with_thumb:
                 thumb_file = io.BytesIO(thumb_data)
                 thumb_file.name = "preview.jpg"
-            await self.client.send_file(job.peer, uploaded, caption=caption, parse_mode=None,
-                                        mime_type=(source_file.mime if source_file else
-                                                   "audio/mpeg" if audio else "video/mp4"),
-                                        attributes=attributes, supports_streaming=streamable and not document,
-                                        force_document=document or (source_file is not None and not streamable and not audio),
-                                        thumb=thumb_file)
+            # MP4s stay inline (streamable video) unless Telegram refuses them as video.
+            return await self.client.send_file(job.peer, uploaded, caption=caption, parse_mode=None,
+                                               mime_type=(source_file.mime if source_file else
+                                                          "audio/mpeg" if audio else "video/mp4"),
+                                               attributes=attributes,
+                                               supports_streaming=streamable and not document,
+                                               force_document=document or (
+                                                   source_file is not None and not streamable and not audio),
+                                               thumb=thumb_file)
 
-        async def deliver() -> None:
+        async def deliver():
+            # These retries only follow a rejected send, so the video was not delivered yet.
+            # The uploaded handle is reused; bytes are never streamed again.
             try:
-                await send_with_preview()
+                return await send_with_preview()
             except (PhotoInvalidDimensionsError, PhotoInvalidError):
                 LOG.warning("Telegram rejected the prepared thumbnail for %s", job.source.kind)
-                await send_with_preview(with_thumb=False)
+                return await send_with_preview(with_thumb=False)
             except VideoContentTypeInvalidError:
                 if audio:
                     raise
-                # Reuse the handle if Telegram rejects the MP4 as streamable.
+                # Last resort: Telegram refused the MP4 as video, so send the same handle as a document.
                 try:
-                    await send_with_preview(document=True)
+                    return await send_with_preview(document=True)
                 except (PhotoInvalidDimensionsError, PhotoInvalidError):
-                    await send_with_preview(document=True, with_thumb=False)
+                    return await send_with_preview(document=True, with_thumb=False)
 
+        sent_message = None
         for attempt in range(3):
             try:
-                await deliver()
+                sent_message = await deliver()
                 job.rate_limit_until = 0
-                return
+                break
             except FloodWaitError as exc:
                 if attempt == 2 or exc.seconds > 300:
                     raise
                 job.rate_limit_until = time.monotonic() + exc.seconds + 1
                 await asyncio.sleep(exc.seconds + 1)
-        # All retries either returned or raised above.
+        # The video is delivered now. Cover problems below must never re-send it.
+        if video_file:
+            await self.ensure_cover(job, sent_message, thumb_data)
 
 
 async def serve(token: str, api_id: int, api_hash: str) -> None:

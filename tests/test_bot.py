@@ -1,16 +1,46 @@
 import asyncio
+import io
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from ytdown.bot import (DownloaderBot, FileTooLarge, HTTPReader, Job, MAX_MT_MB, MAX_PARTS,
                         PART_BYTES, Selection, UnknownLength, choose_title, get_youtube_title,
-                        media_name, upload_parts, upload_stream)
+                        media_label, media_name, split_subtitle_tag, upload_parts, upload_stream)
 from ytdown.core import PlaylistEntry, Source, Video
 from ytdown.media import MediaInfo
 
 VIDEO_URL = "https://www.youtube.com/watch?v=3SY1i5CB03Q"
 CDN_URL = "https://cdn.example.com/video.mp4"
+
+
+def jpeg_image(color=(30, 110, 170), size=(320, 180)) -> bytes:
+    """A JPEG that is not a blank placeholder (a red stripe on the left unless white)."""
+    from PIL import Image, ImageDraw
+    image = Image.new("RGB", size, color)
+    if color != (255, 255, 255):
+        ImageDraw.Draw(image).rectangle((0, 0, size[0] // 3, size[1]), fill=(200, 40, 40))
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=80)
+    return out.getvalue()
+
+
+GOOD_STILL = jpeg_image()
+WHITE_STILL = jpeg_image((255, 255, 255))
+COVER = jpeg_image((12, 200, 90))
+
+
+def returned_video(*thumbs, message_id: int = 7):
+    """The Message-like object Telethon returns after a successful send_file."""
+    from telethon.tl import types
+    document = types.Document(id=1, access_hash=2, file_reference=b"", date=None, mime_type="video/mp4",
+                              size=10, dc_id=1, attributes=[], thumbs=list(thumbs))
+    return SimpleNamespace(id=message_id, document=document)
+
+
+def cached_still(data: bytes):
+    from telethon.tl import types
+    return types.PhotoCachedSize(type="m", w=320, h=180, bytes=data)
 
 
 class FakeContent:
@@ -234,7 +264,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_filename_and_caption_on_mtproto_send(self):
         client = MagicMock()
-        client.send_file = AsyncMock()
+        client.send_file = AsyncMock(return_value=returned_video(cached_still(GOOD_STILL)))
         client.edit_message = AsyncMock()
         service = DownloaderBot(client, MagicMock())
         video = Video("A real YouTube video title", {"480p": CDN_URL})
@@ -244,8 +274,9 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
              patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo(884, 1080, 1920))):
             await service.send_stream(job, video, "480p", CDN_URL, 1, 3)
             await service.send_stream(job, video, "mp3", CDN_URL, 2, 3)
-        self.assertEqual(upload.await_args_list[0].args[3], "A real YouTube video title [480p].mp4")
-        self.assertEqual(upload.await_args_list[1].args[3], "A real YouTube video title [MP3].mp3")
+        # Playlist-style multi-item jobs use zero-padded "01-03" filenames.
+        self.assertEqual(upload.await_args_list[0].args[3], "01-03 A real YouTube video title [480p].mp4")
+        self.assertEqual(upload.await_args_list[1].args[3], "02-03 A real YouTube video title [MP3].mp3")
         self.assertEqual(client.send_file.await_args_list[0].kwargs["caption"],
                          "1/3 · A real YouTube video title [480p]")
         self.assertEqual(client.send_file.await_args_list[1].kwargs["mime_type"], "audio/mpeg")
@@ -253,11 +284,12 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((attr.duration, attr.w, attr.h), (884, 1080, 1920))
         self.assertEqual(client.send_file.await_args_list[0].kwargs["thumb"].name, "preview.jpg")
         self.assertTrue(media_name("X" * 250, "480p", 80).endswith(" [480p]"))
+        self.assertEqual(client.send_file.await_count, 2)  # Two videos; no unexpected cover photos.
 
     async def test_api_duration_and_thumbnail_shape_if_probe_unavailable(self):
         client = MagicMock()
         client.edit_message = AsyncMock()
-        client.send_file = AsyncMock()
+        client.send_file = AsyncMock(return_value=returned_video(cached_still(GOOD_STILL)))
         service = DownloaderBot(client, MagicMock())
         service.video_thumbnail = AsyncMock(return_value=(b"jpeg", 320, 180))
         video = Video("Video", {"480p": CDN_URL}, duration=884)
@@ -569,3 +601,221 @@ class QueueAndAPISettingsTests(unittest.IsolatedAsyncioTestCase):
         await service.on_message(event)
         self.assertEqual(service.api_for(7), API_URL)
         self.assertEqual(service.selections[7].api_endpoint, endpoint)  # Existing selections keep their API.
+
+
+class LabelTests(unittest.TestCase):
+    def test_subtitle_marker_moves_after_quality(self):
+        self.assertEqual(split_subtitle_tag("One Way or Another Episode 15 [MultiSub]"),
+                         ("One Way or Another Episode 15", "[MultiSub]"))
+        self.assertEqual(split_subtitle_tag("One Way or Another - Episode 15 (EngSub)"),
+                         ("One Way or Another - Episode 15", "[EngSub]"))
+        self.assertEqual(split_subtitle_tag("Show Eng Sub 2 [engsub]")[1], "[EngSub]")
+        self.assertEqual(split_subtitle_tag("Plain title"), ("Plain title", ""))
+        self.assertEqual(split_subtitle_tag("Both [EngSub] [MultiSub]")[1], "[MultiSub]")
+        self.assertEqual(split_subtitle_tag("[MultiSub]"), ("", "[MultiSub]"))
+
+    def test_position_quality_and_subtitle_label(self):
+        self.assertEqual(media_label("One Way or Another Episode 15 [MultiSub]", "360p", 750, "2/39"),
+                         "2/39 · One Way or Another Episode 15 [360p] [MultiSub]")
+        self.assertEqual(media_label("Episode 15 (EngSub)", "mp3", 750, "2/39"),
+                         "2/39 · Episode 15 [MP3] [EngSub]")
+        self.assertEqual(media_label("Plain", "720p", 750), "Plain [720p]")
+
+    def test_long_title_keeps_position_quality_and_subtitle(self):
+        label = media_label("X" * 900 + " [MultiSub]", "1080p", 750, "10/150")
+        self.assertLessEqual(len(label), 750)
+        self.assertTrue(label.startswith("10/150 · X"))
+        self.assertTrue(label.endswith(" [1080p] [MultiSub]"))
+        self.assertTrue(media_name("X" * 250, "480p", 80, "[EngSub]").endswith(" [480p] [EngSub]"))
+
+    def test_status_title_starts_with_position(self):
+        service = DownloaderBot(MagicMock(), MagicMock())
+        job = Job(1, "peer", 2, Source("playlist", "url"), ("360p",), None, state="running",
+                  title="One Way or Another Episode 15 [MultiSub]", quality="360p",
+                  item_index=2, item_total=39)
+        service.jobs[job.token] = job
+        text = service.format_job(job, include_metrics=False)
+        self.assertTrue(text.startswith("🎬 2/39 · One Way or Another Episode 15 [360p] [MultiSub]\n"), text)
+        single = Job(1, "peer", 3, Source("video", VIDEO_URL), ("mp3",), None, state="running",
+                     title="Solo [EngSub]", quality="mp3", item_index=1, item_total=1)
+        self.assertTrue(service.format_job(single, include_metrics=False).startswith(
+            "🎬 Solo [MP3] [EngSub]\n"))
+
+
+class PlaylistLabelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_playlist_filename_caption_and_inline_options(self):
+        client = MagicMock()
+        client.edit_message = AsyncMock()
+        client.send_file = AsyncMock(return_value=returned_video(cached_still(GOOD_STILL)))
+        service = DownloaderBot(client, MagicMock())
+        service.video_thumbnail = AsyncMock(return_value=(COVER, 320, 180))
+        video = Video("One Way or Another Episode 15 [MultiSub]", {"360p": CDN_URL})
+        job = Job(1, "peer", 2, Source("playlist", "url"), ("360p",), None, item_total=39)
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="handle")) as upload, \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo(600, 640, 360))):
+            await service.send_stream(job, video, "360p", CDN_URL, 2, 39)
+        self.assertEqual(upload.await_args.args[3], "02-39 One Way or Another Episode 15 [360p] [MultiSub].mp4")
+        options = client.send_file.await_args.kwargs
+        self.assertEqual(options["caption"], "2/39 · One Way or Another Episode 15 [360p] [MultiSub]")
+        # Playable inline: streamable MP4, not forced to a document.
+        self.assertFalse(options["force_document"])
+        self.assertTrue(options["supports_streaming"])
+        self.assertEqual(options["mime_type"], "video/mp4")
+        self.assertEqual(client.send_file.await_count, 1)
+
+    async def test_three_digit_playlist_index_is_padded_to_total_width(self):
+        client = MagicMock()
+        client.edit_message = AsyncMock()
+        client.send_file = AsyncMock(return_value=returned_video(cached_still(GOOD_STILL)))
+        service = DownloaderBot(client, MagicMock())
+        service.video_thumbnail = AsyncMock(return_value=(None, 0, 0))
+        video = Video("Episode", {"480p": CDN_URL})
+        job = Job(1, "peer", 2, Source("playlist", "url"), ("480p",), None, item_total=150)
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="handle")) as upload, \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo())):
+            await service.send_stream(job, video, "480p", CDN_URL, 2, 150)
+        self.assertEqual(upload.await_args.args[3], "002-150 Episode [480p].mp4")
+        self.assertEqual(client.send_file.await_args.kwargs["caption"], "2/150 · Episode [480p]")
+
+    async def test_single_video_has_no_position_prefix(self):
+        client = MagicMock()
+        client.edit_message = AsyncMock()
+        client.send_file = AsyncMock(return_value=returned_video(cached_still(GOOD_STILL)))
+        service = DownloaderBot(client, MagicMock())
+        service.video_thumbnail = AsyncMock(return_value=(None, 0, 0))
+        video = Video("Solo [EngSub]", {"480p": CDN_URL})
+        job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), video)
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="handle")) as upload, \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo())):
+            await service.send_stream(job, video, "480p", CDN_URL, 1, 1)
+        self.assertEqual(upload.await_args.args[3], "Solo [480p] [EngSub].mp4")
+        self.assertEqual(client.send_file.await_args.kwargs["caption"], "Solo [480p] [EngSub]")
+
+
+class CoverTests(unittest.IsolatedAsyncioTestCase):
+    """After a video is delivered, Telegram's returned still is checked; a missing or white one gets a reply cover."""
+
+    def make_service(self, *, iter_download=None, send_results=None):
+        client = MagicMock()
+        client.edit_message = AsyncMock()
+        client.send_file = AsyncMock(side_effect=send_results)
+        if iter_download is not None:
+            client.iter_download = iter_download
+        service = DownloaderBot(client, MagicMock())
+        service.video_thumbnail = AsyncMock(return_value=(COVER, 320, 180))
+        self.job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("360p",), None)
+        self.video = Video("Cover test", {"360p": CDN_URL})
+        return service
+
+    async def stream(self, service, quality="360p", url=CDN_URL, *, mime_probe=True):
+        video = self.video if quality != "mp3" else Video("Cover test", {"mp3": CDN_URL})
+        job = self.job if quality != "mp3" else Job(1, "peer", 2, Source("video", VIDEO_URL), ("mp3",), None)
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="handle")) as upload, \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo(60, 640, 360))):
+            await service.send_stream(job, video, quality, url, 1, 1)
+        return upload
+
+    async def test_healthy_returned_still_sends_no_cover(self):
+        service = self.make_service(send_results=[returned_video(cached_still(GOOD_STILL))])
+        upload = await self.stream(service)
+        upload.assert_awaited_once()
+        self.assertEqual(service.client.send_file.await_count, 1)
+
+    async def test_missing_still_gets_reply_photo_without_reuploading_video(self):
+        service = self.make_service(send_results=[returned_video(), SimpleNamespace(id=9)])
+        upload = await self.stream(service)
+        upload.assert_awaited_once()  # The video bytes were uploaded only once.
+        self.assertEqual(service.client.send_file.await_count, 2)
+        video_call, cover_call = service.client.send_file.await_args_list
+        self.assertIs(video_call.args[1], "handle")
+        self.assertEqual(cover_call.kwargs["reply_to"], 7)
+        self.assertFalse(cover_call.kwargs["force_document"])
+        photo = cover_call.args[1]
+        self.assertEqual(photo.name, "cover.jpg")
+        self.assertEqual(photo.getvalue(), COVER)
+
+    async def test_healthy_downloaded_still_is_checked_without_cover(self):
+        from telethon.tl import types
+        requested = []
+
+        async def download(location, file_size=None, request_size=None):
+            requested.append((location.thumb_size, file_size, request_size))
+            for start in range(0, len(GOOD_STILL), 4096):
+                yield GOOD_STILL[start:start + 4096]
+
+        still = types.PhotoSize(type="m", w=320, h=180, size=len(GOOD_STILL))
+        service = self.make_service(iter_download=download, send_results=[returned_video(still)])
+        await self.stream(service)
+        self.assertEqual(requested, [("m", len(GOOD_STILL), 64 * 1024)])
+        self.assertEqual(service.client.send_file.await_count, 1)
+
+    async def test_stripped_placeholder_only_counts_as_missing(self):
+        from telethon.tl import types
+        stripped = types.PhotoStrippedSize(type="i", bytes=b"\x01\x02")
+        service = self.make_service(send_results=[returned_video(stripped), SimpleNamespace(id=9)])
+        await self.stream(service)
+        self.assertEqual(service.client.send_file.await_count, 2)
+
+    async def test_white_still_is_replaced_with_cover(self):
+        service = self.make_service(send_results=[returned_video(cached_still(WHITE_STILL)), None])
+        await self.stream(service)
+        self.assertEqual(service.client.send_file.await_count, 2)
+        self.assertEqual(service.client.send_file.await_args.kwargs["reply_to"], 7)
+
+    async def test_unreadable_downloaded_still_counts_as_missing(self):
+        from telethon.tl import types
+
+        def broken_download(*args, **kwargs):
+            raise ConnectionError("thumbnail download dropped")
+
+        still = types.PhotoSize(type="m", w=320, h=180, size=4000)
+        service = self.make_service(iter_download=broken_download,
+                                    send_results=[returned_video(still), SimpleNamespace(id=9)])
+        await self.stream(service)
+        self.assertEqual(service.client.send_file.await_count, 2)
+
+    async def test_oversized_returned_still_download_is_bounded(self):
+        from telethon.tl import types
+        chunks_read = []
+
+        async def endless(location, file_size=None, request_size=None):
+            while True:  # A misbehaving server could stream forever.
+                chunks_read.append(1)
+                yield b"\x00" * request_size
+
+        still = types.PhotoSize(type="m", w=320, h=180, size=4000)
+        service = self.make_service(iter_download=endless,
+                                    send_results=[returned_video(still), SimpleNamespace(id=9)])
+        await self.stream(service)
+        self.assertLessEqual(len(chunks_read), 5)  # Stops right after the 256 KiB cap.
+        self.assertEqual(service.client.send_file.await_count, 2)  # Treated as missing.
+
+    async def test_cover_failure_never_resends_the_video(self):
+        from telethon.errors import RPCError
+        service = self.make_service(send_results=[returned_video(), RPCError(None, "PHOTO_SAVE_FILE_INVALID", 400)])
+        upload = await self.stream(service)  # Must not raise.
+        upload.assert_awaited_once()
+        self.assertEqual(service.client.send_file.await_count, 2)
+        self.assertNotIn("handle", [call.args[1] for call in service.client.send_file.await_args_list[1:]])
+
+    async def test_rejected_video_thumb_resends_only_the_failed_send_then_checks_cover(self):
+        from telethon.errors import PhotoInvalidDimensionsError
+        service = self.make_service(send_results=[PhotoInvalidDimensionsError(None),
+                                                  returned_video(), SimpleNamespace(id=9)])
+        upload = await self.stream(service)
+        upload.assert_awaited_once()
+        self.assertEqual(service.client.send_file.await_count, 3)
+        self.assertIsNotNone(service.client.send_file.await_args_list[0].kwargs["thumb"])
+        self.assertIsNone(service.client.send_file.await_args_list[1].kwargs["thumb"])
+        self.assertEqual(service.client.send_file.await_args_list[2].kwargs["reply_to"], 7)
+
+    async def test_audio_never_gets_a_cover(self):
+        service = self.make_service(send_results=[returned_video()])
+        await self.stream(service, quality="mp3", url=CDN_URL)
+        self.assertEqual(service.client.send_file.await_count, 1)
+
+    async def test_no_prepared_cover_leaves_video_alone(self):
+        service = self.make_service(send_results=[returned_video()])
+        service.video_thumbnail = AsyncMock(return_value=(None, 0, 0))
+        await self.stream(service)
+        self.assertEqual(service.client.send_file.await_count, 1)
