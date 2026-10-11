@@ -469,7 +469,9 @@ class LiveStatusTests(unittest.IsolatedAsyncioTestCase):
 
 class QueueAndAPISettingsTests(unittest.IsolatedAsyncioTestCase):
     async def test_multiple_links_from_same_user_can_queue_and_cancel_individually(self):
-        service = DownloaderBot(MagicMock(), MagicMock())
+        client = MagicMock()
+        client.delete_messages = AsyncMock()
+        service = DownloaderBot(client, MagicMock())
         service.run_job = AsyncMock()
         existing = Job(7, "peer", 10, Source("video", VIDEO_URL), ("480p",), None, state="running")
         service.jobs[existing.token] = existing
@@ -488,9 +490,11 @@ class QueueAndAPISettingsTests(unittest.IsolatedAsyncioTestCase):
         await service.callback(click)
         self.assertEqual(len(service.user_jobs(7)), 2)
         event.raw_text = "/queue"
+        event.respond.return_value = SimpleNamespace(id=55)
         await service.on_message(event)
-        self.assertIn("Your jobs (2)", event.respond.call_args.args[0])
-        self.assertIn("queue #1", event.respond.call_args.args[0])
+        self.assertIn("Your downloads", event.respond.call_args.args[0])
+        self.assertIn("Queue #1", event.respond.call_args.args[0])
+        self.assertIn(existing.token, event.respond.call_args.args[0])
         second = next(j for j in service.user_jobs(7) if j is not existing)
         await second.task
         wrong_user = SimpleNamespace(sender_id=8, data=f"j:{second.token}:cancel".encode(),

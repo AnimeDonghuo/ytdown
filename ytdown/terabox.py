@@ -12,7 +12,7 @@ from .core import public_https_url
 
 TERABOX_API_URL = "https://samratbdownload.krishnalucky193.workers.dev/"
 TERABOX_HOSTS = ("terabox.com", "1024terabox.com", "teraboxapp.com", "teraboxlink.com",
-                 "teraboxshare.com", "terasharelink.com", "terabox.fun")
+                 "teraboxshare.com", "terasharelink.com", "terasharefile.com", "terabox.fun")
 MAX_TERABOX_FILES = 500
 
 

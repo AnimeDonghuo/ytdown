@@ -48,6 +48,8 @@ REPORT_SECONDS = 12  # Automatic edits: keep well below Telegram flood limits.
 MANUAL_REFRESH_SECONDS = 2
 MAX_RANGE_VIDEOS = 150
 MAX_DISCOVER = 5000
+MAX_DASHBOARDS = 100
+MAX_COMPLETED_USERS = 200
 
 
 class PublicResolver(aiohttp.abc.AbstractResolver):
@@ -120,6 +122,18 @@ class RangeRequest:
     api_endpoint: str = API_URL
     listing: TeraboxListing | None = None
     created: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class Dashboard:
+    peer: object
+    message_id: int
+    token: str = field(default_factory=lambda: secrets.token_hex(4))
+    created: float = field(default_factory=time.monotonic)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    next_edit: float = 0.0
+    edit_flood_until: float = 0.0
+    last_manual: float = 0.0
 
 
 @dataclass
@@ -381,6 +395,10 @@ class DownloaderBot:
         self.modes: dict[int, str] = {}
         self.mode_tokens: dict[int, str] = {}
         self.pending_ranges: dict[int, RangeRequest] = {}
+        self.dashboards: dict[int, Dashboard] = {}
+        self.status_lock = asyncio.Lock()  # Serialize /status replacements.
+        # Keep only a few completed status snapshots per user for one hour.
+        self.completed: dict[int, list[tuple[float, str]]] = {}
         self.slot = asyncio.Semaphore(1)
         self.turn = asyncio.Condition()  # Preserve enqueue order even if status edits are slow.
         self.max_bytes = env_int("MAX_FILE_MB", MAX_MT_MB, 1, MAX_MT_MB) * 1024 * 1024
@@ -402,7 +420,7 @@ class DownloaderBot:
 
     def register(self) -> None:
         self.client.add_event_handler(self.on_message, events.NewMessage(incoming=True))
-        self.client.add_event_handler(self.callback, events.CallbackQuery(pattern=rb"^(s|j|m):"))
+        self.client.add_event_handler(self.callback, events.CallbackQuery(pattern=rb"^(s|j|m|d):"))
 
     def job_buttons(self, job: Job):
         if job.state == "finished":
@@ -410,7 +428,7 @@ class DownloaderBot:
         return [[Button.inline("🔄 Refresh", data=f"j:{job.token}:refresh".encode()),
                  Button.inline("✖ Cancel", data=f"j:{job.token}:cancel".encode())]]
 
-    def format_job(self, job: Job) -> str:
+    def format_job(self, job: Job, *, include_metrics: bool = True) -> str:
         now = time.monotonic()
         elapsed = now - job.sample_at
         if elapsed >= 3:
@@ -436,10 +454,91 @@ class DownloaderBot:
                 f"⬇ Source: {human_size(job.downloaded)}\n"
                 f"🚀 {human_size(job.speed)}/s · ⏳ ETA {eta}\n\n"
                 f"📌 {status}\n"
-                f"📊 {self.metrics.describe()}\n"
-                f"Tasks in bot: {len(self.jobs)} · /cancel")
+                f"🆔 {job.token} · /cancel {job.token}"
+                + (f"\n📊 {self.metrics.describe()}\nTasks in bot: {len(self.jobs)}" if include_metrics else ""))
+
+    def dashboard_buttons(self, uid: int, dashboard: Dashboard):
+        rows = [[Button.inline("🔄 Refresh all", data=f"d:{dashboard.token}:refresh".encode())]]
+        rows.extend([Button.inline(f"✖ Cancel {job.token}", data=f"j:{job.token}:cancel".encode())]
+                    for job in self.user_jobs(uid))
+        return rows
+
+    def format_dashboard(self, uid: int) -> str:
+        active = self.user_jobs(uid)
+        now = time.monotonic()
+        history = [(when, text) for when, text in self.completed.get(uid, []) if now - when < 3600]
+        if history:
+            self.completed[uid] = history
+        else:
+            self.completed.pop(uid, None)
+        panels = [self.format_job(job, include_metrics=False) for job in active]
+        panels += [text for _, text in reversed(history[-2:])]
+        if not panels:
+            panels = ["No active or recent transfers. Send a link to begin."]
+        body = "📋 Your downloads\n\n" + "\n\n──────────\n\n".join(panels)
+        if uid in self.lookups:
+            body += "\n\n🔎 Looking up a link…"
+        body += (f"\n\n📊 {self.metrics.describe()}\n"
+                 f"Active/queued: {len(active)} · /cancel lists job IDs")
+        # Leave room for UTF-16 surrogate pairs (Telegram's 4,096-unit limit).
+        return body if len(body) <= 3600 else body[:3500] + "\n… use /cancel for job IDs."
+
+    async def render_dashboard(self, uid: int, *, force: bool = False) -> None:
+        dashboard = self.dashboards.get(uid)
+        if not dashboard:
+            return
+        async with dashboard.lock:
+            if self.dashboards.get(uid) is not dashboard:
+                return
+            now = time.monotonic()
+            if now < dashboard.edit_flood_until or (not force and now < dashboard.next_edit):
+                return
+            dashboard.next_edit = now + REPORT_SECONDS
+            try:
+                await self.client.edit_message(dashboard.peer, dashboard.message_id,
+                                               self.format_dashboard(uid), parse_mode=None,
+                                               buttons=self.dashboard_buttons(uid, dashboard))
+            except MessageNotModifiedError:
+                pass
+            except FloodWaitError as exc:
+                dashboard.edit_flood_until = time.monotonic() + exc.seconds + 3
+                dashboard.next_edit = dashboard.edit_flood_until
+            except RPCError:
+                LOG.warning("Could not update dashboard for %s; will retry", uid, exc_info=True)
+
+    async def show_dashboard(self, event) -> None:
+        async with self.status_lock:
+            await self._show_dashboard_locked(event)
+
+    async def _show_dashboard_locked(self, event) -> None:
+        uid = event.sender_id
+        if uid not in self.dashboards and len(self.dashboards) >= MAX_DASHBOARDS:
+            idle = [(owner, panel) for owner, panel in self.dashboards.items()
+                    if not self.user_jobs(owner)]
+            if not idle:
+                await event.respond("Too many live status dashboards. Please try again later.")
+                return
+            oldest = min(idle, key=lambda item: item[1].created)[0]
+            self.dashboards.pop(oldest, None)
+        old = self.dashboards.get(uid)
+        dashboard = Dashboard(await event.get_input_chat(), 0)
+        message = await event.respond(self.format_dashboard(uid), parse_mode=None,
+                                      buttons=self.dashboard_buttons(uid, dashboard))
+        dashboard.message_id = message.id
+        self.dashboards[uid] = dashboard
+        ids = [job.message_id for job in self.user_jobs(uid) if job.message_id != message.id]
+        if old and old.message_id != message.id:
+            ids.append(old.message_id)
+        if ids:
+            try:
+                await self.client.delete_messages(dashboard.peer, list(set(ids)))
+            except RPCError:
+                LOG.warning("Could not remove old status panels", exc_info=True)
 
     async def render(self, job: Job, *, force: bool = False) -> None:
+        if job.user_id in self.dashboards:
+            await self.render_dashboard(job.user_id, force=force)
+            return
         async with job.edit_lock:
             now = time.monotonic()
             if now < job.edit_flood_until or (not force and now < job.next_edit):
@@ -477,7 +576,9 @@ class DownloaderBot:
                 "Send another link while a job runs to queue it. Transfers stay sequential.\n\n"
                 "A watch link containing list= is treated as a playlist; remove it for just one video.\n\n"
                 "/change — YouTube / Terabox buttons\n"
-                "/status or /queue — jobs and queue positions\n/cancel [job-id] — cancel a job\n"
+                "/status or /queue — one live status for running, queued and recent jobs\n"
+                "/cancel — list job IDs; /cancel <job-id> stops one\n"
+                "/apis — numbered API list; /apis remove 3 resets a custom API\n"
                 "/changeapi — set your YouTube API; /changeapi reset restores default\n"
                 "/limits — size and queue limits\n/help — these instructions\n\n"
                 "Only download media you have permission to use.")
@@ -518,45 +619,64 @@ class DownloaderBot:
                 else:
                     await event.respond("Custom API saved for your future links. /changeapi reset restores the default.")
         elif command in ("/status", "/queue"):
+            await self.show_dashboard(event)
+        elif command == "/apis":
             uid = event.sender_id
-            owned = self.user_jobs(uid)
-            if len(owned) == 1:
-                await event.respond(self.format_job(owned[0]), buttons=self.job_buttons(owned[0]), parse_mode=None)
-            elif owned:
-                lines = [f"Your jobs ({len(owned)}):"]
-                for job in owned:
-                    pos = [j for j in self.jobs.values() if j.state == "queued"].index(job) + 1 if job.state == "queued" else 0
-                    label = f"queue #{pos}" if pos else "running"
-                    lines.append(f"• {job.token} · {label} · {job.title[:55] or job.source.kind} "
-                                 f"[{', '.join(job.selected)}] · {job.item_index}/{job.item_total or '?'}")
-                lines.append("Each job message has Refresh and Cancel. /cancel <job-id> cancels a specific job.")
-                await event.respond("\n".join(lines), parse_mode=None)
-            elif uid in self.lookups:
-                await event.respond("Looking up video qualities; the provider may take a few minutes.")
-            elif uid in self.selections:
-                await event.respond("Choose qualities and tap Done, or send a new link.")
+            arg = text.split(maxsplit=2)
+            if len(arg) == 3 and arg[1].lower() == "remove" and arg[2] == "3":
+                if self.api_overrides.pop(uid, None):
+                    self.awaiting_api.discard(uid)
+                    await event.respond("Custom YouTube API #3 removed. Future links use the default; queued jobs are unchanged.")
+                else:
+                    await event.respond("No custom API #3 to remove.")
+            elif len(arg) == 3 and arg[1].lower() == "remove" and arg[2] in ("1", "2"):
+                await event.respond("Built-in APIs #1 and #2 cannot be removed. Use /apis remove 3 for a custom API.")
+            elif len(arg) > 1:
+                await event.respond("Use /apis to list providers or /apis remove 3 to reset your custom YouTube API.")
             else:
-                await event.respond(f"No active jobs. Send a {self.modes.get(uid, 'youtube').title()} link to begin.")
+                custom = self.api_overrides.get(uid)
+                lines = ["Configured APIs (for your account):",
+                         f"1. YouTube default: {API_URL}" + (" (inactive)" if custom else " (active)"),
+                         f"2. Terabox: {TERABOX_API_URL} (built-in)"]
+                if custom:
+                    lines.append(f"3. YouTube custom: {custom} (active; /apis remove 3)")
+                lines.append("Built-in APIs cannot be removed. /changeapi sets a custom YouTube API.")
+                await event.respond("\n".join(lines), parse_mode=None)
         elif command == "/cancel":
             uid = event.sender_id
-            task = self.lookups.get(uid)
-            target = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+            target = text.partition(" ")[2].strip()
             owned = self.user_jobs(uid)
-            job = self.jobs.get(target) if target else next((j for j in owned if j.state == "running"), owned[0] if owned else None)
-            if target and (not job or job.user_id != uid):
-                await event.respond("No matching job of yours. Use /queue to see job IDs.")
-                return
-            if task and not target:
-                task.cancel()
-            elif job and job.task:
-                job.task.cancel()
-            selection = self.selections.pop(uid, None) if not target else None
-            range_request = self.pending_ranges.pop(uid, None) if not target else None
-            pending_api = uid in self.awaiting_api
-            if not target:
+            if target == "lookup" and uid in self.lookups:
+                self.lookups[uid].cancel()
+                await event.respond("Link lookup cancellation requested.")
+            elif target:
+                job = self.jobs.get(target)
+                if not job or job.user_id != uid or not job.task:
+                    await event.respond("No matching active/queued job of yours. Send /cancel for your job IDs.")
+                else:
+                    job.task.cancel()
+                    await event.respond(f"Cancellation requested for {target} ({job.state}).")
+            elif owned:
+                lines = ["Choose a job to stop (running or queued):"]
+                for job in owned:
+                    lines.append(f"• {job.token} · {job.state} · {job.title[:50] or job.source.kind} "
+                                 f"[{', '.join(job.selected)}] — /cancel {job.token}")
+                if uid in self.lookups:
+                    lines.append("/cancel lookup — stop the current link lookup")
+                buttons = [[Button.inline(f"✖ Cancel {job.token}",
+                                          data=f"j:{job.token}:cancel".encode())] for job in owned]
+                await event.respond("\n".join(lines), buttons=buttons, parse_mode=None)
+            else:
+                task = self.lookups.get(uid)
+                if task:
+                    task.cancel()
+                selection = self.selections.pop(uid, None)
+                range_request = self.pending_ranges.pop(uid, None)
+                pending_api = uid in self.awaiting_api
                 self.awaiting_api.discard(uid)
-            await event.respond("Cancellation requested." if task or job else
-                                "Selection cleared." if selection or range_request or pending_api else "Nothing to cancel.")
+                await event.respond("Lookup cancellation requested." if task else
+                                    "Selection cleared." if selection or range_request or pending_api else
+                                    "Nothing to cancel.")
         elif command:
             await event.respond("Unknown command. Send /help for instructions.")
         else:
@@ -736,6 +856,23 @@ class DownloaderBot:
     async def callback(self, event) -> None:
         uid = event.sender_id
         parts = (event.data or b"").decode("ascii", errors="ignore").split(":")
+        if parts[0] == "d":
+            dashboard = self.dashboards.get(uid)
+            if (not event.is_private or len(parts) != 3 or not dashboard
+                    or dashboard.token != parts[1] or parts[2] != "refresh"
+                    or event.message_id != dashboard.message_id):
+                await event.answer("Status message expired. Send /status again.", alert=True)
+                return
+            now = time.monotonic()
+            if now < dashboard.edit_flood_until:
+                await event.answer("Telegram rate limit: try again shortly.")
+            elif now - dashboard.last_manual < MANUAL_REFRESH_SECONDS:
+                await event.answer("Just refreshed. Please wait a moment.")
+            else:
+                dashboard.last_manual = now
+                await event.answer("Refreshing now")
+                await self.render_dashboard(uid, force=True)
+            return
         if parts[0] == "m":
             if (not event.is_private or len(parts) != 3 or self.mode_tokens.get(uid) != parts[1]
                     or parts[2] not in ("youtube", "terabox")):
@@ -769,7 +906,9 @@ class DownloaderBot:
                     return
                 job.last_manual = now
                 await event.answer("Refreshing now")
-                if event.message_id == job.message_id:
+                if uid in self.dashboards:
+                    await self.render_dashboard(uid, force=True)
+                elif event.message_id == job.message_id:
                     await self.render(job, force=True)  # Resets the next automatic refresh.
                 else:
                     # A /status reply has its own Refresh button.
@@ -825,6 +964,12 @@ class DownloaderBot:
         self.jobs[job.token] = job
         job.task = asyncio.create_task(self.run_job(job))
         await event.answer("Added to queue")
+        if uid in self.dashboards:
+            try:
+                await self.client.delete_messages(job.peer, [job.message_id])
+            except RPCError:
+                LOG.warning("Could not remove the selection panel", exc_info=True)
+            await self.render_dashboard(uid, force=True)
 
     async def progress(self, job: Job, text: str, *, force: bool = False) -> None:
         job.detail = text
@@ -973,8 +1118,16 @@ class DownloaderBot:
                 await asyncio.gather(job.reporter, return_exceptions=True)
             async with self.turn:
                 if self.jobs.get(job.token) is job:
+                    if job.state == "finished":
+                        if job.user_id not in self.completed and len(self.completed) >= MAX_COMPLETED_USERS:
+                            oldest = min(self.completed, key=lambda uid: self.completed[uid][-1][0])
+                            self.completed.pop(oldest, None)
+                        history = self.completed.setdefault(job.user_id, [])
+                        history.append((time.monotonic(), self.format_job(job, include_metrics=False)))
+                        self.completed[job.user_id] = history[-2:]
                     self.jobs.pop(job.token, None)
                 self.turn.notify_all()
+            await self.render_dashboard(job.user_id, force=True)
 
     async def video_thumbnail(self, job: Job, video: Video) -> tuple[bytes | None, int, int]:
         source = job.current_url or job.source.url
