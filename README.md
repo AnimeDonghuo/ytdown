@@ -10,13 +10,19 @@ Titles come from YouTube first (oEmbed with a `yt-dlp` backup for single videos,
 2. Create a Koyeb Web Service from this repository using its `Dockerfile`. Select the free instance and **one replica only** (multiple instances of the same bot can duplicate work).
 3. Configure Koyeb **secret environment variables** `BOT_TOKEN`, `API_ID`, and `API_HASH`. These are required. Do not commit them to the repository. **No string session or user account login is needed**: Telethon logs in as the bot using an in-memory MTProto session and your bot token. A restart creates a fresh login session.
 4. Use service port **8000** (`PORT` can override it) and the HTTP health check **`/healthz`**. Telegram updates and uploads use MTProto; the web port is only for Koyeb health checks. No webhook is needed.
-5. Optionally set `MAX_FILE_MB` (default 2047, clamped to 1–2047) and `MAX_PLAYLIST_VIDEOS` (default 25, clamped to 1–50). Send `/start` to your bot.
+5. Optionally set `MAX_FILE_MB` (default 2047, clamped to 1–2047), `MAX_PLAYLIST_VIDEOS` (default 25, clamped to 1–50), and `UPLOAD_IN_FLIGHT` (default 2, clamped to 1–3 upload parts). Send `/start` to your bot.
 
 ### Large uploads and free-tier limits
 
 The bot uses **MTProto rather than the standard Bot API upload endpoint**, so its configurable per-file limit is near Telegram's **2 GiB** limit instead of 50 MB. If a media URL supplies `Content-Length`, the bot streams bounded 512 KiB chunks directly from the provider into Telegram's MTProto upload; it does **not** save the whole video on Koyeb or load it into RAM. It checks the declared and actual size. The transfer must remain accessible throughout the upload. If a provider does **not** supply `Content-Length`, it temporarily spools files up to **64 MiB** to discover their size, and skips larger unknown-size files. Redirects must remain on public HTTPS hosts.
 
-Uploads near 2 GiB can take a long time and consume significant bandwidth; Koyeb's free-tier network, runtime, and resource limits may interrupt them. Success depends on the provider link staying valid and the Telegram servers accepting the media. A single global transfer slot and four waiting jobs bound concurrent resource use. Temporary files are deleted after use; jobs and selections are in memory and are **not restored** after a restart. Playlist API lookups run sequentially and can take a long time. The bot does not transcode or split files.
+Uploads near 2 GiB can take a long time and consume significant bandwidth; Koyeb's free-tier network, runtime, and resource limits may interrupt them. Success depends on the provider link staying valid and the Telegram servers accepting the media. A single global transfer slot and four waiting jobs bound concurrent resource use. Temporary files are deleted after use; jobs and selections are in memory and are **not restored** after a restart. Playlist API lookups run sequentially and can take 1–2 minutes *per video*, so a 25-video playlist can take a long time. The bot does not transcode or split files.
+
+### Live status and speed
+
+The job message refreshes approximately every **12 seconds** with video/quality, a progress bar, bytes downloaded from the provider, bytes acknowledged by Telegram, upload speed, estimated time remaining, queue position, approximate process CPU/RAM, and a **Refresh** and **Cancel** button. `/status` shows a current snapshot too. Refresh edits are throttled to avoid Telegram flood waits; the bot honors longer waits instead of repeatedly retrying. During an API lookup or while a playlist is being read, the total size and ETA are not yet known.
+
+The optional native **`cryptg`** accelerator reduces MTProto encryption CPU usage. Large and small known-size uploads pipeline **two 512 KiB parts** by default instead of waiting for each part's round trip. This uses about 1 MiB of in-flight part data per job and keeps the single global transfer limit. On a particularly CPU-constrained free instance, set `UPLOAD_IN_FLIGHT=1`; for faster networks, 2 is the recommended starting value (3 is the maximum). Throughput is still limited by the provider, Telegram, and Koyeb; this cannot guarantee a particular speed.
 
 Only download media you have permission to use. Private, region-blocked, or age-restricted videos are not bypassed.
 

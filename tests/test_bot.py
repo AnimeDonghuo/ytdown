@@ -106,22 +106,22 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
 class StreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_known_size_streams_in_parts_not_a_whole_file(self):
+        import hashlib
+        from telethon.tl import types
+        from telethon.tl.functions.upload import SaveFilePartRequest
         session = MagicMock()
         session.get.return_value = FakeResponse(b"abcdef", length=6)
-        client = MagicMock()
-        pieces = []
-
-        async def upload(reader, *, file_size, file_name, part_size_kb):
-            self.assertIsInstance(reader, HTTPReader)
-            self.assertEqual((file_size, file_name, part_size_kb), (6, "video.mp4", 512))
-            pieces.append(await reader.read(4))
-            pieces.append(await reader.read(4))
-            return "uploaded handle"
-
-        client.upload_file = upload
-        handle = await upload_stream(client, session, CDN_URL, "video.mp4", 100)
-        self.assertEqual(handle, "uploaded handle")
-        self.assertEqual(pieces, [b"abcd", b"ef"])
+        client = AsyncMock(return_value=True)
+        downloaded, uploaded = [], []
+        handle = await upload_stream(client, session, CDN_URL, "video.mp4", 100,
+                                     on_download=downloaded.append,
+                                     on_upload=lambda done, total: uploaded.append(done))
+        self.assertIsInstance(handle, types.InputFile)
+        self.assertEqual(handle.md5_checksum, hashlib.md5(b"abcdef").hexdigest())
+        self.assertIsInstance(client.call_args.args[0], SaveFilePartRequest)
+        self.assertEqual(client.call_args.args[0].bytes, b"abcdef")
+        self.assertEqual(downloaded, [6])
+        self.assertEqual(uploaded, [6])
 
     async def test_telethon_uploads_big_file_with_multipart_requests(self):
         from telethon import TelegramClient
@@ -163,10 +163,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             await upload_stream(MagicMock(), session, CDN_URL, "video.mp4", 100)
         self.assertEqual(session.get.call_count, 2)
         session.get.return_value = FakeResponse(b"abc", length=4)
-        async def upload(reader, **kwargs):
-            await reader.read(4)
-        client = MagicMock()
-        client.upload_file = upload
+        client = AsyncMock(return_value=True)
         with self.assertRaises(asyncio.IncompleteReadError):
             await upload_stream(client, session, CDN_URL, "video.mp4", 100)
 
@@ -187,6 +184,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_filename_and_caption_on_mtproto_send(self):
         client = MagicMock()
         client.send_file = AsyncMock()
+        client.edit_message = AsyncMock()
         service = DownloaderBot(client, MagicMock())
         video = Video("A real YouTube video title", {"480p": CDN_URL})
         job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), video)
@@ -200,10 +198,27 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.send_file.await_args_list[1].kwargs["mime_type"], "audio/mpeg")
         self.assertTrue(media_name("X" * 250, "480p", 80).endswith(" [480p]"))
 
+    async def test_send_flood_wait_reuses_uploaded_handle(self):
+        from telethon.errors import FloodWaitError
+        client = MagicMock()
+        client.edit_message = AsyncMock()
+        client.send_file = AsyncMock(side_effect=[FloodWaitError(None, capture=3), None])
+        service = DownloaderBot(client, MagicMock())
+        video = Video("YouTube title", {"480p": CDN_URL})
+        job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), video)
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="uploaded once")) as upload, \
+             patch("ytdown.bot.asyncio.sleep", new=AsyncMock()) as sleeper:
+            await service.send_stream(job, video, "480p", CDN_URL, 1, 1)
+        upload.assert_awaited_once()
+        self.assertEqual(client.send_file.await_count, 2)
+        self.assertEqual(client.send_file.await_args_list[1].args[1], "uploaded once")
+        sleeper.assert_awaited_once_with(4)
+
     async def test_invalid_streamable_video_reuses_upload_as_document(self):
         from telethon.errors import VideoContentTypeInvalidError
         client = MagicMock()
         client.send_file = AsyncMock(side_effect=[VideoContentTypeInvalidError(None), None])
+        client.edit_message = AsyncMock()
         service = DownloaderBot(client, MagicMock())
         video = Video("YouTube title", {"480p": CDN_URL})
         job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), video)
@@ -278,3 +293,96 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await get_youtube_title(session, VIDEO_URL), "")
         self.assertEqual(choose_title("", "API title", VIDEO_URL), "API title")
         self.assertEqual(choose_title("", "", VIDEO_URL), "YouTube video 3SY1i5CB03Q")
+
+
+class LiveStatusTests(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_bar_eta_queue_refresh_and_edit_throttling(self):
+        client = MagicMock()
+        client.edit_message = AsyncMock()
+        service = DownloaderBot(client, MagicMock())
+        job = Job(7, "peer", 33, Source("video", VIDEO_URL), ("480p",), None)
+        service.jobs[7] = job
+        self.assertIn("position 1", service.format_job(job))
+        job.state = "running"
+        job.title = "YouTube title"
+        job.quality = "480p"
+        job.item_index = job.item_total = 1
+        job.total_bytes = 1024 * 1024
+        job.downloaded = 700 * 1024
+        job.uploaded = 512 * 1024
+        job.sample_at -= 10
+        await service.render(job, force=True)
+        rendered = client.edit_message.call_args.args[2]
+        self.assertIn("50.0%", rendered)
+        self.assertIn("Uploaded: 512.0 KiB / 1.0 MiB", rendered)
+        self.assertIn("ETA:", rendered)
+        self.assertIn("YouTube title [480p]", rendered)
+        self.assertEqual(len(client.edit_message.call_args.kwargs["buttons"][0]), 2)
+        await service.render(job)
+        self.assertEqual(client.edit_message.await_count, 1)  # No flood of status edits.
+        event = SimpleNamespace(data=f"j:{job.token}:refresh".encode(), sender_id=7,
+                                is_private=True, message_id=33, answer=AsyncMock())
+        await service.callback(event)
+        self.assertIn("Next update in", event.answer.call_args.args[0])
+
+    async def test_flood_wait_delays_next_edit_without_crashing_transfer(self):
+        from telethon.errors import FloodWaitError
+        client = MagicMock()
+        client.edit_message = AsyncMock(side_effect=FloodWaitError(None, capture=90))
+        service = DownloaderBot(client, MagicMock())
+        job = Job(7, "peer", 33, Source("video", VIDEO_URL), ("480p",), None)
+        await service.render(job, force=True)
+        self.assertGreater(job.next_edit - asyncio.get_running_loop().time(), 85)
+
+    async def test_bounded_big_upload_can_pipeline_two_parts(self):
+        from telethon.tl import types
+        data = b"x" * (10 * 1024 * 1024 + 1)
+        session = MagicMock()
+        session.get.return_value = FakeResponse(data, length=len(data))
+        class DelayedClient:
+            def __init__(self):
+                self.active = 0
+                self.peak = 0
+                self.count = 0
+            async def __call__(self, request):
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                await asyncio.sleep(0)
+                self.active -= 1
+                self.count += 1
+                return True
+        client = DelayedClient()
+        downloads = []
+        uploads = []
+        handle = await upload_stream(client, session, CDN_URL, "video.mp4", len(data),
+                                     on_download=downloads.append,
+                                     on_upload=lambda n, total: uploads.append(n), in_flight=2)
+        self.assertIsInstance(handle, types.InputFileBig)
+        self.assertEqual(client.count, 21)
+        self.assertEqual(client.peak, 2)
+        self.assertEqual(sum(downloads), len(data))
+        self.assertEqual(uploads[-1], len(data))
+
+    async def test_mtproto_flood_wait_retries_part_without_reuploading_entire_file(self):
+        from telethon.errors import FloodWaitError
+        size = 10 * 1024 * 1024 + 1
+        session = MagicMock()
+        session.get.return_value = FakeResponse(b"x" * size, length=size)
+        class RateLimitedClient:
+            def __init__(self):
+                self.attempts = {}
+            async def __call__(self, request):
+                index = request.file_part
+                self.attempts[index] = self.attempts.get(index, 0) + 1
+                if index == 0 and self.attempts[index] == 1:
+                    raise FloodWaitError(None, capture=2)
+                return True
+        client = RateLimitedClient()
+        waits = []
+        with patch("ytdown.bot.asyncio.sleep", new=AsyncMock()) as sleeper:
+            await upload_stream(client, session, CDN_URL, "video.mp4", size, in_flight=2,
+                                on_flood=waits.append)
+        self.assertEqual(client.attempts[0], 2)
+        self.assertTrue(all(count == 1 for part, count in client.attempts.items() if part != 0))
+        self.assertEqual(waits, [2, 0])
+        sleeper.assert_awaited_once_with(3)

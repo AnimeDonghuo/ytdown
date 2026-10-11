@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
@@ -17,10 +18,11 @@ from urllib.parse import urljoin
 
 import aiohttp
 from aiohttp import web
-from telethon import Button, TelegramClient, events
-from telethon.errors import RPCError, VideoContentTypeInvalidError
+from telethon import Button, TelegramClient, events, helpers
+from telethon.errors import FloodWaitError, MessageNotModifiedError, RPCError, VideoContentTypeInvalidError
 from telethon.sessions import MemorySession
 from telethon.tl import types
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 
 from .core import (AUDIO, VIDEO_QUALITIES, PlaylistEntry, Source, Video, extract_playlist,
                    extract_title, normalize_video, parse_source, public_https_url, youtube_title)
@@ -34,6 +36,8 @@ SESSION_SECONDS = 1800
 MAX_MT_MB = 2047
 PART_BYTES = 512 * 1024
 SPOOL_MB = 64  # For rare providers that do not send Content-Length.
+REPORT_SECONDS = 12  # Automatic edits: keep well below Telegram flood limits.
+MIN_EDIT_SECONDS = 8
 
 
 class PublicResolver(aiohttp.abc.AbstractResolver):
@@ -74,6 +78,23 @@ def media_name(title: str, quality: str, max_length: int) -> str:
     return (title[:max_length - len(suffix)].rstrip() or "YouTube video") + suffix
 
 
+def human_size(count: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if count < 1024 or unit == "GiB":
+            return f"{count:.1f} {unit}" if unit != "B" else f"{count:.0f} B"
+        count /= 1024
+    return "0 B"
+
+
+def human_eta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m{seconds % 60}s"
+    return f"{seconds}s"
+
+
 @dataclass
 class Selection:
     token: str
@@ -96,6 +117,21 @@ class Job:
     state: str = "queued"
     detail: str = "Waiting for the download slot."
     task: asyncio.Task | None = None
+    token: str = field(default_factory=lambda: secrets.token_hex(4))
+    title: str = ""
+    quality: str = ""
+    item_index: int = 0
+    item_total: int = 0
+    total_bytes: int = 0
+    downloaded: int = 0
+    uploaded: int = 0
+    speed: float = 0.0
+    sample_bytes: int = 0
+    sample_at: float = field(default_factory=time.monotonic)
+    next_edit: float = 0.0
+    edit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    reporter: asyncio.Task | None = None
+    rate_limit_until: float = 0.0
 
 
 async def fetch_video(session: aiohttp.ClientSession, url: str) -> Video:
@@ -137,9 +173,10 @@ def choose_title(youtube: str, provider: str, url: str) -> str:
 class HTTPReader:
     """Async read(n) adapter for Telethon.upload_file; never buffers more than one part."""
 
-    def __init__(self, response: aiohttp.ClientResponse, size: int):
+    def __init__(self, response: aiohttp.ClientResponse, size: int, on_download=None):
         self.content = response.content
         self.remaining = size
+        self.on_download = on_download
 
     async def read(self, count: int) -> bytes:
         size = min(count, self.remaining)
@@ -147,16 +184,71 @@ class HTTPReader:
             return b""
         data = await self.content.readexactly(size)
         self.remaining -= len(data)
+        if self.on_download:
+            self.on_download(len(data))
         return data
 
 
+async def upload_parts(client, reader: HTTPReader, size: int, filename: str,
+                       in_flight: int, on_upload=None, on_flood=None):
+    """Pipeline 1–3 MTProto parts, using the correct small/big file protocol."""
+    file_id = helpers.generate_random_long()
+    parts = (size + PART_BYTES - 1) // PART_BYTES
+    is_big = size > 10 * 1024 * 1024
+    digest = hashlib.md5() if not is_big else None  # Telegram requires MD5 for small files.
+    pending: set[asyncio.Task] = set()
+    confirmed = 0
+
+    async def send_part(index: int, data: bytes) -> None:
+        nonlocal confirmed
+        for attempt in range(3):
+            try:
+                request = (SaveBigFilePartRequest(file_id, index, parts, data) if is_big else
+                           SaveFilePartRequest(file_id, index, data))
+                if not await client(request):
+                    raise ValueError(f"Telegram rejected upload part {index}.")
+                confirmed += len(data)
+                if on_upload:
+                    on_upload(confirmed, size)
+                return
+            except FloodWaitError as exc:
+                if attempt == 2 or exc.seconds > 300:
+                    raise
+                if on_flood:
+                    on_flood(exc.seconds)
+                await asyncio.sleep(exc.seconds + 1)
+                if on_flood:
+                    on_flood(0)
+
+    try:
+        for index in range(parts):
+            data = await reader.read(PART_BYTES)
+            if digest:
+                digest.update(data)
+            task = asyncio.create_task(send_part(index, data))
+            pending.add(task)
+            if len(pending) >= in_flight:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for completed in done:
+                    completed.result()
+        if pending:
+            await asyncio.gather(*pending)
+    except BaseException:
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        raise
+    return (types.InputFileBig(file_id, parts, filename) if is_big else
+            types.InputFile(file_id, parts, filename, digest.hexdigest()))
+
+
 async def upload_stream(client: TelegramClient, session: aiohttp.ClientSession, url: str,
-                        filename: str, max_bytes: int):
+                        filename: str, max_bytes: int, *, on_total=None, on_download=None,
+                        on_upload=None, on_flood=None, in_flight: int = 2):
     """Download from CDN while uploading MTProto parts. Never store a 2 GB file on Koyeb.
 
-    Telethon uses saveBigFilePart (>10 MiB) or saveFilePart and returns an
-    InputFile handle. file_size is supplied explicitly so its helper does NOT
-    read the entire non-seekable HTTP stream into memory.
+Pipelines bounded saveBigFilePart/saveFilePart requests from the HTTP stream,
+    with MD5 for small files; no unbounded buffering.
     """
     for _ in range(5):
         if not public_https_url(url):
@@ -178,9 +270,11 @@ async def upload_stream(client: TelegramClient, session: aiohttp.ClientSession, 
                     raise FileTooLarge()
                 if size == 0:
                     raise ValueError("The download link returned an empty file.")
-                reader = HTTPReader(response, size)
-                handle = await client.upload_file(reader, file_size=size, file_name=filename,
-                                                  part_size_kb=PART_BYTES // 1024)
+                if on_total:
+                    on_total(size)
+                reader = HTTPReader(response, size, on_download)
+                handle = await upload_parts(client, reader, size, filename,
+                                            max(1, min(3, in_flight)), on_upload, on_flood)
                 if reader.remaining or await response.content.read(1):
                     raise ValueError("The download size did not match Content-Length.")
                 return handle
@@ -195,10 +289,15 @@ async def upload_stream(client: TelegramClient, session: aiohttp.ClientSession, 
                         if count > min(max_bytes, SPOOL_MB * 1024 * 1024):
                             raise UnknownLength()
                         output.write(chunk)
+                        if on_download:
+                            on_download(len(chunk))
                 if not count:
                     raise ValueError("The download link returned an empty file.")
+                if on_total:
+                    on_total(count)
                 return await client.upload_file(str(path), file_name=filename,
-                                                part_size_kb=PART_BYTES // 1024)
+                                                part_size_kb=PART_BYTES // 1024,
+                                                progress_callback=on_upload)
     raise ValueError("Too many download redirects.")
 
 
@@ -212,10 +311,85 @@ class DownloaderBot:
         self.slot = asyncio.Semaphore(1)
         self.max_bytes = env_int("MAX_FILE_MB", MAX_MT_MB, 1, MAX_MT_MB) * 1024 * 1024
         self.playlist_limit = env_int("MAX_PLAYLIST_VIDEOS", 25, 1, 50)
+        self.in_flight = env_int("UPLOAD_IN_FLIGHT", 2, 1, 3)
+        self._cpu_wall = time.monotonic()
+        self._cpu_process = time.process_time()
+        self._cpu_percent = 0.0
+
+    def resource_line(self) -> str:
+        # Sample no more than every 5 seconds; CPU is per-process, not Koyeb's host metric.
+        now = time.monotonic()
+        if now - self._cpu_wall >= 5:
+            current = time.process_time()
+            self._cpu_percent = max(0, (current - self._cpu_process) / (now - self._cpu_wall) * 100)
+            self._cpu_wall, self._cpu_process = now, current
+        try:
+            rss_pages = int(Path("/proc/self/statm").read_text().split()[1])
+            rss = human_size(rss_pages * os.sysconf("SC_PAGE_SIZE"))
+            return f"Process CPU: {self._cpu_percent:.0f}% · RAM: {rss}"
+        except (OSError, ValueError, IndexError):
+            return f"Process CPU: {self._cpu_percent:.0f}%"
 
     def register(self) -> None:
         self.client.add_event_handler(self.on_message, events.NewMessage(incoming=True))
-        self.client.add_event_handler(self.callback, events.CallbackQuery(pattern=rb"^s:"))
+        self.client.add_event_handler(self.callback, events.CallbackQuery(pattern=rb"^(s|j):"))
+
+    def job_buttons(self, job: Job):
+        if job.state == "finished":
+            return None
+        return [[Button.inline("🔄 Refresh", data=f"j:{job.token}:refresh".encode()),
+                 Button.inline("✖ Cancel", data=f"j:{job.token}:cancel".encode())]]
+
+    def format_job(self, job: Job) -> str:
+        now = time.monotonic()
+        elapsed = now - job.sample_at
+        if elapsed >= 3:
+            new_speed = max(0, job.uploaded - job.sample_bytes) / elapsed
+            job.speed = new_speed if job.speed == 0 else (0.5 * job.speed + 0.5 * new_speed)
+            job.sample_bytes, job.sample_at = job.uploaded, now
+        total = job.total_bytes
+        ratio = min(1.0, job.uploaded / total) if total else 0
+        filled = min(12, int(ratio * 12))
+        eta = human_eta((total - job.uploaded) / job.speed) if total and job.speed > 1 else "—"
+        waiting = [j for j in self.jobs.values() if j.state == "queued"]
+        queue = f" (position {waiting.index(job) + 1})" if job in waiting else ""
+        item = f"{job.item_index}/{job.item_total}" if job.item_total else "—"
+        title = job.title[:95] or ("Playlist" if job.source.kind == "playlist" else "YouTube video")
+        quality = f" [{job.quality}]" if job.quality else ""
+        rate = (f"Rate limited until {human_eta(job.rate_limit_until - now)}"
+                if job.rate_limit_until > now else job.detail)
+        return (f"🎬 {title}{quality}\n"
+                f"👤 {job.user_id} · Video {item}\n"
+                f"[{('●' * filled) + ('○' * (12 - filled))}] {ratio * 100:.1f}%\n"
+                f"↑ Uploaded: {human_size(job.uploaded)} / {human_size(total) if total else '—'}\n"
+                f"↓ Downloaded: {human_size(job.downloaded)}\n"
+                f"Speed: {human_size(job.speed)}/s · ETA: {eta}\n"
+                f"Status: {job.state}{queue} · {rate}\n"
+                f"Tasks: {len(self.jobs)} · {self.resource_line()}\n"
+                f"/cancel or buttons below")
+
+    async def render(self, job: Job, *, force: bool = False) -> None:
+        async with job.edit_lock:
+            now = time.monotonic()
+            if not force and now < job.next_edit:
+                return
+            job.next_edit = now + REPORT_SECONDS
+            try:
+                await self.client.edit_message(job.peer, job.message_id, self.format_job(job),
+                                               buttons=self.job_buttons(job), parse_mode=None)
+            except MessageNotModifiedError:
+                pass
+            except FloodWaitError as exc:
+                job.next_edit = time.monotonic() + exc.seconds + 3
+                LOG.info("Throttling status edits for %ss due to Telegram flood wait", exc.seconds)
+            except RPCError:
+                LOG.warning("Could not update job status", exc_info=True)
+
+    async def report_loop(self, job: Job) -> None:
+        while True:
+            await asyncio.sleep(REPORT_SECONDS)
+            await self.render(job)
+
 
     async def on_message(self, event) -> None:
         if not event.is_private:
@@ -226,23 +400,25 @@ class DownloaderBot:
         if command in ("/start", "/help"):
             await event.respond(
                 "Send a YouTube video, Shorts, or public playlist link. Choose one or several qualities, then tap Done. "
-                "Files are transferred sequentially. Playlist qualities unavailable for a video are skipped.\n\n"
+                "Files are transferred sequentially. Watch the live progress message or tap Refresh; "
+                "playlist qualities unavailable for a video are skipped.\n\n"
                 "A watch link containing list= is treated as a playlist; remove it for just one video.\n\n"
                 "/status — current job\n/cancel — stop a lookup or job\n/limits — size and queue limits\n/help — these instructions\n\n"
                 "Only download media you have permission to use.")
         elif command == "/limits":
             await event.respond(
                 f"MTProto limit: {self.max_bytes // 1024 // 1024} MiB per file (up to 2 GiB). "
-                f"Playlist: first {self.playlist_limit} entries. One transfer at a time; up to {MAX_WAITING} waiting jobs. "
+                f"Playlist: first {self.playlist_limit} entries. One job at a time, "
+                f"{self.in_flight} concurrent upload parts; up to {MAX_WAITING} waiting jobs. "
                 "Files without Content-Length are limited to 64 MiB. Jobs/selections are not restored after a restart.")
         elif command == "/status":
             uid = event.sender_id
             job = self.jobs.get(uid)
-            text = (f"Job {job.state}: {job.detail}" if job else
+            text = (self.format_job(job) if job else
                     "Looking up video qualities; the provider may take a few minutes." if uid in self.lookups else
                     "Choose qualities and tap Done, or send a new link." if uid in self.selections else
                     "No active job. Send a YouTube link to begin.")
-            await event.respond(text)
+            await event.respond(text, buttons=self.job_buttons(job) if job else None, parse_mode=None)
         elif command == "/cancel":
             uid = event.sender_id
             task = self.lookups.get(uid)
@@ -345,6 +521,38 @@ class DownloaderBot:
     async def callback(self, event) -> None:
         uid = event.sender_id
         parts = (event.data or b"").decode("ascii", errors="ignore").split(":")
+        if parts[0] == "j":
+            job = self.jobs.get(uid)
+            if (not event.is_private or len(parts) != 3 or not job or parts[1] != job.token):
+                await event.answer("This job has finished or expired.", alert=True)
+                return
+            if parts[2] == "cancel":
+                if job.task:
+                    job.task.cancel()
+                await event.answer("Cancellation requested")
+                return
+            if parts[2] == "refresh":
+                now = time.monotonic()
+                if now < job.next_edit:
+                    await event.answer(f"Next update in {int(job.next_edit - now) + 1}s")
+                    return
+                await event.answer("Updating status")
+                if event.message_id == job.message_id:
+                    await self.render(job)
+                else:
+                    # A /status reply has its own Refresh button.
+                    job.next_edit = now + REPORT_SECONDS
+                    try:
+                        await event.edit(self.format_job(job), buttons=self.job_buttons(job), parse_mode=None)
+                    except FloodWaitError as exc:
+                        job.next_edit = time.monotonic() + exc.seconds + 3
+                    except MessageNotModifiedError:
+                        pass
+                    except RPCError:
+                        LOG.warning("Could not refresh job status", exc_info=True)
+                return
+            await event.answer("Invalid button.", alert=True)
+            return
         selection = self.selections.get(uid)
         if (not event.is_private or len(parts) < 3 or not selection or parts[1] != selection.token
                 or time.monotonic() - selection.created > SESSION_SECONDS):
@@ -383,17 +591,15 @@ class DownloaderBot:
         job.task = asyncio.create_task(self.run_job(job))
         await event.answer("Added to queue")
 
-    async def progress(self, job: Job, text: str) -> None:
+    async def progress(self, job: Job, text: str, *, force: bool = False) -> None:
         job.detail = text
-        try:
-            await self.client.edit_message(job.peer, job.message_id, text)
-        except RPCError:
-            LOG.warning("Could not update job progress", exc_info=True)
+        await self.render(job, force=force)
 
     async def run_job(self, job: Job) -> None:
         sent = missing = too_large = unknown_size = failed = 0
+        job.reporter = asyncio.create_task(self.report_loop(job))
         try:
-            await self.progress(job, f"Queued: {', '.join(job.selected)}. Use /status or /cancel.")
+            await self.progress(job, f"Queued: {', '.join(job.selected)}. Use /status or /cancel.", force=True)
             async with self.slot:
                 job.state = "running"
                 await self.progress(job, "Starting…")
@@ -403,12 +609,18 @@ class DownloaderBot:
                         asyncio.to_thread(extract_playlist, job.source.url, self.playlist_limit), timeout=180)
                 else:
                     entries = [PlaylistEntry(job.source.url, job.video.title if job.video else "")]
+                job.item_total = len(entries)
                 for index, entry in enumerate(entries, 1):
-                    await self.progress(job, f"Video {index}/{len(entries)}: checking formats… Sent {sent} so far.")
+                    job.item_index = index
+                    job.quality = ""
+                    job.title = entry.title
+                    job.total_bytes = job.downloaded = job.uploaded = 0
+                    await self.progress(job, f"Checking formats (API may take 1–2 minutes). Sent {sent} so far.")
                     try:
                         video = job.video if job.video else await fetch_video(self.http, entry.url)
                         youtube_name = entry.title or await get_youtube_title(self.http, entry.url)
                         video = replace(video, title=choose_title(youtube_name, video.title, entry.url))
+                        job.title = video.title
                     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
                         LOG.warning("Lookup failed for playlist item %s: %s", index, exc)
                         failed += len(job.selected)
@@ -418,7 +630,11 @@ class DownloaderBot:
                         if not stream:
                             missing += 1
                             continue
-                        await self.progress(job, f"Video {index}/{len(entries)}: transferring {quality}… Sent {sent} so far.")
+                        job.quality = quality
+                        job.total_bytes = job.downloaded = job.uploaded = 0
+                        job.speed = 0.0
+                        job.sample_bytes, job.sample_at = 0, time.monotonic()
+                        await self.progress(job, f"Streaming provider → Telegram. Sent {sent} so far.")
                         try:
                             await self.send_stream(job, video, quality, stream, index, len(entries))
                             sent += 1
@@ -430,16 +646,24 @@ class DownloaderBot:
                         except (aiohttp.ClientError, RPCError, asyncio.TimeoutError, ValueError, OSError) as exc:
                             LOG.warning("Transfer failed at video %s, quality %s: %s", index, quality, exc)
                             failed += 1
+                job.state = "finished"
                 await self.progress(job, f"Finished. Sent {sent}; unavailable {missing}; over size limit {too_large}; "
-                                         f"missing size header (>64 MiB) {unknown_size}; failed {failed}.")
+                                         f"missing size header (>64 MiB) {unknown_size}; failed {failed}.", force=True)
         except asyncio.CancelledError:
-            await self.progress(job, "Cancelled. Already uploaded files remain in the chat.")
+            job.state = "finished"
+            job.rate_limit_until = 0
+            await self.progress(job, "Cancelled. Already uploaded files remain in the chat.", force=True)
         except (ValueError, asyncio.TimeoutError) as exc:
-            await self.progress(job, f"Could not read the playlist: {exc}")
+            job.state = "finished"
+            await self.progress(job, f"Could not read the playlist: {exc}", force=True)
         except Exception:
+            job.state = "finished"
             LOG.exception("Unexpected job failure")
-            await self.progress(job, "Job failed unexpectedly. Please try again later.")
+            await self.progress(job, "Job failed unexpectedly. Please try again later.", force=True)
         finally:
+            if job.reporter:
+                job.reporter.cancel()
+                await asyncio.gather(job.reporter, return_exceptions=True)
             if self.jobs.get(job.user_id) is job:
                 self.jobs.pop(job.user_id, None)
 
@@ -449,20 +673,49 @@ class DownloaderBot:
         filename = media_name(safe_title, quality, 100) + suffix
         prefix = f"{index}/{total} · " if total > 1 else ""
         caption = prefix + media_name(video.title, quality, 750 - len(prefix))
-        uploaded = await upload_stream(self.client, self.http, url, filename, self.max_bytes)
+        def on_total(count: int) -> None:
+            job.total_bytes = count
+
+        def on_download(count: int) -> None:
+            job.downloaded += count
+
+        def on_upload(done: int, total: int) -> None:
+            job.uploaded = done
+            job.total_bytes = total
+
+        def on_flood(seconds: int) -> None:
+            job.rate_limit_until = time.monotonic() + seconds if seconds else 0
+
+        uploaded = await upload_stream(self.client, self.http, url, filename, self.max_bytes,
+                                       on_total=on_total, on_download=on_download,
+                                       on_upload=on_upload, on_flood=on_flood,
+                                       in_flight=self.in_flight)
+        await self.progress(job, "Finalizing: sending uploaded file to chat.")
         attributes = ([types.DocumentAttributeAudio(duration=0, title=media_name(video.title, quality, 64))]
                       if quality == AUDIO else None)
-        try:
-            await self.client.send_file(job.peer, uploaded, caption=caption, parse_mode=None,
-                                        mime_type="audio/mpeg" if quality == AUDIO else "video/mp4",
-                                        attributes=attributes, supports_streaming=quality != AUDIO)
-        except VideoContentTypeInvalidError:
-            if quality == AUDIO:
-                raise
-            # The same uploaded MTProto handle can be sent as a document when
-            # Telegram rejects the provider's MP4 as a streamable video.
-            await self.client.send_file(job.peer, uploaded, caption=caption, parse_mode=None,
-                                        mime_type="video/mp4", force_document=True)
+        async def deliver() -> None:
+            try:
+                await self.client.send_file(job.peer, uploaded, caption=caption, parse_mode=None,
+                                            mime_type="audio/mpeg" if quality == AUDIO else "video/mp4",
+                                            attributes=attributes, supports_streaming=quality != AUDIO)
+            except VideoContentTypeInvalidError:
+                if quality == AUDIO:
+                    raise
+                # Reuse the same MTProto handle if Telegram rejects streaming.
+                await self.client.send_file(job.peer, uploaded, caption=caption, parse_mode=None,
+                                            mime_type="video/mp4", force_document=True)
+
+        for attempt in range(3):
+            try:
+                await deliver()
+                job.rate_limit_until = 0
+                return
+            except FloodWaitError as exc:
+                if attempt == 2 or exc.seconds > 300:
+                    raise
+                job.rate_limit_until = time.monotonic() + exc.seconds + 1
+                await asyncio.sleep(exc.seconds + 1)
+        # All retries either returned or raised above.
 
 
 async def serve(token: str, api_id: int, api_hash: str) -> None:
