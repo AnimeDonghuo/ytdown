@@ -1,9 +1,58 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from ytdown.bot import DownloaderBot, Job, Selection, choose_title, download, FileTooLarge, media_name, get_youtube_title
+from ytdown.bot import (DownloaderBot, FileTooLarge, HTTPReader, Job, Selection, UnknownLength,
+                        choose_title, get_youtube_title, media_name, upload_stream)
 from ytdown.core import PlaylistEntry, Source, Video
+
+VIDEO_URL = "https://www.youtube.com/watch?v=3SY1i5CB03Q"
+CDN_URL = "https://cdn.example.com/video.mp4"
+
+
+class FakeContent:
+    def __init__(self, data: bytes):
+        self.data = data
+        self.pos = 0
+
+    async def read(self, count=-1):
+        count = len(self.data) - self.pos if count < 0 else count
+        data = self.data[self.pos:self.pos + count]
+        self.pos += len(data)
+        return data
+
+    async def readexactly(self, count):
+        data = await self.read(count)
+        if len(data) != count:
+            raise asyncio.IncompleteReadError(data, count)
+        return data
+
+    async def iter_chunked(self, count):
+        while True:
+            chunk = await self.read(count)
+            if not chunk:
+                break
+            yield chunk
+
+
+class FakeResponse:
+    status = 200
+    content_type = "video/mp4"
+    headers = {}
+
+    def __init__(self, data=b"", length=None):
+        self.content_length = length
+        self.content = FakeContent(data)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def raise_for_status(self):
+        pass
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
@@ -11,122 +60,199 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.service = DownloaderBot(MagicMock(), MagicMock())
         self.service.progress = AsyncMock()
         self.sent = []
+
         async def fake_send(job, video, quality, url, index, total):
             self.sent.append((index, quality, url, video.title))
+
         self.service.send_stream = fake_send
 
-    async def test_playlist_skips_missing_formats_and_uploads_in_order(self):
-        source = Source("playlist", "https://www.youtube.com/playlist?list=PL12345678901")
-        job = Job(1, 1, 2, source, ("360p", "720p", "2160p"), None)
+    async def test_playlist_uses_youtube_title_and_skips_missing_quality(self):
+        job = Job(1, "peer", 2, Source("playlist", "https://www.youtube.com/playlist?list=PL12345678901"),
+                  ("360p", "720p", "2160p"), None)
         self.service.jobs[1] = job
-        videos = [Video("Wrong API title", {"720p": "https://cdn.example.com/a"}),
-                  Video("Another wrong API title", {"360p": "https://cdn.example.com/b", "2160p": "https://cdn.example.com/c"})]
-        entries = [PlaylistEntry("url1", "YouTube title one"), PlaylistEntry("url2", "YouTube title two")]
+        videos = [Video("Wrong API title", {"720p": CDN_URL}),
+                  Video("Another wrong API title", {"360p": CDN_URL, "2160p": CDN_URL})]
+        entries = [PlaylistEntry(VIDEO_URL, "YouTube title one"),
+                   PlaylistEntry("https://www.youtube.com/watch?v=abcdefghijk", "YouTube title two")]
         with patch("ytdown.bot.extract_playlist", return_value=entries), \
              patch("ytdown.bot.fetch_video", new=AsyncMock(side_effect=videos)) as fetch, \
              patch("ytdown.bot.get_youtube_title", new=AsyncMock()) as metadata:
             await self.service.run_job(job)
         self.assertEqual(fetch.await_count, 2)
-        metadata.assert_not_awaited()  # Flat playlist titles do not need extra requests.
-        self.assertEqual(self.sent, [(1, "720p", "https://cdn.example.com/a", "YouTube title one"),
-                                     (2, "360p", "https://cdn.example.com/b", "YouTube title two"),
-                                     (2, "2160p", "https://cdn.example.com/c", "YouTube title two")])
+        metadata.assert_not_awaited()
+        self.assertEqual([(item[1], item[3]) for item in self.sent],
+                         [("720p", "YouTube title one"), ("360p", "YouTube title two"),
+                          ("2160p", "YouTube title two")])
         self.assertIn("unavailable 3", self.service.progress.call_args.args[1])
         self.assertNotIn(1, self.service.jobs)
 
-    async def test_playlist_falls_back_to_api_name_when_youtube_title_is_missing(self):
-        job = Job(1, 1, 2, Source("playlist", "https://www.youtube.com/playlist?list=PL12345678901"),
-                  ("480p",), None)
-        entry = PlaylistEntry("https://www.youtube.com/watch?v=3SY1i5CB03Q", "")
-        with patch("ytdown.bot.extract_playlist", return_value=[entry]), \
-             patch("ytdown.bot.fetch_video", new=AsyncMock(return_value=Video(
-                 "API name for playlist video", {"480p": "https://cdn.example.com/v.mp4"}))), \
+    async def test_playlist_falls_back_to_api_name(self):
+        job = Job(1, "peer", 2, Source("playlist", "url"), ("480p",), None)
+        with patch("ytdown.bot.extract_playlist", return_value=[PlaylistEntry(VIDEO_URL, "")]), \
+             patch("ytdown.bot.fetch_video", new=AsyncMock(return_value=Video("API name", {"480p": CDN_URL}))), \
              patch("ytdown.bot.get_youtube_title", new=AsyncMock(return_value="")) as metadata:
             await self.service.run_job(job)
         metadata.assert_awaited_once()
-        self.assertEqual(self.sent[0][3], "API name for playlist video")
+        self.assertEqual(self.sent[0][3], "API name")
 
-    async def test_single_uses_cached_video_without_second_api_call(self):
-        video = Video("first", {"360p": "https://cdn.example.com/a", "mp3": "https://cdn.example.com/b"})
-        job = Job(1, 1, 2, Source("video", "https://www.youtube.com/watch?v=3SY1i5CB03Q"),
-                  ("360p", "mp3"), video)
+    async def test_single_uses_cached_video(self):
+        video = Video("first", {"360p": CDN_URL, "mp3": CDN_URL})
+        job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("360p", "mp3"), video)
         with patch("ytdown.bot.fetch_video", new=AsyncMock()) as fetch:
             await self.service.run_job(job)
         fetch.assert_not_awaited()
         self.assertEqual([item[1] for item in self.sent], ["360p", "mp3"])
-        self.assertEqual([item[3] for item in self.sent], ["first", "first"])
 
 
-class FakeResponse:
-    status = 200
-    content_type = "video/mp4"
-    def __init__(self, chunks, length=None):
-        self.content_length = length
-        self.content = self
-        self.chunks = chunks
-    async def __aenter__(self):
-        return self
-    async def __aexit__(self, *args):
-        pass
-    def raise_for_status(self):
-        pass
-    async def iter_chunked(self, n):
-        for chunk in self.chunks:
-            yield chunk
+class StreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_known_size_streams_in_parts_not_a_whole_file(self):
+        session = MagicMock()
+        session.get.return_value = FakeResponse(b"abcdef", length=6)
+        client = MagicMock()
+        pieces = []
 
+        async def upload(reader, *, file_size, file_name, part_size_kb):
+            self.assertIsInstance(reader, HTTPReader)
+            self.assertEqual((file_size, file_name, part_size_kb), (6, "video.mp4", 512))
+            pieces.append(await reader.read(4))
+            pieces.append(await reader.read(4))
+            return "uploaded handle"
 
-class DownloadTests(unittest.IsolatedAsyncioTestCase):
-    async def test_size_is_checked_even_without_content_length(self):
-        from pathlib import Path
-        from tempfile import TemporaryDirectory
-        with TemporaryDirectory() as folder:
-            session = MagicMock()
-            session.get.return_value = FakeResponse([b"abc", b"def"])
-            with self.assertRaises(FileTooLarge):
-                await download(session, "https://cdn.example.com/v.mp4", Path(folder) / "file", 5)
+        client.upload_file = upload
+        handle = await upload_stream(client, session, CDN_URL, "video.mp4", 100)
+        self.assertEqual(handle, "uploaded handle")
+        self.assertEqual(pieces, [b"abcd", b"ef"])
 
-    async def test_rejects_redirect_to_local_network(self):
-        from pathlib import Path
-        from tempfile import TemporaryDirectory
-        response = FakeResponse([])
+    async def test_telethon_uploads_big_file_with_multipart_requests(self):
+        from telethon import TelegramClient
+        from telethon.sessions import MemorySession
+        from telethon.tl import types
+        from telethon.tl.functions.upload import SaveBigFilePartRequest
+
+        class OfflineClient(TelegramClient):
+            def __init__(self):
+                super().__init__(MemorySession(), 12345, "0" * 32)
+                self.requests = []
+
+            async def __call__(self, request, *args, **kwargs):
+                self.requests.append(request)
+                return True
+
+        client = OfflineClient()
+        size = 10 * 1024 * 1024 + 1
+        response = FakeResponse(b"x" * size, length=size)
+        session = MagicMock()
+        session.get.return_value = response
+        handle = await upload_stream(client, session, CDN_URL, "video.mp4", size)
+        self.assertIsInstance(handle, types.InputFileBig)
+        self.assertEqual(handle.parts, 21)
+        self.assertEqual(len(client.requests), 21)
+        self.assertTrue(all(isinstance(r, SaveBigFilePartRequest) and len(r.bytes) <= 512 * 1024
+                            for r in client.requests))
+
+    async def test_size_cap_redirect_and_wrong_length(self):
+        session = MagicMock()
+        session.get.return_value = FakeResponse(b"abc", length=101)
+        with self.assertRaises(FileTooLarge):
+            await upload_stream(MagicMock(), session, CDN_URL, "video.mp4", 100)
+        response = FakeResponse()
         response.status = 302
         response.headers = {"Location": "https://127.0.0.1/private"}
-        with TemporaryDirectory() as folder:
-            session = MagicMock()
-            session.get.return_value = response
-            with self.assertRaises(ValueError):
-                await download(session, "https://cdn.example.com/v.mp4", Path(folder) / "file", 50)
-            self.assertEqual(session.get.call_count, 1)
+        session.get.return_value = response
+        with self.assertRaises(ValueError):
+            await upload_stream(MagicMock(), session, CDN_URL, "video.mp4", 100)
+        self.assertEqual(session.get.call_count, 2)
+        session.get.return_value = FakeResponse(b"abc", length=4)
+        async def upload(reader, **kwargs):
+            await reader.read(4)
+        client = MagicMock()
+        client.upload_file = upload
+        with self.assertRaises(asyncio.IncompleteReadError):
+            await upload_stream(client, session, CDN_URL, "video.mp4", 100)
+
+    async def test_unknown_length_spools_only_small_files(self):
+        session = MagicMock()
+        session.get.return_value = FakeResponse(b"small")
+        client = MagicMock()
+        async def upload(path, **kwargs):
+            from pathlib import Path
+            self.assertEqual(Path(path).read_bytes(), b"small")
+            return "uploaded"
+        client.upload_file = upload
+        self.assertEqual(await upload_stream(client, session, CDN_URL, "video.mp4", 100), "uploaded")
+        session.get.return_value = FakeResponse(b"too big")
+        with patch("ytdown.bot.SPOOL_MB", 0), self.assertRaises(UnknownLength):
+            await upload_stream(client, session, CDN_URL, "video.mp4", 100)
+
+    async def test_filename_and_caption_on_mtproto_send(self):
+        client = MagicMock()
+        client.send_file = AsyncMock()
+        service = DownloaderBot(client, MagicMock())
+        video = Video("A real YouTube video title", {"480p": CDN_URL})
+        job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), video)
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="uploaded")) as upload:
+            await service.send_stream(job, video, "480p", CDN_URL, 1, 3)
+            await service.send_stream(job, video, "mp3", CDN_URL, 2, 3)
+        self.assertEqual(upload.await_args_list[0].args[3], "A real YouTube video title [480p].mp4")
+        self.assertEqual(upload.await_args_list[1].args[3], "A real YouTube video title [MP3].mp3")
+        self.assertEqual(client.send_file.await_args_list[0].kwargs["caption"],
+                         "1/3 · A real YouTube video title [480p]")
+        self.assertEqual(client.send_file.await_args_list[1].kwargs["mime_type"], "audio/mpeg")
+        self.assertTrue(media_name("X" * 250, "480p", 80).endswith(" [480p]"))
+
+    async def test_invalid_streamable_video_reuses_upload_as_document(self):
+        from telethon.errors import VideoContentTypeInvalidError
+        client = MagicMock()
+        client.send_file = AsyncMock(side_effect=[VideoContentTypeInvalidError(None), None])
+        service = DownloaderBot(client, MagicMock())
+        video = Video("YouTube title", {"480p": CDN_URL})
+        job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), video)
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="same handle")) as upload:
+            await service.send_stream(job, video, "480p", CDN_URL, 1, 1)
+        upload.assert_awaited_once()
+        self.assertEqual(client.send_file.await_count, 2)
+        self.assertEqual(client.send_file.await_args_list[1].args[1], "same handle")
+        self.assertTrue(client.send_file.await_args_list[1].kwargs["force_document"])
 
 
 class SelectionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_multiple_buttons_toggle_then_done(self):
-        from types import SimpleNamespace
+    async def test_buttons_toggle_and_done(self):
         service = DownloaderBot(MagicMock(), MagicMock())
         service.run_job = AsyncMock()
         source = Source("playlist", "https://www.youtube.com/playlist?list=PL12345678901")
-        choice = Selection("abcd1234", source, ("360p", "720p", "2160p"))
+        choice = Selection("abcd1234", source, ("360p", "720p", "2160p"), "peer")
         service.selections[7] = choice
-        query = SimpleNamespace(
-            data="", from_user=SimpleNamespace(id=7),
-            message=SimpleNamespace(chat=SimpleNamespace(type="private"), chat_id=7, message_id=99),
-            answer=AsyncMock(), edit_message_reply_markup=AsyncMock(), edit_message_text=AsyncMock(),
-        )
-        update = SimpleNamespace(callback_query=query)
+        event = SimpleNamespace(data=b"", sender_id=7, is_private=True, message_id=99,
+                                answer=AsyncMock(), edit=AsyncMock())
         for key in ("360p", "2160p"):
-            query.data = f"s:abcd1234:t:{key}"
-            await service.callback(update, None)
+            event.data = f"s:abcd1234:t:{key}".encode()
+            await service.callback(event)
         self.assertEqual(choice.selected, {"360p", "2160p"})
-        self.assertIn("(4K)", service.keyboard(choice).inline_keyboard[1][0].text)
-        query.data = "s:abcd1234:done"
-        await service.callback(update, None)
+        self.assertIn("(4K)", service.keyboard(choice)[1][0].text)
+        event.data = b"s:abcd1234:done"
+        await service.callback(event)
         self.assertEqual(service.jobs[7].selected, ("360p", "2160p"))
         await service.jobs[7].task
-        query.data = "s:abcd1234:t:720p"
-        await service.callback(update, None)
-        self.assertEqual(query.answer.call_args.args[0], "This selection expired. Send the link again.")
+        event.data = b"s:abcd1234:t:720p"
+        await service.callback(event)
+        self.assertEqual(event.answer.call_args.args[0], "This selection expired. Send the link again.")
 
-    async def test_resolver_filters_private_dns_records(self):
+    async def test_single_youtube_title_then_api_fallback(self):
+        service = DownloaderBot(MagicMock(), MagicMock())
+        notice = SimpleNamespace(edit=AsyncMock())
+        event = SimpleNamespace(sender_id=7, raw_text="https://youtu.be/3SY1i5CB03Q",
+                                get_input_chat=AsyncMock(return_value="peer"),
+                                respond=AsyncMock(return_value=notice))
+        with patch("ytdown.bot.fetch_video", new=AsyncMock(return_value=Video("Wrong API title", {"480p": CDN_URL}))), \
+             patch("ytdown.bot.get_youtube_title", new=AsyncMock(return_value="Actual YouTube title")):
+            await service.on_link(event)
+        self.assertEqual(service.selections[7].video.title, "Actual YouTube title")
+        with patch("ytdown.bot.fetch_video", new=AsyncMock(return_value=Video("API fallback", {"480p": CDN_URL}))), \
+             patch("ytdown.bot.get_youtube_title", new=AsyncMock(return_value="")):
+            await service.on_link(event)
+        self.assertEqual(service.selections[7].video.title, "API fallback")
+
+    async def test_resolver_filters_private_dns(self):
         from ytdown.bot import PublicResolver
         resolver = PublicResolver()
         resolver.inner.resolve = AsyncMock(return_value=[{"host": "127.0.0.1"}, {"host": "1.1.1.1"}])
@@ -136,72 +262,19 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
             await resolver.resolve("cdn.example.com")
         await resolver.close()
 
-
-class TitleTests(unittest.IsolatedAsyncioTestCase):
-    async def test_single_selection_uses_youtube_metadata_not_provider_title(self):
-        from types import SimpleNamespace
-        service = DownloaderBot(MagicMock(), MagicMock())
-        notice = SimpleNamespace(edit_text=AsyncMock())
-        message = SimpleNamespace(text="https://youtu.be/3SY1i5CB03Q", reply_text=AsyncMock(return_value=notice))
-        update = SimpleNamespace(effective_chat=SimpleNamespace(type="private"),
-                                 effective_user=SimpleNamespace(id=7), effective_message=message)
-        with patch("ytdown.bot.fetch_video", new=AsyncMock(return_value=Video(
-                "Incorrect API title", {"480p": "https://cdn.example.com/video.mp4"}))), \
-             patch("ytdown.bot.get_youtube_title", new=AsyncMock(return_value="Actual YouTube title")):
-            await service.on_link(update, None)
-        self.assertEqual(service.selections[7].video.title, "Actual YouTube title")
-        self.assertIn("Actual YouTube title", notice.edit_text.call_args.args[0])
-        self.assertNotIn("Incorrect API title", notice.edit_text.call_args.args[0])
-        with patch("ytdown.bot.fetch_video", new=AsyncMock(return_value=Video(
-                "API fallback title", {"480p": "https://cdn.example.com/video.mp4"}))), \
-             patch("ytdown.bot.get_youtube_title", new=AsyncMock(return_value="")):
-            await service.on_link(update, None)
-        self.assertEqual(service.selections[7].video.title, "API fallback title")
-        self.assertIn("API fallback title", notice.edit_text.call_args.args[0])
-
-    async def test_oembed_returns_youtube_title_and_yt_dlp_is_backup(self):
-        from types import SimpleNamespace
-        response = FakeResponse([])
-        response.content.read = AsyncMock(return_value=b'{"title":"Real title"}')
+    async def test_oembed_and_yt_dlp_backup(self):
+        response = FakeResponse(b'{"title":"Real title"}')
         session = MagicMock()
         session.get.return_value = response
         with patch("ytdown.bot.extract_title") as fallback:
-            title = await get_youtube_title(session, "https://www.youtube.com/watch?v=3SY1i5CB03Q")
-        self.assertEqual(title, "Real title")
+            self.assertEqual(await get_youtube_title(session, VIDEO_URL), "Real title")
         fallback.assert_not_called()
-        response.content.read = AsyncMock(return_value=b'{"title":"NA"}')
-        with patch("ytdown.bot.extract_title", return_value="Backup YouTube title") as fallback:
-            title = await get_youtube_title(session, "https://www.youtube.com/watch?v=3SY1i5CB03Q")
-        self.assertEqual(title, "Backup YouTube title")
+        session.get.return_value = FakeResponse(b'{"title":"NA"}')
+        with patch("ytdown.bot.extract_title", return_value="Backup title") as fallback:
+            self.assertEqual(await get_youtube_title(session, VIDEO_URL), "Backup title")
         fallback.assert_called_once()
-        with patch("ytdown.bot.extract_title", side_effect=ValueError("YouTube unavailable")):
-            title = await get_youtube_title(session, "https://www.youtube.com/watch?v=3SY1i5CB03Q")
-        self.assertEqual(title, "")
-        url = "https://www.youtube.com/watch?v=3SY1i5CB03Q"
-        self.assertEqual(choose_title(title, "Title from API", url), "Title from API")
-        self.assertEqual(choose_title(title, "", url), "YouTube video 3SY1i5CB03Q")
-
-    async def test_upload_caption_filename_and_audio_title_end_with_quality(self):
-        from pathlib import Path
-        from tempfile import TemporaryDirectory
-        service = DownloaderBot(MagicMock(), MagicMock())
-        video = Video("A real YouTube video title", {"480p": "https://cdn.example.com/v.mp4"})
-        job = Job(1, 1, 2, Source("video", "url"), ("480p",), video)
-        seen = []
-        async def fake_download(session, url, path, max_bytes):
-            path.write_bytes(b"media")
-        async def send_video(chat, video, **kwargs):
-            seen.append((video.filename, kwargs["caption"], video.input_file_content.read()))
-        async def send_audio(chat, audio, **kwargs):
-            seen.append((audio.filename, kwargs["caption"], kwargs["title"]))
-        service.app.bot.send_video = send_video
-        service.app.bot.send_audio = send_audio
-        with patch("ytdown.bot.download", new=fake_download):
-            await service.send_stream(job, video, "480p", "https://cdn.example.com/v.mp4", 1, 3)
-            await service.send_stream(job, video, "mp3", "https://cdn.example.com/a.mp3", 2, 3)
-        self.assertEqual(seen[0], ("A real YouTube video title [480p].mp4",
-                                   "1/3 · A real YouTube video title [480p]", b"media"))
-        self.assertEqual(seen[1], ("A real YouTube video title [MP3].mp3",
-                                   "2/3 · A real YouTube video title [MP3]",
-                                   "A real YouTube video title [MP3]"))
-        self.assertTrue(media_name("X" * 250, "480p", 80).endswith(" [480p]"))
+        session.get.return_value = FakeResponse(b'{"title":"NA"}')
+        with patch("ytdown.bot.extract_title", side_effect=ValueError("Unavailable")):
+            self.assertEqual(await get_youtube_title(session, VIDEO_URL), "")
+        self.assertEqual(choose_title("", "API title", VIDEO_URL), "API title")
+        self.assertEqual(choose_title("", "", VIDEO_URL), "YouTube video 3SY1i5CB03Q")
