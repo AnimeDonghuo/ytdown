@@ -7,6 +7,7 @@ from ytdown.bot import (DownloaderBot, FileTooLarge, HTTPReader, Job, MAX_MT_MB,
                         PART_BYTES, Selection, UnknownLength, choose_title, get_youtube_title,
                         media_name, upload_parts, upload_stream)
 from ytdown.core import PlaylistEntry, Source, Video
+from ytdown.media import MediaInfo
 
 VIDEO_URL = "https://www.youtube.com/watch?v=3SY1i5CB03Q"
 CDN_URL = "https://cdn.example.com/video.mp4"
@@ -70,7 +71,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_playlist_uses_youtube_title_and_skips_missing_quality(self):
         job = Job(1, "peer", 2, Source("playlist", "https://www.youtube.com/playlist?list=PL12345678901"),
                   ("360p", "720p", "2160p"), None)
-        self.service.jobs[1] = job
+        self.service.jobs[job.token] = job
         videos = [Video("Wrong API title", {"720p": CDN_URL}),
                   Video("Another wrong API title", {"360p": CDN_URL, "2160p": CDN_URL})]
         entries = [PlaylistEntry(VIDEO_URL, "YouTube title one"),
@@ -85,10 +86,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                          [("720p", "YouTube title one"), ("360p", "YouTube title two"),
                           ("2160p", "YouTube title two")])
         self.assertIn("unavailable 3", self.service.progress.call_args.args[1])
-        self.assertNotIn(1, self.service.jobs)
+        self.assertNotIn(job.token, self.service.jobs)
 
     async def test_playlist_falls_back_to_api_name(self):
         job = Job(1, "peer", 2, Source("playlist", "url"), ("480p",), None)
+        self.service.jobs[job.token] = job
         with patch("ytdown.bot.extract_playlist", return_value=[PlaylistEntry(VIDEO_URL, "")]), \
              patch("ytdown.bot.fetch_video", new=AsyncMock(return_value=Video("API name", {"480p": CDN_URL}))), \
              patch("ytdown.bot.get_youtube_title", new=AsyncMock(return_value="")) as metadata:
@@ -96,9 +98,39 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         metadata.assert_awaited_once()
         self.assertEqual(self.sent[0][3], "API name")
 
+    async def test_queue_is_fifo_even_if_first_status_edit_is_slow(self):
+        first = Job(1, "peer1", 1, Source("video", VIDEO_URL), ("480p",), Video("first", {"480p": CDN_URL}))
+        second = Job(1, "peer1", 2, Source("video", VIDEO_URL), ("480p",), Video("second", {"480p": CDN_URL}))
+        self.service.jobs[first.token] = first
+        self.service.jobs[second.token] = second
+        async def slow_first(job, text, **kwargs):
+            if job is first and text.startswith("Queued"):
+                await asyncio.sleep(0.02)
+        self.service.progress = slow_first
+        await asyncio.wait_for(asyncio.gather(self.service.run_job(first), self.service.run_job(second)), 1)
+        self.assertEqual([item[3] for item in self.sent], ["first", "second"])
+
+    async def test_cancelled_waiting_job_unblocks_next_job(self):
+        active = Job(1, "peer", 1, Source("video", VIDEO_URL), ("480p",), None, state="running")
+        first = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), Video("first", {"480p": CDN_URL}))
+        second = Job(1, "peer", 3, Source("video", VIDEO_URL), ("480p",), Video("second", {"480p": CDN_URL}))
+        for job in (active, first, second):
+            self.service.jobs[job.token] = job
+        one = asyncio.create_task(self.service.run_job(first))
+        two = asyncio.create_task(self.service.run_job(second))
+        await asyncio.sleep(0)
+        one.cancel()
+        await one
+        async with self.service.turn:
+            self.service.jobs.pop(active.token)
+            self.service.turn.notify_all()
+        await asyncio.wait_for(two, 1)
+        self.assertEqual([item[3] for item in self.sent], ["second"])
+
     async def test_single_uses_cached_video(self):
         video = Video("first", {"360p": CDN_URL, "mp3": CDN_URL})
         job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("360p", "mp3"), video)
+        self.service.jobs[job.token] = job
         with patch("ytdown.bot.fetch_video", new=AsyncMock()) as fetch:
             await self.service.run_job(job)
         fetch.assert_not_awaited()
@@ -207,7 +239,9 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         service = DownloaderBot(client, MagicMock())
         video = Video("A real YouTube video title", {"480p": CDN_URL})
         job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), video)
-        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="uploaded")) as upload:
+        service.video_thumbnail = AsyncMock(return_value=(b"jpeg", 320, 180))
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="uploaded")) as upload, \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo(884, 1080, 1920))):
             await service.send_stream(job, video, "480p", CDN_URL, 1, 3)
             await service.send_stream(job, video, "mp3", CDN_URL, 2, 3)
         self.assertEqual(upload.await_args_list[0].args[3], "A real YouTube video title [480p].mp4")
@@ -215,7 +249,24 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.send_file.await_args_list[0].kwargs["caption"],
                          "1/3 · A real YouTube video title [480p]")
         self.assertEqual(client.send_file.await_args_list[1].kwargs["mime_type"], "audio/mpeg")
+        attr = client.send_file.await_args_list[0].kwargs["attributes"][0]
+        self.assertEqual((attr.duration, attr.w, attr.h), (884, 1080, 1920))
+        self.assertEqual(client.send_file.await_args_list[0].kwargs["thumb"].name, "preview.jpg")
         self.assertTrue(media_name("X" * 250, "480p", 80).endswith(" [480p]"))
+
+    async def test_api_duration_and_thumbnail_shape_if_probe_unavailable(self):
+        client = MagicMock()
+        client.edit_message = AsyncMock()
+        client.send_file = AsyncMock()
+        service = DownloaderBot(client, MagicMock())
+        service.video_thumbnail = AsyncMock(return_value=(b"jpeg", 320, 180))
+        video = Video("Video", {"480p": CDN_URL}, duration=884)
+        job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), video)
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="handle")), \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo())):
+            await service.send_stream(job, video, "480p", CDN_URL, 1, 1)
+        attr = client.send_file.call_args.kwargs["attributes"][0]
+        self.assertEqual((attr.duration, attr.w, attr.h), (884, 320, 180))
 
     async def test_send_flood_wait_reuses_uploaded_handle(self):
         from telethon.errors import FloodWaitError
@@ -225,7 +276,9 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         service = DownloaderBot(client, MagicMock())
         video = Video("YouTube title", {"480p": CDN_URL})
         job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), video)
+        service.video_thumbnail = AsyncMock(return_value=(None, 0, 0))
         with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="uploaded once")) as upload, \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo())), \
              patch("ytdown.bot.asyncio.sleep", new=AsyncMock()) as sleeper:
             await service.send_stream(job, video, "480p", CDN_URL, 1, 1)
         upload.assert_awaited_once()
@@ -241,7 +294,9 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         service = DownloaderBot(client, MagicMock())
         video = Video("YouTube title", {"480p": CDN_URL})
         job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), video)
-        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="same handle")) as upload:
+        service.video_thumbnail = AsyncMock(return_value=(None, 0, 0))
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="same handle")) as upload, \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo())):
             await service.send_stream(job, video, "480p", CDN_URL, 1, 1)
         upload.assert_awaited_once()
         self.assertEqual(client.send_file.await_count, 2)
@@ -265,8 +320,9 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("(4K)", service.keyboard(choice)[1][0].text)
         event.data = b"s:abcd1234:done"
         await service.callback(event)
-        self.assertEqual(service.jobs[7].selected, ("360p", "2160p"))
-        await service.jobs[7].task
+        job = service.user_jobs(7)[0]
+        self.assertEqual(job.selected, ("360p", "2160p"))
+        await job.task
         event.data = b"s:abcd1234:t:720p"
         await service.callback(event)
         self.assertEqual(event.answer.call_args.args[0], "This selection expired. Send the link again.")
@@ -320,8 +376,8 @@ class LiveStatusTests(unittest.IsolatedAsyncioTestCase):
         client.edit_message = AsyncMock()
         service = DownloaderBot(client, MagicMock())
         job = Job(7, "peer", 33, Source("video", VIDEO_URL), ("480p",), None)
-        service.jobs[7] = job
-        self.assertIn("position 1", service.format_job(job))
+        service.jobs[job.token] = job
+        self.assertIn("Queue #1", service.format_job(job))
         job.state = "running"
         job.title = "YouTube title"
         job.quality = "480p"
@@ -333,8 +389,8 @@ class LiveStatusTests(unittest.IsolatedAsyncioTestCase):
         await service.render(job, force=True)
         rendered = client.edit_message.call_args.args[2]
         self.assertIn("50.0%", rendered)
-        self.assertIn("Uploaded: 512.0 KiB / 1.0 MiB", rendered)
-        self.assertIn("ETA:", rendered)
+        self.assertIn("Telegram: 512.0 KiB / 1.0 MiB", rendered)
+        self.assertIn("ETA ", rendered)
         self.assertIn("YouTube title [480p]", rendered)
         self.assertEqual(len(client.edit_message.call_args.kwargs["buttons"][0]), 2)
         await service.render(job)
@@ -342,7 +398,11 @@ class LiveStatusTests(unittest.IsolatedAsyncioTestCase):
         event = SimpleNamespace(data=f"j:{job.token}:refresh".encode(), sender_id=7,
                                 is_private=True, message_id=33, answer=AsyncMock())
         await service.callback(event)
-        self.assertIn("Next update in", event.answer.call_args.args[0])
+        self.assertEqual(client.edit_message.await_count, 2)  # Manual refresh is immediate.
+        self.assertIn("Refreshing now", event.answer.call_args.args[0])
+        self.assertGreater(job.next_edit, asyncio.get_running_loop().time())
+        await service.callback(event)
+        self.assertIn("Just refreshed", event.answer.call_args.args[0])
 
     async def test_flood_wait_delays_next_edit_without_crashing_transfer(self):
         from telethon.errors import FloodWaitError
@@ -405,3 +465,98 @@ class LiveStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(count == 1 for part, count in client.attempts.items() if part != 0))
         self.assertEqual(waits, [2, 0])
         sleeper.assert_awaited_once_with(3)
+
+
+class QueueAndAPISettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_multiple_links_from_same_user_can_queue_and_cancel_individually(self):
+        service = DownloaderBot(MagicMock(), MagicMock())
+        service.run_job = AsyncMock()
+        existing = Job(7, "peer", 10, Source("video", VIDEO_URL), ("480p",), None, state="running")
+        service.jobs[existing.token] = existing
+        notice = SimpleNamespace(edit=AsyncMock())
+        event = SimpleNamespace(sender_id=7, raw_text=VIDEO_URL, is_private=True,
+                                get_input_chat=AsyncMock(return_value="peer"),
+                                respond=AsyncMock(return_value=notice))
+        with patch("ytdown.bot.fetch_video", new=AsyncMock(return_value=Video("API title", {"480p": CDN_URL}))), \
+             patch("ytdown.bot.get_youtube_title", new=AsyncMock(return_value="YouTube title")):
+            await service.on_link(event)
+        self.assertIsNotNone(service.selections.get(7))
+        selection = service.selections[7]
+        selection.selected.add("480p")
+        click = SimpleNamespace(sender_id=7, data=f"s:{selection.token}:done".encode(),
+                                is_private=True, message_id=11, answer=AsyncMock())
+        await service.callback(click)
+        self.assertEqual(len(service.user_jobs(7)), 2)
+        event.raw_text = "/queue"
+        await service.on_message(event)
+        self.assertIn("Your jobs (2)", event.respond.call_args.args[0])
+        self.assertIn("queue #1", event.respond.call_args.args[0])
+        second = next(j for j in service.user_jobs(7) if j is not existing)
+        await second.task
+        wrong_user = SimpleNamespace(sender_id=8, data=f"j:{second.token}:cancel".encode(),
+                                     is_private=True, message_id=11, answer=AsyncMock())
+        await service.callback(wrong_user)
+        self.assertIn("expired", wrong_user.answer.call_args.args[0])
+        # Cancel by exact job ID must not cancel the first job.
+        second.task = asyncio.create_task(asyncio.sleep(300))
+        event.raw_text = f"/cancel {second.token}"
+        await service.on_message(event)
+        self.assertTrue(second.task.cancelled() or second.task.cancelling())
+        self.assertIn(existing.token, service.jobs)
+        await asyncio.gather(second.task, return_exceptions=True)
+
+    async def test_full_queue_does_not_discard_selection(self):
+        service = DownloaderBot(MagicMock(), MagicMock())
+        service.run_job = AsyncMock()
+        for i in range(5):
+            job = Job(i, f"peer{i}", i, Source("video", VIDEO_URL), ("480p",), None)
+            service.jobs[job.token] = job
+        selection = Selection("abcd1234", Source("video", VIDEO_URL), ("480p",), "peer", selected={"480p"})
+        service.selections[7] = selection
+        event = SimpleNamespace(sender_id=7, data=b"s:abcd1234:done", is_private=True,
+                                message_id=77, answer=AsyncMock())
+        await service.callback(event)
+        self.assertIn("Queue is full", event.answer.call_args.args[0])
+        self.assertIs(service.selections[7], selection)
+
+    async def test_api_redirect_to_private_address_is_rejected(self):
+        from ytdown.bot import fetch_video
+        response = FakeResponse()
+        response.status = 302
+        response.url = "https://api.example.com/?url=video"
+        response.headers = {"Location": "http://127.0.0.1/internal"}
+        session = MagicMock()
+        session.get.return_value = response
+        with self.assertRaises(ValueError):
+            await fetch_video(session, VIDEO_URL, "https://api.example.com/")
+        self.assertEqual(session.get.call_count, 1)
+
+    async def test_changeapi_per_user_then_reset(self):
+        from ytdown.bot import API_URL, normalize_api_endpoint
+        endpoint = normalize_api_endpoint("https://api.example.com/download?key=hello&url=")
+        self.assertEqual(endpoint, "https://api.example.com/download?key=hello")
+        for bad in ("http://api.example.com/?url=", "https://127.0.0.1/?url=",
+                    "https://www.youtube.com/watch?v=3SY1i5CB03Q"):
+            with self.assertRaises(ValueError):
+                normalize_api_endpoint(bad)
+        service = DownloaderBot(MagicMock(), MagicMock())
+        event = SimpleNamespace(sender_id=7, is_private=True, raw_text="/changeapi",
+                                respond=AsyncMock(), get_input_chat=AsyncMock(return_value="peer"))
+        await service.on_message(event)
+        self.assertIn(7, service.awaiting_api)
+        event.raw_text = "https://api.example.com/download?key=hello&url="
+        await service.on_message(event)
+        self.assertEqual(service.api_for(7), endpoint)
+        self.assertEqual(service.api_for(8), API_URL)
+        notice = SimpleNamespace(edit=AsyncMock())
+        event.respond = AsyncMock(return_value=notice)
+        event.raw_text = VIDEO_URL
+        with patch("ytdown.bot.fetch_video", new=AsyncMock(return_value=Video("API", {"480p": CDN_URL}))) as fetch, \
+             patch("ytdown.bot.get_youtube_title", new=AsyncMock(return_value="YouTube")):
+            await service.on_message(event)
+        self.assertEqual(fetch.call_args.args[2], endpoint)
+        self.assertEqual(service.selections[7].api_endpoint, endpoint)
+        event.raw_text = "/changeapi reset"
+        await service.on_message(event)
+        self.assertEqual(service.api_for(7), API_URL)
+        self.assertEqual(service.selections[7].api_endpoint, endpoint)  # Existing selections keep their API.

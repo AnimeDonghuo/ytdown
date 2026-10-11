@@ -25,6 +25,7 @@ class CoreTests(unittest.TestCase):
 
     def test_provider_formats_are_authoritative(self):
         payload = {"success": True, "availableQuality": [360, 720, 2160], "title": "Example",
+                   "duration": 884, "thumbnail": "https://i.ytimg.com/vi/3SY1i5CB03Q/maxresdefault.jpg",
                    "downloads": [
                        {"quality": "360p", "type": "video", "format": "mp4", "url": "https://cdn.example.com/360.mp4"},
                        {"quality": "720p", "type": "video", "format": "webm", "url": "https://cdn.example.com/720.webm"},
@@ -32,6 +33,8 @@ class CoreTests(unittest.TestCase):
                    ], "audio_stream_link": "https://cdn.example.com/128.mp3"}
         self.assertEqual(set(normalize_video(payload).streams), {"360p", "mp3"})
         self.assertEqual(normalize_video(payload).title, "Example")  # Fallback if YouTube lookup fails.
+        self.assertEqual(normalize_video(payload).duration, 884)
+        self.assertTrue(normalize_video(payload).thumbnail.endswith("maxresdefault.jpg"))
         self.assertFalse(public_https_url("https://127.0.0.1/video"))
         self.assertFalse(public_https_url("https://localhost/video"))
         with self.assertRaises(ValueError):

@@ -24,6 +24,8 @@ class Source:
 class Video:
     title: str
     streams: dict[str, str]
+    duration: int = 0
+    thumbnail: str = ""
 
 
 @dataclass(frozen=True)
@@ -116,7 +118,10 @@ def normalize_video(payload: object) -> Video:
         raise ValueError("The link provider returned no usable MP4/MP3 downloads.")
     # Keep the provider title only as a fallback if YouTube metadata is unavailable.
     title = youtube_title(payload.get("title"), str(payload.get("video_id") or ""))
-    return Video(title, streams)
+    raw_duration = payload.get("duration")
+    duration = int(raw_duration) if isinstance(raw_duration, (int, float)) and 0 < raw_duration < 7 * 86400 else 0
+    thumbnail = payload.get("thumbnail")
+    return Video(title, streams, duration, thumbnail if public_https_url(thumbnail) else "")
 
 
 def extract_title(url: str) -> str:
