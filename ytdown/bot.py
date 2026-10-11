@@ -1163,15 +1163,21 @@ class DownloaderBot:
             video_id = source.rsplit("=", 1)[-1]
             # Prefer the API's supplied thumbnail; YouTube sizes are fallbacks.
             urls = [video.thumbnail] if video.thumbnail else []
-            for candidate in (f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
-                              f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"):
+            # HQ is reliably present; maxres can be a valid but blank placeholder.
+            for candidate in (f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                              f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg"):
                 if candidate not in urls:
                     urls.append(candidate)
         thumb = None
         for image_url in urls:
             thumb = await thumbnail_jpeg(self.http, image_url)
             if thumb:
+                LOG.info("Prepared %s thumbnail from %s (%d bytes, %dx%d)",
+                         job.source.kind, urlsplit(image_url).hostname,
+                         len(thumb[0]), thumb[1], thumb[2])
                 break
+        if not thumb:
+            LOG.info("No usable API/site thumbnail for %s", job.source.kind)
         job.thumbnail_id = source
         job.thumbnail = thumb[0] if thumb else None
         job.thumb_size = thumb[1:] if thumb else (0, 0)
@@ -1230,6 +1236,11 @@ class DownloaderBot:
             fallback = await probe.preview_jpeg()
             if fallback:
                 thumb_data, thumb_w, thumb_h = fallback
+                LOG.info("Prepared Terabox frame thumbnail (%d bytes, %dx%d)",
+                         len(thumb_data), thumb_w, thumb_h)
+        if video_file and not thumb_data:
+            LOG.warning("No usable thumbnail for %s; Telegram may show the video's own first frame",
+                        job.source.kind)
         if audio:
             attributes = [types.DocumentAttributeAudio(duration=video.duration,
                                                        title=media_name(video.title, quality, 64))]
@@ -1259,6 +1270,7 @@ class DownloaderBot:
             try:
                 await send_with_preview()
             except (PhotoInvalidDimensionsError, PhotoInvalidError):
+                LOG.warning("Telegram rejected the prepared thumbnail for %s", job.source.kind)
                 await send_with_preview(with_thumb=False)
             except VideoContentTypeInvalidError:
                 if audio:

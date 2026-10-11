@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from PIL import Image
-from ytdown.media import MediaInfo, MediaProbe, thumbnail_jpeg
+from ytdown.media import MediaInfo, MediaProbe, jpeg_preview, thumbnail_jpeg
 
 
 class MediaTests(unittest.IsolatedAsyncioTestCase):
@@ -102,6 +102,55 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ThumbnailSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_telethon_attaches_our_jpeg_as_document_thumbnail(self):
+        from telethon import TelegramClient
+        from telethon.sessions import MemorySession
+        from telethon.tl import types
+        client = TelegramClient(MemorySession(), 12345, "0" * 32)
+        source = io.BytesIO()
+        Image.new("RGB", (1280, 720), "red").save(source, format="JPEG")
+        preview = jpeg_preview(source.getvalue())
+        thumb = io.BytesIO(preview[0])
+        thumb.name = "preview.jpg"
+        async def upload(file, **kwargs):
+            self.assertEqual(file.name, "preview.jpg")
+            self.assertLessEqual(len(file.read()), 18 * 1024)
+            return types.InputFile(123, 1, file.name, "0" * 32)
+        client.upload_file = upload
+        _, media, _ = await client._file_to_media(
+            types.InputFileBig(321, 2, "video.mp4"), thumb=thumb, mime_type="video/mp4",
+            attributes=[types.DocumentAttributeVideo(360, 1280, 720, supports_streaming=True)],
+            supports_streaming=True)
+        self.assertIsInstance(media, types.InputMediaUploadedDocument)
+        self.assertEqual(media.thumb.name, "preview.jpg")
+        self.assertEqual((media.attributes[1].w, media.attributes[1].h), (1280, 720))
+
+    async def test_complex_thumbnail_is_small_enough_for_telegram(self):
+        import random
+        rng = random.Random(42)
+        image = Image.frombytes("RGB", (640, 360), rng.randbytes(640 * 360 * 3))
+        source = io.BytesIO()
+        image.save(source, format="JPEG", quality=92)
+        result = jpeg_preview(source.getvalue())
+        self.assertIsNotNone(result)
+        jpeg, width, height = result
+        self.assertLessEqual(len(jpeg), 18 * 1024)
+        self.assertLessEqual(max(width, height), 320)
+        self.assertEqual(Image.open(io.BytesIO(jpeg)).size, (width, height))
+
+    async def test_mostly_white_placeholder_with_small_logo_is_rejected(self):
+        from PIL import ImageDraw
+        image = Image.new("RGB", (320, 180), "white")
+        ImageDraw.Draw(image).rectangle((145, 70, 175, 95), fill="red")
+        source = io.BytesIO()
+        image.save(source, format="JPEG", quality=80)
+        self.assertIsNone(jpeg_preview(source.getvalue()))
+        larger_logo = Image.new("RGB", (320, 180), "white")
+        ImageDraw.Draw(larger_logo).rectangle((100, 62, 220, 118), fill="red")
+        source = io.BytesIO()
+        larger_logo.save(source, format="JPEG", quality=80)
+        self.assertIsNone(jpeg_preview(source.getvalue()))
+
     async def test_blank_placeholder_is_rejected(self):
         image = io.BytesIO()
         Image.new("RGB", (1280, 720), "white").save(image, "JPEG")

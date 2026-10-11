@@ -1,4 +1,5 @@
 import asyncio
+import io
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -170,6 +171,44 @@ class ModeAndFolderTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await self.service.video_thumbnail(job, Video(
                 "Movie", {}, thumbnail=job.thumbnail_urls[0])), thumb)
         self.assertEqual([call.args[1] for call in fetch.await_args_list], list(job.thumbnail_urls))
+
+    async def test_real_blank_api_image_falls_back_to_usable_youtube_hq(self):
+        from PIL import Image, ImageDraw
+        def image_bytes(blank):
+            image = Image.new("RGB", (320, 180), "white" if blank else "red")
+            if blank:
+                ImageDraw.Draw(image).rectangle((100, 62, 220, 118), fill="red")
+            data = io.BytesIO()
+            image.save(data, format="JPEG", quality=80)
+            return data.getvalue()
+        def response(data):
+            result = MagicMock()
+            result.__aenter__ = AsyncMock(return_value=result)
+            result.__aexit__ = AsyncMock()
+            result.status, result.content_length = 200, len(data)
+            result.content.read = AsyncMock(return_value=data)
+            return result
+        source = Source("video", "https://www.youtube.com/watch?v=3SY1i5CB03Q")
+        job = Job(7, "peer", 2, source, ("480p",), None)
+        session = MagicMock()
+        session.get.side_effect = [response(image_bytes(True)), response(image_bytes(False))]
+        self.service.http = session
+        jpeg, width, height = await self.service.video_thumbnail(job, Video(
+            "", {}, thumbnail="https://cdn.example.com/blank.jpg"))
+        self.assertLessEqual(len(jpeg), 18 * 1024)
+        self.assertEqual((width, height), (320, 180))
+        self.assertEqual(session.get.call_count, 2)
+
+    async def test_youtube_blank_api_thumbnail_falls_back_to_hq(self):
+        source = Source("video", "https://www.youtube.com/watch?v=3SY1i5CB03Q")
+        job = Job(7, "peer", 2, source, ("480p",), None)
+        api_thumbnail = "https://cdn.example.com/white.jpg"
+        with patch("ytdown.bot.thumbnail_jpeg", new=AsyncMock(
+                side_effect=[None, (b"hq", 320, 180)])) as thumb:
+            self.assertEqual(await self.service.video_thumbnail(job, Video(
+                "", {}, thumbnail=api_thumbnail)), (b"hq", 320, 180))
+        self.assertEqual([call.args[1] for call in thumb.await_args_list],
+                         [api_thumbnail, "https://i.ytimg.com/vi/3SY1i5CB03Q/hqdefault.jpg"])
 
     async def test_api_thumbnail_is_preferred_not_youtube_fallback(self):
         source = Source("video", "https://www.youtube.com/watch?v=3SY1i5CB03Q")

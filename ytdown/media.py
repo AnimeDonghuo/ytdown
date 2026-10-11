@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 import aiohttp
-from PIL import Image, ImageStat, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
 
 from .core import public_https_url
 
@@ -140,16 +140,28 @@ def jpeg_preview(data: bytes) -> tuple[bytes, int, int] | None:
         if image.width * image.height > 5_000_000:
             return None
         image.thumbnail((320, 320), Image.Resampling.LANCZOS)
-        # Some providers return a valid JPEG that is only a blank placeholder.
-        sample = ImageStat.Stat(image.convert("RGB").resize((32, 32)))
-        if min(sample.mean) > 247 and max(sample.var) < 30:
+        image = image.convert("RGB")
+        # A valid maxresdefault URL can return an almost-white placeholder with
+        # a small logo; low variance alone does not catch it. Try HQ instead.
+        sample = image.resize((32, 32), Image.Resampling.BILINEAR)
+        pixels = sample.tobytes()
+        bright = [min(pixels[i:i + 3]) >= 240 for i in range(0, len(pixels), 3)]
+        border = [bright[y * 32 + x] for y in range(32) for x in range(32)
+                  if x in (0, 31) or y in (0, 31)]
+        if sum(bright) >= 0.9 * len(bright) or (
+                sum(bright) >= 0.82 * len(bright) and sum(border) >= 0.95 * len(border)):
             return None
-        width, height = image.size
-        out = io.BytesIO()
-        image.convert("RGB").save(out, format="JPEG", quality=75, optimize=True)
-        if out.tell() > 200 * 1024:
-            return None
-        return out.getvalue(), width, height
+        # Telegram silently ignores many otherwise valid thumbnails above ~20 KB.
+        # Compress/downscale until it can reliably attach, preserving aspect ratio.
+        for bound in (320, 256, 200, 160, 128):
+            candidate = image.copy()
+            candidate.thumbnail((bound, bound), Image.Resampling.LANCZOS)
+            for quality in (72, 58, 44, 32):
+                out = io.BytesIO()
+                candidate.save(out, format="JPEG", quality=quality, optimize=True)
+                if out.tell() <= 18 * 1024:
+                    return out.getvalue(), *candidate.size
+        return None
     except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
         return None
 
