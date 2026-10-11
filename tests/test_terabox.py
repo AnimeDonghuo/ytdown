@@ -38,6 +38,17 @@ class TeraboxNormalizationTests(unittest.TestCase):
         self.assertEqual(unnamed_ext.files[0].size, 4096)
         self.assertEqual(unnamed_ext.files[0].quality, "2160p")
 
+    def test_file_thumbnail_falls_back_to_parent_thumbnail(self):
+        listing = normalize_terabox({"success": True, "data": {
+            "thumbnail": {"url": "https://cdn.example.com/parent.jpg"},
+            "files": [{"id": "A", "filename": "film.mp4", "quality": "480p",
+                       "thumbnail_url": "https://cdn.example.com/file.jpg",
+                       "download_url": CDN}]}})
+        item = listing.files[0]
+        self.assertEqual(item.thumbnail, "https://cdn.example.com/file.jpg")
+        self.assertEqual(item.thumbnail_urls, ("https://cdn.example.com/file.jpg",
+                                               "https://cdn.example.com/parent.jpg"))
+
     def test_multiple_qualities_for_one_file_are_not_counted_as_folder(self):
         listing = normalize_terabox({"success": True, "total_files": 1,
                                      "data": {"files": [
@@ -151,6 +162,15 @@ class ModeAndFolderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.service.selections[7].start, self.service.selections[7].end), (200, 300))
         self.assertEqual(self.service.selections[7].choices[0], "360p")
 
+    async def test_terabox_file_preview_falls_back_to_parent_api_url(self):
+        job = Job(7, "peer", 2, Source("terabox", SHARE), ("480p",), None)
+        job.thumbnail_urls = ("https://cdn.example.com/file.jpg", "https://cdn.example.com/parent.jpg")
+        thumb = (b"jpeg", 320, 180)
+        with patch("ytdown.bot.thumbnail_jpeg", new=AsyncMock(side_effect=[None, thumb])) as fetch:
+            self.assertEqual(await self.service.video_thumbnail(job, Video(
+                "Movie", {}, thumbnail=job.thumbnail_urls[0])), thumb)
+        self.assertEqual([call.args[1] for call in fetch.await_args_list], list(job.thumbnail_urls))
+
     async def test_api_thumbnail_is_preferred_not_youtube_fallback(self):
         source = Source("video", "https://www.youtube.com/watch?v=3SY1i5CB03Q")
         job = Job(7, "peer", 2, source, ("480p",), None)
@@ -185,6 +205,22 @@ class StreamMetadataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(options["attributes"][0].duration, 120)
         self.assertEqual((options["attributes"][0].w, options["attributes"][0].h), (1920, 1080))
         self.assertEqual(options["thumb"].read(), b"jpeg")
+
+    async def test_terabox_missing_api_thumbnail_uses_frame_preview(self):
+        from ytdown.media import MediaInfo
+        service = DownloaderBot(MagicMock(), MagicMock())
+        service.client.send_file = AsyncMock()
+        service.progress = AsyncMock()
+        item = TeraboxFile("1", "film.mkv", "480p", CDN, "", "video/x-matroska", 1024)
+        job = Job(7, "peer", 2, Source("terabox", SHARE), ("480p",), None)
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value=object())), \
+             patch.object(service, "video_thumbnail", new=AsyncMock(return_value=(None, 0, 0))), \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo())), \
+             patch("ytdown.bot.MediaProbe.preview_jpeg", new=AsyncMock(
+                 return_value=(b"frame", 320, 180))) as frame:
+            await service.send_stream(job, Video("Film", {}, 0), "480p", CDN, 1, 1, item)
+        frame.assert_awaited_once()
+        self.assertEqual(service.client.send_file.call_args.kwargs["thumb"].read(), b"frame")
 
     async def test_known_api_size_allows_transfer_without_content_length(self):
         from ytdown.bot import upload_stream

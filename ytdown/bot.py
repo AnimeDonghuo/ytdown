@@ -167,11 +167,23 @@ class Job:
     edit_flood_until: float = 0.0
     thumbnail: bytes | None = None
     thumbnail_id: str = ""
+    thumbnail_urls: tuple[str, ...] = ()
     thumb_size: tuple[int, int] = (0, 0)
     current_url: str = ""
     start: int = 1
     end: int = 1
     listing: TeraboxListing | None = None
+
+
+def is_media_link(raw: str) -> bool:
+    """Keep media links out of a pending /changeapi URL prompt."""
+    for parser in (parse_source, parse_terabox_source):
+        try:
+            parser(raw)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 def normalize_api_endpoint(raw: str) -> str:
@@ -592,10 +604,13 @@ class DownloaderBot:
                 "Jobs/selections are not restored after a restart.")
         elif command == "/change":
             uid = event.sender_id
+            # A pending /changeapi prompt must never capture the next media URL.
+            self.awaiting_api.discard(uid)
             token = secrets.token_hex(4)
             self.mode_tokens[uid] = token
             active = self.modes.get(uid, "youtube")
-            await event.respond(f"Current downloader: {active.title()}. Choose a service for future links:",
+            active_label = "YouTube" if active == "youtube" else "Terabox"
+            await event.respond(f"Current downloader: {active_label}. Choose a service for future links:",
                                 buttons=[[Button.inline("▶️ YouTube", data=f"m:{token}:youtube".encode()),
                                           Button.inline("📁 Terabox", data=f"m:{token}:terabox".encode())]])
         elif command == "/changeapi":
@@ -681,12 +696,17 @@ class DownloaderBot:
             await event.respond("Unknown command. Send /help for instructions.")
         else:
             if event.sender_id in self.awaiting_api:
-                try:
-                    self.set_api(event.sender_id, text)
-                except ValueError as exc:
-                    await event.respond(f"{exc} Send an API URL, or /changeapi reset.")
+                if is_media_link(text):
+                    self.awaiting_api.discard(event.sender_id)
+                    self.pending_ranges.pop(event.sender_id, None)
+                    await self.on_link(event)
                 else:
-                    await event.respond("Custom API saved for your future links. /changeapi reset restores the default.")
+                    try:
+                        self.set_api(event.sender_id, text)
+                    except ValueError as exc:
+                        await event.respond(f"{exc} Send an API URL, or /changeapi reset.")
+                    else:
+                        await event.respond("Custom API saved for your future links. /changeapi reset restores the default.")
             elif event.sender_id in self.pending_ranges and not text.startswith("https://"):
                 await self.on_range(event)
             else:
@@ -881,10 +901,12 @@ class DownloaderBot:
             mode = parts[2]
             self.modes[uid] = mode
             self.mode_tokens.pop(uid, None)
+            self.awaiting_api.discard(uid)
             self.pending_ranges.pop(uid, None)
             self.selections.pop(uid, None)
-            await event.answer(f"{mode.title()} selected")
-            await event.edit(f"{mode.title()} mode is active. Send a {mode.title()} link.")
+            label = "YouTube" if mode == "youtube" else "Terabox"
+            await event.answer(f"{label} selected")
+            await event.edit(f"{label} mode is active. Send a {label} link.")
             return
         if parts[0] == "j":
             job = self.jobs.get(parts[1]) if len(parts) == 3 else None
@@ -1134,7 +1156,9 @@ class DownloaderBot:
         if job.thumbnail_id == source:
             return job.thumbnail, *job.thumb_size
         if job.source.kind.startswith("terabox"):
-            urls = [video.thumbnail] if video.thumbnail else []
+            # Prefer the file URL supplied by the API, then its parent listing
+            # thumbnail. Both go through the same JPEG/redirect/blank checks as YouTube.
+            urls = list(dict.fromkeys(url for url in (video.thumbnail, *job.thumbnail_urls) if url))
         else:
             video_id = source.rsplit("=", 1)[-1]
             # Prefer the API's supplied thumbnail; YouTube sizes are fallbacks.
@@ -1161,6 +1185,7 @@ class DownloaderBot:
         audio = quality.lower() == "mp3" or bool(source_file and source_file.mime.startswith("audio/"))
         video_file = source_file.video if source_file else not audio
         streamable = video_file and suffix == ".mp4"
+        job.thumbnail_urls = source_file.thumbnail_urls if source_file else ()
         safe_title = re.sub(r"[^\w .-]", "_", video.title, flags=re.UNICODE).strip(" .") or "video"
         filename = media_name(safe_title, quality, 100) + suffix
         prefix = f"{index}/{total} · " if total > 1 else ""
@@ -1199,6 +1224,12 @@ class DownloaderBot:
             LOG.warning("Thumbnail unavailable: %s", type(exc).__name__)
             thumb_data, thumb_w, thumb_h = None, 0, 0
         info = await probe.inspect() if probe else None
+        if source_file and video_file and not thumb_data and probe:
+            # Terabox often omits or expires preview URLs. Use one decoded frame
+            # from the already captured bounded sample; no second full download.
+            fallback = await probe.preview_jpeg()
+            if fallback:
+                thumb_data, thumb_w, thumb_h = fallback
         if audio:
             attributes = [types.DocumentAttributeAudio(duration=video.duration,
                                                        title=media_name(video.title, quality, 64))]

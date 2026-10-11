@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from ytdown.bot import API_URL, DownloaderBot, Job, Selection
 from ytdown.core import Source, Video
@@ -25,6 +25,43 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
         self.sent = []
         self.event = SimpleNamespace(sender_id=7, is_private=True, raw_text="/status",
                                      respond=respond, get_input_chat=AsyncMock(return_value="peer"))
+
+    async def test_change_mode_clears_stale_api_prompt_before_youtube_link(self):
+        from ytdown.core import Video
+        self.service.awaiting_api.add(7)
+        self.event.raw_text = "/change"
+        await self.service.on_message(self.event)
+        self.assertNotIn(7, self.service.awaiting_api)
+        token = self.service.mode_tokens[7]
+        click = SimpleNamespace(sender_id=7, is_private=True,
+                                data=f"m:{token}:youtube".encode(),
+                                answer=AsyncMock(), edit=AsyncMock())
+        await self.service.callback(click)
+        self.event.raw_text = "https://youtu.be/S7FjeuDF7_k?si=ASgwXk3IybWYujvS"
+        self.event.respond = AsyncMock(return_value=SimpleNamespace(edit=AsyncMock()))
+        with patch("ytdown.bot.fetch_video", new=AsyncMock(return_value=Video(
+                "API", {"480p": "https://cdn.example.com/v.mp4"}))) as fetch, \
+             patch("ytdown.bot.get_youtube_title", new=AsyncMock(return_value="YouTube")):
+            await self.service.on_message(self.event)
+        fetch.assert_awaited_once()
+        self.assertIn("S7FjeuDF7_k", fetch.call_args.args[1])
+        self.assertIn(7, self.service.selections)
+        self.assertNotIn(7, self.service.api_overrides)
+
+    async def test_media_link_not_consumed_by_pending_changeapi(self):
+        self.service.awaiting_api.add(7)
+        self.event.raw_text = "https://youtu.be/S7FjeuDF7_k?si=ASgwXk3IybWYujvS"
+        with patch.object(self.service, "on_link", new=AsyncMock()) as on_link:
+            await self.service.on_message(self.event)
+        on_link.assert_awaited_once_with(self.event)
+        self.assertNotIn(7, self.service.awaiting_api)
+        self.service.awaiting_api.add(7)
+        self.service.modes[7] = "terabox"
+        self.event.raw_text = SHARE_URL
+        with patch.object(self.service, "on_link", new=AsyncMock()) as on_link:
+            await self.service.on_message(self.event)
+        on_link.assert_awaited_once_with(self.event)
+        self.assertNotIn(7, self.service.awaiting_api)
 
     async def test_user_supplied_terasharefile_url_and_spoof_denied(self):
         self.assertEqual(parse_terabox_source(SHARE_URL), SHARE_URL)

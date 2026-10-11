@@ -25,6 +25,7 @@ class TeraboxFile:
     thumbnail: str
     mime: str
     size: int
+    thumbnail_urls: tuple[str, ...] = ()  # API file preview(s), then parent preview.
 
     @property
     def title(self) -> str:
@@ -118,11 +119,19 @@ def normalize_terabox(payload: object) -> TeraboxListing:
         except (ValueError, OverflowError):
             size = 0
         size = size if 0 < size < 10 * 1024**3 else 0
-        thumb = item.get("thumbnail_url") or item.get("thumbnail") or data.get("thumbnail") or ""
+        thumbnails = []
+        for value in (item.get("thumbnail_url"), item.get("thumbnail"),
+                      data.get("thumbnail_url"), data.get("thumbnail"),
+                      payload.get("thumbnail_url"), payload.get("thumbnail")):
+            if isinstance(value, dict):
+                value = value.get("url") or value.get("src") or value.get("image_url")
+            if public_https_url(value) and value not in thumbnails:
+                thumbnails.append(value)
         file_id = str(item.get("id") or name)
         variant = TeraboxFile(file_id, name,
                               normalize_quality(item.get("quality") or data.get("quality"), name),
-                              link, thumb if public_https_url(thumb) else "", mime, size)
+                              link, thumbnails[0] if thumbnails else "", mime, size,
+                              tuple(thumbnails))
         # Repeat IDs (or repeated names without IDs) represent quality choices,
         # not extra folder entries. Duplicate qualities are not sent twice.
         group = groups.setdefault(file_id, [])

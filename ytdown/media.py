@@ -52,18 +52,21 @@ class MediaProbe:
             else:
                 self.tail_length -= len(first)
 
+    def write_sample(self, path: Path) -> None:
+        with path.open("wb") as output:
+            output.truncate(self.size)  # Sparse: no 2 GB disk allocation.
+            output.seek(0)
+            output.write(self.head)
+            output.seek(max(0, self.size - self.tail_length))
+            output.write(b"".join(self.tail))
+
     async def inspect(self) -> MediaInfo:
         if not self.size:
             return MediaInfo()
         try:
             with tempfile.TemporaryDirectory(prefix="ytdown-probe-") as directory:
                 path = Path(directory) / ("sample" + self.suffix)
-                with path.open("wb") as output:
-                    output.truncate(self.size)  # Sparse: no 2 GB disk allocation.
-                    output.seek(0)
-                    output.write(self.head)
-                    output.seek(max(0, self.size - self.tail_length))
-                    output.write(b"".join(self.tail))
+                self.write_sample(path)
                 process = await asyncio.create_subprocess_exec(
                     "ffprobe", "-v", "error", "-threads", "1", "-probesize", "8388608",
                     "-select_streams", "v:0",
@@ -91,8 +94,64 @@ class MediaProbe:
                 width = height = 0
             return MediaInfo(int(duration) if 0 < duration < 7 * 86400 else 0, width, height)
         except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
-            LOG.info("Could not probe MP4 metadata: %s", exc)
+            LOG.info("Could not probe media metadata: %s", exc)
             return MediaInfo()
+
+    async def preview_jpeg(self) -> tuple[bytes, int, int] | None:
+        """Best-effort Terabox frame when both API thumbnail URLs fail.
+
+        Decode just one frame from our bounded sparse sample, never the full file.
+        Limit CPU to one thread and eight seconds for Koyeb free instances.
+        """
+        if not self.size:
+            return None
+        try:
+            with tempfile.TemporaryDirectory(prefix="ytdown-preview-") as directory:
+                path = Path(directory) / ("sample" + self.suffix)
+                self.write_sample(path)
+                process = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-v", "error", "-threads", "1", "-probesize", "8388608",
+                    "-i", str(path), "-an", "-sn", "-frames:v", "1",
+                    "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+                    "-vcodec", "mjpeg", "-f", "image2pipe", "pipe:1",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                try:
+                    image, _ = await asyncio.wait_for(process.communicate(), timeout=8)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.communicate()
+                    return None
+                except asyncio.CancelledError:
+                    process.kill()
+                    await process.communicate()
+                    raise
+            return jpeg_preview(image) if process.returncode == 0 else None
+        except OSError as exc:
+            LOG.info("Could not generate media preview: %s", exc)
+            return None
+
+
+def jpeg_preview(data: bytes) -> tuple[bytes, int, int] | None:
+    """Normalize a provider image or extracted frame for Telegram thumbnails."""
+    if not data or len(data) > 4 * 1024 * 1024:
+        return None
+    try:
+        image = Image.open(io.BytesIO(data))
+        if image.width * image.height > 5_000_000:
+            return None
+        image.thumbnail((320, 320), Image.Resampling.LANCZOS)
+        # Some providers return a valid JPEG that is only a blank placeholder.
+        sample = ImageStat.Stat(image.convert("RGB").resize((32, 32)))
+        if min(sample.mean) > 247 and max(sample.var) < 30:
+            return None
+        width, height = image.size
+        out = io.BytesIO()
+        image.convert("RGB").save(out, format="JPEG", quality=75, optimize=True)
+        if out.tell() > 200 * 1024:
+            return None
+        return out.getvalue(), width, height
+    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
+        return None
 
 
 async def thumbnail_jpeg(session: aiohttp.ClientSession, url: str) -> tuple[bytes, int, int] | None:
@@ -120,22 +179,7 @@ async def thumbnail_jpeg(session: aiohttp.ClientSession, url: str) -> tuple[byte
                 break
         else:
             return None
-        image = Image.open(io.BytesIO(data))
-        if image.width * image.height > 5_000_000:
-            return None
-        image.thumbnail((320, 320), Image.Resampling.LANCZOS)
-        # YouTube maxresdefault can be a valid HTTP image that is just a blank
-        # placeholder; treat it as unavailable and try the next thumbnail URL.
-        sample = ImageStat.Stat(image.convert("RGB").resize((32, 32)))
-        if min(sample.mean) > 247 and max(sample.var) < 30:
-            return None
-        width, height = image.size
-        image = image.convert("RGB")
-        out = io.BytesIO()
-        image.save(out, format="JPEG", quality=75, optimize=True)
-        if out.tell() > 200 * 1024:
-            return None
-        return out.getvalue(), width, height
+        return jpeg_preview(data)
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError,
             UnidentifiedImageError, Image.DecompressionBombError):
         return None

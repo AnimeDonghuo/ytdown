@@ -38,6 +38,26 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         with patch("ytdown.media.asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
             self.assertEqual(await probe.inspect(), MediaInfo(61, 1080, 1920))
 
+    async def test_bounded_terabox_frame_preview(self):
+        from pathlib import Path
+        probe = MediaProbe(".mkv")
+        probe.add(b"head" * 100)
+        frame = io.BytesIO()
+        Image.new("RGB", (1280, 720), "red").save(frame, "JPEG")
+        proc = SimpleNamespace(communicate=AsyncMock(return_value=(frame.getvalue(), b"")),
+                               returncode=0, kill=MagicMock())
+        def spawn(*args, **kwargs):
+            self.assertEqual(args[0], "ffmpeg")
+            self.assertIn("-threads", args)
+            path = Path(args[args.index("-i") + 1])
+            self.assertEqual(path.suffix, ".mkv")
+            self.assertEqual(path.stat().st_size, probe.size)
+            return proc
+        with patch("ytdown.media.asyncio.create_subprocess_exec", new=AsyncMock(side_effect=spawn)):
+            preview = await probe.preview_jpeg()
+        self.assertEqual(preview[1:], (320, 180))
+        self.assertLess(len(preview[0]), 200 * 1024)
+
     async def test_probe_of_near_two_gb_video_uses_sparse_disk(self):
         from collections import deque
         from pathlib import Path
