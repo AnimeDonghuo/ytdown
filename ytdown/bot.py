@@ -1019,7 +1019,10 @@ class DownloaderBot:
             else:
                 selection.selected.add(key)
             await event.answer()
-            await event.edit(buttons=self.keyboard(selection))
+            try:
+                await event.edit(buttons=self.keyboard(selection))
+            except MessageNotModifiedError:
+                pass  # A repeated tap can produce identical buttons; nothing to update.
             return
         if action != "done" or len(parts) != 3:
             await event.answer("Invalid button.", alert=True)
@@ -1369,13 +1372,15 @@ class DownloaderBot:
             LOG.warning("Thumbnail unavailable: %s", type(exc).__name__)
             thumb_data, thumb_w, thumb_h = None, 0, 0
         info = await probe.inspect() if probe else None
-        if source_file and video_file and not thumb_data and probe:
-            # Terabox often omits or expires preview URLs. Use one decoded frame
-            # from the already captured bounded sample; no second full download.
+        if video_file and not thumb_data and probe:
+            # Terabox often omits or expires preview URLs, and YouTube playlist items
+            # have no API thumbnail. Use one decoded frame from the bounded sample
+            # already captured while streaming; no second full download.
             fallback = await probe.preview_jpeg()
             if fallback:
                 thumb_data, thumb_w, thumb_h = fallback
-                LOG.info("Prepared Terabox frame thumbnail (%d bytes, %dx%d)",
+                LOG.info("Prepared %s frame thumbnail (%d bytes, %dx%d)",
+                         "Terabox" if source_file else job.source.kind,
                          len(thumb_data), thumb_w, thumb_h)
         if video_file and not thumb_data:
             LOG.warning("No usable thumbnail for %s; Telegram may show the video's own first frame",

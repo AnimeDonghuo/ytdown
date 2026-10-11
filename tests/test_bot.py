@@ -857,3 +857,54 @@ class CoverTests(unittest.IsolatedAsyncioTestCase):
         service.video_thumbnail = AsyncMock(return_value=(None, 0, 0))
         await self.stream(service)
         self.assertEqual(service.client.send_file.await_count, 1)
+
+
+class FrameThumbnailTests(unittest.IsolatedAsyncioTestCase):
+    """YouTube items with no API/YouTube still use a frame from the bounded sample."""
+
+    async def run_item(self, *, kind, thumbnail, frame):
+        client = MagicMock()
+        client.edit_message = AsyncMock()
+        client.send_file = AsyncMock(return_value=returned_video(cached_still(GOOD_STILL)))
+        service = DownloaderBot(client, MagicMock())
+        service.video_thumbnail = AsyncMock(return_value=thumbnail)
+        job = Job(1, "peer", 2, Source(kind, "https://www.youtube.com/playlist?list=PL12345678901"
+                                       if kind == "playlist" else VIDEO_URL), ("360p",), None, item_total=39)
+        video = Video("Episode 15", {"360p": CDN_URL})
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="handle")), \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo(60, 640, 360))), \
+             patch("ytdown.bot.MediaProbe.preview_jpeg", new=AsyncMock(return_value=frame)) as preview:
+            await service.send_stream(job, video, "360p", CDN_URL, 2, 39)
+        return client, preview
+
+    async def test_playlist_item_without_api_thumbnail_uses_video_frame(self):
+        frame = (COVER, 320, 180)
+        client, preview = await self.run_item(kind="playlist", thumbnail=(None, 0, 0), frame=frame)
+        preview.assert_awaited_once()
+        self.assertEqual(client.send_file.await_args.kwargs["thumb"].read(), COVER)
+
+    async def test_api_thumbnail_is_preferred_over_frame(self):
+        client, preview = await self.run_item(kind="playlist", thumbnail=(GOOD_STILL, 320, 180),
+                                              frame=(COVER, 320, 180))
+        preview.assert_not_awaited()
+        self.assertEqual(client.send_file.await_args.kwargs["thumb"].read(), GOOD_STILL)
+
+    async def test_no_frame_still_sends_video_without_thumbnail(self):
+        client, preview = await self.run_item(kind="playlist", thumbnail=(None, 0, 0), frame=None)
+        preview.assert_awaited_once()
+        self.assertIsNone(client.send_file.await_args.kwargs["thumb"])
+        self.assertEqual(client.send_file.await_count, 1)
+
+
+class ToggleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repeated_toggle_with_identical_buttons_does_not_raise(self):
+        from telethon.errors import MessageNotModifiedError
+        service = DownloaderBot(MagicMock(), MagicMock())
+        selection = Selection("abcd1234", Source("video", VIDEO_URL), ("360p", "720p"), "peer",
+                              Video("T", {"360p": CDN_URL, "720p": CDN_URL}))
+        service.selections[5] = selection
+        event = SimpleNamespace(sender_id=5, is_private=True, data=b"s:abcd1234:t:360p",
+                                answer=AsyncMock(), edit=AsyncMock(side_effect=MessageNotModifiedError(None)))
+        await service.callback(event)  # Must not propagate the Telegram error.
+        event.edit.assert_awaited_once()
+        self.assertEqual(selection.selected, {"360p"})
