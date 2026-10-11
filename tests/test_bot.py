@@ -268,7 +268,8 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         client.edit_message = AsyncMock()
         service = DownloaderBot(client, MagicMock())
         video = Video("A real YouTube video title", {"480p": CDN_URL})
-        job = Job(1, "peer", 2, Source("video", VIDEO_URL), ("480p",), video)
+        job = Job(1, "peer", 2, Source("playlist", "https://www.youtube.com/playlist?list=PL12345678901"),
+                  ("480p",), video)
         service.video_thumbnail = AsyncMock(return_value=(b"jpeg", 320, 180))
         with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="uploaded")) as upload, \
              patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo(884, 1080, 1920))):
@@ -278,7 +279,7 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(upload.await_args_list[0].args[3], "01-03 A real YouTube video title [480p].mp4")
         self.assertEqual(upload.await_args_list[1].args[3], "02-03 A real YouTube video title [MP3].mp3")
         self.assertEqual(client.send_file.await_args_list[0].kwargs["caption"],
-                         "1/3 · A real YouTube video title [480p]")
+                         "A real YouTube video title [480p]")
         self.assertEqual(client.send_file.await_args_list[1].kwargs["mime_type"], "audio/mpeg")
         attr = client.send_file.await_args_list[0].kwargs["attributes"][0]
         self.assertEqual((attr.duration, attr.w, attr.h), (884, 1080, 1920))
@@ -614,28 +615,28 @@ class LabelTests(unittest.TestCase):
         self.assertEqual(split_subtitle_tag("Both [EngSub] [MultiSub]")[1], "[MultiSub]")
         self.assertEqual(split_subtitle_tag("[MultiSub]"), ("", "[MultiSub]"))
 
-    def test_position_quality_and_subtitle_label(self):
-        self.assertEqual(media_label("One Way or Another Episode 15 [MultiSub]", "360p", 750, "2/39"),
-                         "2/39 · One Way or Another Episode 15 [360p] [MultiSub]")
-        self.assertEqual(media_label("Episode 15 (EngSub)", "mp3", 750, "2/39"),
-                         "2/39 · Episode 15 [MP3] [EngSub]")
+    def test_quality_and_subtitle_label_has_no_playlist_number(self):
+        self.assertEqual(media_label("One Way or Another Episode 15 [MultiSub]", "360p", 750),
+                         "One Way or Another Episode 15 [360p] [MultiSub]")
+        self.assertEqual(media_label("Episode 15 (EngSub)", "mp3", 750), "Episode 15 [MP3] [EngSub]")
         self.assertEqual(media_label("Plain", "720p", 750), "Plain [720p]")
 
-    def test_long_title_keeps_position_quality_and_subtitle(self):
-        label = media_label("X" * 900 + " [MultiSub]", "1080p", 750, "10/150")
+    def test_long_title_keeps_quality_and_subtitle(self):
+        label = media_label("X" * 900 + " [MultiSub]", "1080p", 750)
         self.assertLessEqual(len(label), 750)
-        self.assertTrue(label.startswith("10/150 · X"))
+        self.assertTrue(label.startswith("X"))
         self.assertTrue(label.endswith(" [1080p] [MultiSub]"))
         self.assertTrue(media_name("X" * 250, "480p", 80, "[EngSub]").endswith(" [480p] [EngSub]"))
 
-    def test_status_title_starts_with_position(self):
+    def test_status_title_has_no_playlist_number(self):
         service = DownloaderBot(MagicMock(), MagicMock())
         job = Job(1, "peer", 2, Source("playlist", "url"), ("360p",), None, state="running",
                   title="One Way or Another Episode 15 [MultiSub]", quality="360p",
                   item_index=2, item_total=39)
         service.jobs[job.token] = job
         text = service.format_job(job, include_metrics=False)
-        self.assertTrue(text.startswith("🎬 2/39 · One Way or Another Episode 15 [360p] [MultiSub]\n"), text)
+        self.assertTrue(text.startswith("🎬 One Way or Another Episode 15 [360p] [MultiSub]\n"), text)
+        self.assertNotIn("2/39", text.split("\n")[0])
         single = Job(1, "peer", 3, Source("video", VIDEO_URL), ("mp3",), None, state="running",
                      title="Solo [EngSub]", quality="mp3", item_index=1, item_total=1)
         self.assertTrue(service.format_job(single, include_metrics=False).startswith(
@@ -656,7 +657,7 @@ class PlaylistLabelTests(unittest.IsolatedAsyncioTestCase):
             await service.send_stream(job, video, "360p", CDN_URL, 2, 39)
         self.assertEqual(upload.await_args.args[3], "02-39 One Way or Another Episode 15 [360p] [MultiSub].mp4")
         options = client.send_file.await_args.kwargs
-        self.assertEqual(options["caption"], "2/39 · One Way or Another Episode 15 [360p] [MultiSub]")
+        self.assertEqual(options["caption"], "One Way or Another Episode 15 [360p] [MultiSub]")
         # Playable inline: streamable MP4, not forced to a document.
         self.assertFalse(options["force_document"])
         self.assertTrue(options["supports_streaming"])
@@ -675,7 +676,7 @@ class PlaylistLabelTests(unittest.IsolatedAsyncioTestCase):
              patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo())):
             await service.send_stream(job, video, "480p", CDN_URL, 2, 150)
         self.assertEqual(upload.await_args.args[3], "002-150 Episode [480p].mp4")
-        self.assertEqual(client.send_file.await_args.kwargs["caption"], "2/150 · Episode [480p]")
+        self.assertEqual(client.send_file.await_args.kwargs["caption"], "Episode [480p]")
 
     async def test_single_video_has_no_position_prefix(self):
         client = MagicMock()
@@ -690,6 +691,43 @@ class PlaylistLabelTests(unittest.IsolatedAsyncioTestCase):
             await service.send_stream(job, video, "480p", CDN_URL, 1, 1)
         self.assertEqual(upload.await_args.args[3], "Solo [480p] [EngSub].mp4")
         self.assertEqual(client.send_file.await_args.kwargs["caption"], "Solo [480p] [EngSub]")
+
+
+class TeraboxUnchangedTests(unittest.IsolatedAsyncioTestCase):
+    """Terabox keeps its original filenames, captions, and single preview send."""
+
+    async def test_folder_item_keeps_original_names_and_no_reply_cover(self):
+        from ytdown.terabox import TeraboxFile
+        client = MagicMock()
+        client.edit_message = AsyncMock()
+        # A returned message with no still: YouTube would add a cover photo, Terabox must not.
+        client.send_file = AsyncMock(return_value=SimpleNamespace(id=9))
+        service = DownloaderBot(client, MagicMock())
+        service.video_thumbnail = AsyncMock(return_value=(COVER, 320, 180))
+        item = TeraboxFile("1", "Movie Part.mkv", "1080p", CDN_URL, "", "video/x-matroska", 20 * 1024 * 1024)
+        job = Job(7, "peer", 2, Source("terabox-folder", "https://terasharefile.com/s/abc"), ("1080p",), None,
+                  item_total=39)
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="handle")) as upload, \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo(120, 1920, 1080))):
+            await service.send_stream(job, Video(item.title, {}), "1080p", CDN_URL, 2, 39, item)
+        self.assertEqual(upload.await_args.args[3], "Movie Part [1080p].mkv")
+        self.assertEqual(client.send_file.await_count, 1)
+        self.assertEqual(client.send_file.await_args.kwargs["caption"], "2/39 · Movie Part [1080p]")
+        self.assertTrue(client.send_file.await_args.kwargs["force_document"])
+
+    async def test_terabox_subtitle_text_is_not_rearranged(self):
+        from ytdown.terabox import TeraboxFile
+        client = MagicMock()
+        client.edit_message = AsyncMock()
+        client.send_file = AsyncMock(return_value=SimpleNamespace(id=9))
+        service = DownloaderBot(client, MagicMock())
+        service.video_thumbnail = AsyncMock(return_value=(None, 0, 0))
+        item = TeraboxFile("1", "Track [EngSub].mp3", "MP3", CDN_URL, "", "audio/mpeg", 1000)
+        job = Job(7, "peer", 2, Source("terabox", "https://terasharefile.com/s/abc"), ("MP3",), None)
+        with patch("ytdown.bot.upload_stream", new=AsyncMock(return_value="handle")) as upload, \
+             patch("ytdown.bot.MediaProbe.inspect", new=AsyncMock(return_value=MediaInfo())):
+            await service.send_stream(job, Video(item.title, {}), "MP3", CDN_URL, 1, 1, item)
+        self.assertEqual(upload.await_args.args[3], "Track _EngSub_ [MP3].mp3")
 
 
 class CoverTests(unittest.IsolatedAsyncioTestCase):

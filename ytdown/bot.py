@@ -110,11 +110,10 @@ def media_name(title: str, quality: str, max_length: int, tag: str = "") -> str:
     return (title[:max_length - len(suffix)].rstrip() or "YouTube video") + suffix
 
 
-def media_label(title: str, quality: str, max_length: int, position: str = "") -> str:
-    """Caption/status label such as '2/39 · Title [360p] [MultiSub]'."""
+def media_label(title: str, quality: str, max_length: int) -> str:
+    """YouTube caption/status label such as 'Title [360p] [MultiSub]'."""
     clean, tag = split_subtitle_tag(title)
-    prefix = f"{position} · " if position else ""
-    return prefix + media_name(clean, quality, max_length - len(prefix), tag)
+    return media_name(clean, quality, max_length, tag)
 
 
 def cancel_entities(text: str) -> list[types.MessageEntityBotCommand]:
@@ -487,16 +486,17 @@ class DownloaderBot:
         eta = human_eta((total - job.uploaded) / job.speed) if total and job.speed > 1 else "—"
         waiting = [j for j in self.jobs.values() if j.state == "queued"]
         item = f"{job.item_index}/{job.item_total}" if job.item_total else "—"
-        clean, tag = split_subtitle_tag(job.title)
+        # Terabox status lines keep their original format; YouTube titles get subtitle tags.
+        youtube = not job.source.kind.startswith("terabox")
+        clean, tag = split_subtitle_tag(job.title) if youtube else (job.title, "")
         title = clean[:95] or ("Playlist" if job.source.kind == "playlist" else
                                "Terabox files" if job.source.kind.startswith("terabox") else "YouTube video")
-        position = f"{job.item_index}/{job.item_total} · " if job.item_total > 1 and job.item_index else ""
-        quality = (f" [{'MP3' if job.quality == AUDIO else job.quality}]" if job.quality else "") + (
+        quality = (f" [{'MP3' if youtube and job.quality == AUDIO else job.quality}]" if job.quality else "") + (
             f" {tag}" if tag else "")
         status = (f"Telegram rate limit: waiting {human_eta(job.rate_limit_until - now)}"
                   if job.rate_limit_until > now else job.detail)
         queue_note = f" · Queue #{waiting.index(job) + 1}" if job in waiting else ""
-        return (f"🎬 {position}{title}{quality}\n"
+        return (f"🎬 {title}{quality}\n"
                 f"📋 Video {item} · {job.state.title()}{queue_note}\n\n"
                 f"{'█' * filled}{'░' * (12 - filled)}  {ratio * 100:.1f}%\n"
                 f"⬆ Telegram: {human_size(job.uploaded)} / {human_size(total) if total else 'unknown'}\n"
@@ -1320,14 +1320,21 @@ class DownloaderBot:
         video_file = source_file.video if source_file else not audio
         streamable = video_file and suffix == ".mp4"
         job.thumbnail_urls = source_file.thumbnail_urls if source_file else ()
-        # Subtitle markers move after the quality; playlist items get "02-39" filenames
-        # and "2/39 ·" captions/status titles so that files sort in playlist order.
-        clean_title, subtitle_tag = split_subtitle_tag(video.title)
+        # YouTube only: subtitle markers move after the quality, and playlist
+        # filenames start with "02-39". Terabox keeps its original names and captions.
+        youtube = source_file is None
+        clean_title, subtitle_tag = split_subtitle_tag(video.title) if youtube else (video.title, "")
         safe_title = re.sub(r"[^\w .-]", "_", clean_title, flags=re.UNICODE).strip(" .") or "video"
-        width = max(2, len(str(total)))
-        file_prefix = f"{index:0{width}d}-{total:0{width}d} " if total > 1 else ""
+        file_prefix = ""
+        if youtube and job.source.kind == "playlist" and total > 1:
+            width = max(2, len(str(total)))
+            file_prefix = f"{index:0{width}d}-{total:0{width}d} "
         filename = file_prefix + media_name(safe_title, quality, 100 - len(file_prefix), subtitle_tag) + suffix
-        caption = media_label(video.title, quality, 750, position=f"{index}/{total}" if total > 1 else "")
+        if youtube:
+            caption = media_label(video.title, quality, 750)  # No position in YouTube captions.
+        else:
+            prefix = f"{index}/{total} · " if total > 1 else ""
+            caption = prefix + media_name(video.title, quality, 750 - len(prefix))
         def on_total(count: int) -> None:
             job.total_bytes = count
 
@@ -1375,7 +1382,8 @@ class DownloaderBot:
                         job.source.kind)
         if audio:
             attributes = [types.DocumentAttributeAudio(duration=video.duration,
-                                                       title=media_label(video.title, quality, 64))]
+                                                       title=(media_label(video.title, quality, 64) if youtube else
+                                                              media_name(video.title, quality, 64)))]
         elif video_file:
             # ffprobe inspects the actual MP4 head/tail. API duration and image
             # dimensions are fallbacks only if its metadata cannot be parsed.
@@ -1429,8 +1437,9 @@ class DownloaderBot:
                     raise
                 job.rate_limit_until = time.monotonic() + exc.seconds + 1
                 await asyncio.sleep(exc.seconds + 1)
-        # The video is delivered now. Cover problems below must never re-send it.
-        if video_file:
+        # The video is delivered now. YouTube cover problems must never re-send it.
+        # Terabox thumbnails keep their existing behaviour (no reply cover).
+        if youtube and video_file:
             await self.ensure_cover(job, sent_message, thumb_data)
 
 
