@@ -306,7 +306,10 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
 
 class SelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_buttons_toggle_and_done(self):
-        service = DownloaderBot(MagicMock(), MagicMock())
+        client = MagicMock()
+        client.send_message = AsyncMock(return_value=SimpleNamespace(id=101))
+        client.delete_messages = AsyncMock()
+        service = DownloaderBot(client, MagicMock())
         service.run_job = AsyncMock()
         source = Source("playlist", "https://www.youtube.com/playlist?list=PL12345678901")
         choice = Selection("abcd1234", source, ("360p", "720p", "2160p"), "peer")
@@ -392,7 +395,8 @@ class LiveStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Telegram: 512.0 KiB / 1.0 MiB", rendered)
         self.assertIn("ETA ", rendered)
         self.assertIn("YouTube title [480p]", rendered)
-        self.assertEqual(len(client.edit_message.call_args.kwargs["buttons"][0]), 2)
+        self.assertEqual(len(client.edit_message.call_args.kwargs["buttons"][0]), 1)
+        self.assertIn(f"/cancel_{job.token}", rendered)
         await service.render(job)
         self.assertEqual(client.edit_message.await_count, 1)  # No flood of status edits.
         event = SimpleNamespace(data=f"j:{job.token}:refresh".encode(), sender_id=7,
@@ -471,6 +475,7 @@ class QueueAndAPISettingsTests(unittest.IsolatedAsyncioTestCase):
     async def test_multiple_links_from_same_user_can_queue_and_cancel_individually(self):
         client = MagicMock()
         client.delete_messages = AsyncMock()
+        client.send_message = AsyncMock(return_value=SimpleNamespace(id=54))
         service = DownloaderBot(client, MagicMock())
         service.run_job = AsyncMock()
         existing = Job(7, "peer", 10, Source("video", VIDEO_URL), ("480p",), None, state="running")
