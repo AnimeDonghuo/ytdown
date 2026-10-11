@@ -16,7 +16,7 @@ AUDIO = "mp3"
 
 @dataclass(frozen=True)
 class Source:
-    kind: str  # video or playlist
+    kind: str  # video, playlist, terabox, or terabox-folder
     url: str
 
 
@@ -32,6 +32,45 @@ class Video:
 class PlaylistEntry:
     url: str
     title: str  # From YouTube's playlist metadata, never from the download API.
+    position: int = 0  # Original playlist index, including skipped/private entries.
+
+
+def _playlist_options(**overrides):
+    return {
+        "extract_flat": "in_playlist", "skip_download": True, "quiet": True,
+        "no_warnings": True, "ignoreerrors": True,
+        "socket_timeout": 20, "retries": 1, "extractor_retries": 1,
+        **overrides,
+    }
+
+
+def playlist_count(url: str, max_scan: int = 5000) -> int:
+    """Count public playlist entries without resolving/downloading video formats."""
+    try:
+        with yt_dlp.YoutubeDL(_playlist_options(lazy_playlist=True)) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                raise ValueError("Could not read this public playlist.")
+            count = info.get("playlist_count") or info.get("n_entries")
+            if isinstance(count, int) and count > 0:
+                if count > max_scan:
+                    raise ValueError(f"Playlist exceeds the {max_scan}-entry discovery limit.")
+                return count
+            # Some extractors do not expose the count. Flat entries are cheap;
+            # iterate with a hard bound rather than loading video details.
+            entries = info.get("entries")
+            if entries is None:
+                raise ValueError("Could not determine the playlist size.")
+            count = 0
+            for _ in entries:
+                count += 1
+                if count > max_scan:
+                    raise ValueError(f"Playlist exceeds the {max_scan}-entry discovery limit.")
+            if count:
+                return count
+    except yt_dlp.utils.DownloadError as exc:
+        raise ValueError("Could not read this public playlist. YouTube may be blocking the host.") from exc
+    raise ValueError("No videos were found in this playlist.")
 
 
 def youtube_title(value: object, video_id: str) -> str:
@@ -119,7 +158,18 @@ def normalize_video(payload: object) -> Video:
     # Keep the provider title only as a fallback if YouTube metadata is unavailable.
     title = youtube_title(payload.get("title"), str(payload.get("video_id") or ""))
     raw_duration = payload.get("duration")
-    duration = int(raw_duration) if isinstance(raw_duration, (int, float)) and 0 < raw_duration < 7 * 86400 else 0
+    duration = 0
+    if isinstance(raw_duration, (int, float)) and 0 < raw_duration < 7 * 86400:
+        duration = int(raw_duration)
+    elif isinstance(raw_duration, str):
+        # Providers may send either seconds or YouTube-style HH:MM:SS / MM:SS.
+        pieces = raw_duration.strip().split(":")
+        if 1 <= len(pieces) <= 3 and all(piece.isdigit() for piece in pieces):
+            seconds = 0
+            for piece in pieces:
+                seconds = seconds * 60 + int(piece)
+            if 0 < seconds < 7 * 86400:
+                duration = seconds
     thumbnail = payload.get("thumbnail")
     return Video(title, streams, duration, thumbnail if public_https_url(thumbnail) else "")
 
@@ -136,12 +186,19 @@ def extract_title(url: str) -> str:
 
 
 def extract_playlist(url: str, limit: int) -> list[PlaylistEntry]:
-    """Run in a thread; flat extraction reads playlist entries, not video formats/files."""
-    opts = {
-        "extract_flat": "in_playlist", "skip_download": True, "quiet": True,
-        "no_warnings": True, "ignoreerrors": True, "playlistend": limit,
-        "socket_timeout": 20, "retries": 1, "extractor_retries": 1,
-    }
+    """Compatibility helper: first N flat playlist entries."""
+    return _extract_playlist(url, _playlist_options(playlistend=limit), limit)
+
+
+def extract_playlist_range(url: str, start: int, end: int) -> list[PlaylistEntry]:
+    """Fetch only an inclusive 1-indexed range (not all preceding formats)."""
+    if start < 1 or end < start or end - start + 1 > 150:
+        raise ValueError("Invalid playlist range (maximum 150 videos per job).")
+    return _extract_playlist(url, _playlist_options(playliststart=start, playlistend=end),
+                             end - start + 1, unique=False)
+
+
+def _extract_playlist(url: str, opts: dict, limit: int, *, unique: bool = True) -> list[PlaylistEntry]:
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -151,14 +208,17 @@ def extract_playlist(url: str, limit: int) -> list[PlaylistEntry]:
         raise ValueError("Could not read this public playlist. Check that it is available.")
     entries = []
     seen = set()
-    for entry in info["entries"]:
+    for offset, entry in enumerate(info["entries"]):
         if not isinstance(entry, dict):
             continue
         video_id = entry.get("id")
-        if isinstance(video_id, str) and VIDEO_ID.fullmatch(video_id) and video_id not in seen:
+        if isinstance(video_id, str) and VIDEO_ID.fullmatch(video_id) and (not unique or video_id not in seen):
             seen.add(video_id)
+            playlist_index = entry.get("playlist_index")
+            position = (playlist_index if isinstance(playlist_index, int) and playlist_index > 0
+                        else opts.get("playliststart", 1) + offset) if not unique else 0
             entries.append(PlaylistEntry(f"https://www.youtube.com/watch?v={video_id}",
-                                         youtube_title(entry.get("title"), video_id)))
+                                         youtube_title(entry.get("title"), video_id), position))
         if len(entries) >= limit:
             break
     if not entries:

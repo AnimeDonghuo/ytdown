@@ -59,3 +59,41 @@ class CoreTests(unittest.TestCase):
                              [PlaylistEntry(f"https://www.youtube.com/watch?v={ID}", "Actual YouTube title"),
                               PlaylistEntry("https://www.youtube.com/watch?v=abcdefghijk", "")])
         self.assertEqual(youtube_title("  My  real\n title ", ID), "My real title")
+
+
+class PlaylistRangeTests(unittest.TestCase):
+    def test_count_uses_playlist_metadata_without_resolving_formats(self):
+        from ytdown.core import playlist_count
+        class FakeYDL:
+            def __init__(self, opts):
+                self.opts = opts
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def extract_info(self, url, download=False):
+                self.test.assertTrue(self.opts["lazy_playlist"])
+                return {"playlist_count": 327, "entries": []}
+            test = self
+        with patch("ytdown.core.yt_dlp.YoutubeDL", FakeYDL):
+            self.assertEqual(playlist_count("https://youtube.com/playlist?list=PL12345678901"), 327)
+
+    def test_count_falls_back_to_flat_entries_and_range_extracts_only_selection(self):
+        from ytdown.core import extract_playlist_range, playlist_count
+        class FakeYDL:
+            def __init__(self, opts): self.opts = opts
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def extract_info(self, url, download=False):
+                if self.opts.get("playliststart"):
+                    assert self.opts["playliststart"] == 200
+                    assert self.opts["playlistend"] == 300
+                    return {"entries": [None, {"id": ID, "title": "201st"},
+                                        {"id": ID, "title": "202nd"}]}
+                return {"entries": iter([{"id": ID}] * 220)}
+        url = "https://youtube.com/playlist?list=PL12345678901"
+        with patch("ytdown.core.yt_dlp.YoutubeDL", FakeYDL):
+            self.assertEqual(playlist_count(url), 220)
+            self.assertEqual(extract_playlist_range(url, 200, 300),
+                             [PlaylistEntry(f"https://www.youtube.com/watch?v={ID}", "201st", 201),
+                              PlaylistEntry(f"https://www.youtube.com/watch?v={ID}", "202nd", 202)])
+        with self.assertRaises(ValueError):
+            extract_playlist_range(url, 200, 351)

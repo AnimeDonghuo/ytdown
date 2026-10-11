@@ -76,7 +76,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                   Video("Another wrong API title", {"360p": CDN_URL, "2160p": CDN_URL})]
         entries = [PlaylistEntry(VIDEO_URL, "YouTube title one"),
                    PlaylistEntry("https://www.youtube.com/watch?v=abcdefghijk", "YouTube title two")]
-        with patch("ytdown.bot.extract_playlist", return_value=entries), \
+        with patch("ytdown.bot.extract_playlist_range", return_value=entries), \
              patch("ytdown.bot.fetch_video", new=AsyncMock(side_effect=videos)) as fetch, \
              patch("ytdown.bot.get_youtube_title", new=AsyncMock()) as metadata:
             await self.service.run_job(job)
@@ -91,7 +91,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_playlist_falls_back_to_api_name(self):
         job = Job(1, "peer", 2, Source("playlist", "url"), ("480p",), None)
         self.service.jobs[job.token] = job
-        with patch("ytdown.bot.extract_playlist", return_value=[PlaylistEntry(VIDEO_URL, "")]), \
+        with patch("ytdown.bot.extract_playlist_range", return_value=[PlaylistEntry(VIDEO_URL, "")]), \
              patch("ytdown.bot.fetch_video", new=AsyncMock(return_value=Video("API name", {"480p": CDN_URL}))), \
              patch("ytdown.bot.get_youtube_title", new=AsyncMock(return_value="")) as metadata:
             await self.service.run_job(job)

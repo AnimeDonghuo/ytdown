@@ -26,8 +26,10 @@ from telethon.sessions import MemorySession
 from telethon.tl import types
 from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
 
-from .core import (AUDIO, VIDEO_QUALITIES, PlaylistEntry, Source, Video, extract_playlist,
-                   extract_title, normalize_video, parse_source, public_https_url, youtube_title)
+from .core import (AUDIO, VIDEO_QUALITIES, PlaylistEntry, Source, Video, extract_playlist_range,
+                   extract_title, normalize_video, parse_source, playlist_count, public_https_url, youtube_title)
+from .terabox import (TERABOX_API_URL, TeraboxFile, TeraboxListing, normalize_terabox,
+                      parse_terabox_source)
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg
 
@@ -44,6 +46,8 @@ MAX_PARTS = 4000
 SPOOL_MB = 64  # For rare providers that do not send Content-Length.
 REPORT_SECONDS = 12  # Automatic edits: keep well below Telegram flood limits.
 MANUAL_REFRESH_SECONDS = 2
+MAX_RANGE_VIDEOS = 150
+MAX_DISCOVER = 5000
 
 
 class PublicResolver(aiohttp.abc.AbstractResolver):
@@ -103,6 +107,19 @@ class Selection:
     selected: set[str] = field(default_factory=set)
     created: float = field(default_factory=time.monotonic)
     api_endpoint: str = API_URL
+    start: int = 1
+    end: int = 1
+    listing: TeraboxListing | None = None
+
+
+@dataclass
+class RangeRequest:
+    source: Source
+    peer: object
+    count: int
+    api_endpoint: str = API_URL
+    listing: TeraboxListing | None = None
+    created: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -138,6 +155,9 @@ class Job:
     thumbnail_id: str = ""
     thumb_size: tuple[int, int] = (0, 0)
     current_url: str = ""
+    start: int = 1
+    end: int = 1
+    listing: TeraboxListing | None = None
 
 
 def normalize_api_endpoint(raw: str) -> str:
@@ -152,7 +172,8 @@ def normalize_api_endpoint(raw: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", urlencode(params), ""))
 
 
-async def fetch_video(session: aiohttp.ClientSession, url: str, api_endpoint: str = API_URL) -> Video:
+async def fetch_json_api(session: aiohttp.ClientSession, api_endpoint: str, url: str,
+                         max_bytes: int = 2_000_000):
     endpoint, params = api_endpoint, {"url": url}
     for _ in range(5):
         if not public_https_url(endpoint):
@@ -167,13 +188,21 @@ async def fetch_video(session: aiohttp.ClientSession, url: str, api_endpoint: st
                 params = None  # The Location already contains its own query.
                 continue
             response.raise_for_status()
-            if response.content_length and response.content_length > 2_000_000:
+            if response.content_length and response.content_length > max_bytes:
                 raise ValueError("The link provider returned too much data.")
-            data = await response.content.read(2_000_001)
-            if len(data) > 2_000_000:
+            data = await response.content.read(max_bytes + 1)
+            if len(data) > max_bytes:
                 raise ValueError("The link provider returned too much data.")
-            return normalize_video(json.loads(data))
+            return json.loads(data)
     raise ValueError("Too many API redirects.")
+
+
+async def fetch_video(session: aiohttp.ClientSession, url: str, api_endpoint: str = API_URL) -> Video:
+    return normalize_video(await fetch_json_api(session, api_endpoint, url))
+
+
+async def fetch_terabox(session: aiohttp.ClientSession, url: str) -> TeraboxListing:
+    return normalize_terabox(await fetch_json_api(session, TERABOX_API_URL, url, 4_000_000))
 
 
 async def get_youtube_title(session: aiohttp.ClientSession, url: str) -> str:
@@ -280,7 +309,8 @@ async def upload_parts(client, reader: HTTPReader, size: int, filename: str,
 
 async def upload_stream(client: TelegramClient, session: aiohttp.ClientSession, url: str,
                         filename: str, max_bytes: int, *, on_total=None, on_download=None,
-                        on_upload=None, on_flood=None, on_data=None, in_flight: int = 2):
+                        on_upload=None, on_flood=None, on_data=None, in_flight: int = 2,
+                        expected_size: int = 0):
     """Download from CDN while uploading MTProto parts. Never store a 2 GB file on Koyeb.
 
 Pipelines bounded saveBigFilePart/saveFilePart requests from the HTTP stream,
@@ -300,7 +330,7 @@ Pipelines bounded saveBigFilePart/saveFilePart requests from the HTTP stream,
             response.raise_for_status()
             if response.content_type in ("text/html", "application/json", "text/plain"):
                 raise ValueError("The download link returned a page instead of media.")
-            size = response.content_length
+            size = response.content_length if response.content_length is not None else (expected_size or None)
             if size is not None:
                 if size > min(max_bytes, MAX_PARTS * PART_BYTES):
                     raise FileTooLarge()
@@ -348,10 +378,13 @@ class DownloaderBot:
         self.jobs: dict[str, Job] = {}
         self.api_overrides: dict[int, str] = {}
         self.awaiting_api: set[int] = set()
+        self.modes: dict[int, str] = {}
+        self.mode_tokens: dict[int, str] = {}
+        self.pending_ranges: dict[int, RangeRequest] = {}
         self.slot = asyncio.Semaphore(1)
         self.turn = asyncio.Condition()  # Preserve enqueue order even if status edits are slow.
         self.max_bytes = env_int("MAX_FILE_MB", MAX_MT_MB, 1, MAX_MT_MB) * 1024 * 1024
-        self.playlist_limit = env_int("MAX_PLAYLIST_VIDEOS", 25, 1, 50)
+        self.playlist_limit = env_int("MAX_RANGE_VIDEOS", MAX_RANGE_VIDEOS, 1, MAX_RANGE_VIDEOS)
         self.in_flight = env_int("UPLOAD_IN_FLIGHT", 2, 1, 3)
         self.metrics = ContainerMetrics()
 
@@ -369,7 +402,7 @@ class DownloaderBot:
 
     def register(self) -> None:
         self.client.add_event_handler(self.on_message, events.NewMessage(incoming=True))
-        self.client.add_event_handler(self.callback, events.CallbackQuery(pattern=rb"^(s|j):"))
+        self.client.add_event_handler(self.callback, events.CallbackQuery(pattern=rb"^(s|j|m):"))
 
     def job_buttons(self, job: Job):
         if job.state == "finished":
@@ -390,7 +423,8 @@ class DownloaderBot:
         eta = human_eta((total - job.uploaded) / job.speed) if total and job.speed > 1 else "—"
         waiting = [j for j in self.jobs.values() if j.state == "queued"]
         item = f"{job.item_index}/{job.item_total}" if job.item_total else "—"
-        title = job.title[:95] or ("Playlist" if job.source.kind == "playlist" else "YouTube video")
+        title = job.title[:95] or ("Playlist" if job.source.kind == "playlist" else
+                                  "Terabox files" if job.source.kind.startswith("terabox") else "YouTube video")
         quality = f" [{job.quality}]" if job.quality else ""
         status = (f"Telegram rate limit: waiting {human_eta(job.rate_limit_until - now)}"
                   if job.rate_limit_until > now else job.detail)
@@ -437,21 +471,32 @@ class DownloaderBot:
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
         if command in ("/start", "/help"):
             await event.respond(
-                "Send a YouTube video, Shorts, or public playlist link. Choose one or several qualities, then tap Done. "
-                "Send another link while a job runs to queue it. Transfers stay sequential. "
-                "Watch the live status or tap Refresh; "
-                "playlist qualities unavailable for a video are skipped.\n\n"
+                "Choose YouTube or Terabox with /change, then send a link for that service. "
+                "Pick one or several available qualities and tap Done. Playlists/folders first show "
+                "their file count; send a range such as 1-29 or 200-300, then select qualities. "
+                "Send another link while a job runs to queue it. Transfers stay sequential.\n\n"
                 "A watch link containing list= is treated as a playlist; remove it for just one video.\n\n"
+                "/change — YouTube / Terabox buttons\n"
                 "/status or /queue — jobs and queue positions\n/cancel [job-id] — cancel a job\n"
-                "/changeapi — set a personal API; /changeapi reset restores default\n"
+                "/changeapi — set your YouTube API; /changeapi reset restores default\n"
                 "/limits — size and queue limits\n/help — these instructions\n\n"
                 "Only download media you have permission to use.")
         elif command == "/limits":
             await event.respond(
                 f"MTProto limit: {self.max_bytes // 1024 // 1024} MiB per file (up to 4,000 parts). "
-                f"Playlist: first {self.playlist_limit} entries. One job at a time, "
+                f"YouTube playlist: up to {MAX_DISCOVER} entries, {self.playlist_limit} per selected range. "
+                f"Terabox folders: up to 500 listed files. One job at a time, "
                 f"{self.in_flight} concurrent upload parts; up to {MAX_WAITING} waiting jobs. "
-                "Files without Content-Length are limited to 64 MiB. Jobs/selections are not restored after a restart.")
+                "Files with neither Content-Length nor API size are limited to 64 MiB. "
+                "Jobs/selections are not restored after a restart.")
+        elif command == "/change":
+            uid = event.sender_id
+            token = secrets.token_hex(4)
+            self.mode_tokens[uid] = token
+            active = self.modes.get(uid, "youtube")
+            await event.respond(f"Current downloader: {active.title()}. Choose a service for future links:",
+                                buttons=[[Button.inline("▶️ YouTube", data=f"m:{token}:youtube".encode()),
+                                          Button.inline("📁 Terabox", data=f"m:{token}:terabox".encode())]])
         elif command == "/changeapi":
             uid = event.sender_id
             arg = text.partition(" ")[2].strip()
@@ -491,7 +536,7 @@ class DownloaderBot:
             elif uid in self.selections:
                 await event.respond("Choose qualities and tap Done, or send a new link.")
             else:
-                await event.respond("No active jobs. Send a YouTube link to begin.")
+                await event.respond(f"No active jobs. Send a {self.modes.get(uid, 'youtube').title()} link to begin.")
         elif command == "/cancel":
             uid = event.sender_id
             task = self.lookups.get(uid)
@@ -506,11 +551,12 @@ class DownloaderBot:
             elif job and job.task:
                 job.task.cancel()
             selection = self.selections.pop(uid, None) if not target else None
+            range_request = self.pending_ranges.pop(uid, None) if not target else None
             pending_api = uid in self.awaiting_api
             if not target:
                 self.awaiting_api.discard(uid)
             await event.respond("Cancellation requested." if task or job else
-                                "Selection cleared." if selection or pending_api else "Nothing to cancel.")
+                                "Selection cleared." if selection or range_request or pending_api else "Nothing to cancel.")
         elif command:
             await event.respond("Unknown command. Send /help for instructions.")
         else:
@@ -521,8 +567,48 @@ class DownloaderBot:
                     await event.respond(f"{exc} Send an API URL, or /changeapi reset.")
                 else:
                     await event.respond("Custom API saved for your future links. /changeapi reset restores the default.")
+            elif event.sender_id in self.pending_ranges and not text.startswith("https://"):
+                await self.on_range(event)
             else:
+                self.pending_ranges.pop(event.sender_id, None)
                 await self.on_link(event)
+
+    def listing_choices(self, files: tuple[TeraboxFile, ...]) -> tuple[str, ...]:
+        return tuple(sorted({item.quality for item in files},
+                            key=lambda q: (q == "Original", q == "MP3", int(q[:-1]) if q.endswith("p") and q[:-1].isdigit() else 0)))
+
+    async def on_range(self, event) -> None:
+        request = self.pending_ranges.get(event.sender_id)
+        if not request or time.monotonic() - request.created > SESSION_SECONDS:
+            self.pending_ranges.pop(event.sender_id, None)
+            await event.respond("Range request expired. Send the link again.")
+            return
+        match = re.fullmatch(r"\s*(\d+)\s*[-–]\s*(\d+)\s*", event.raw_text or "")
+        if not match:
+            await event.respond("Send a range like 1-29 or 200-300 (inclusive), or /cancel.")
+            return
+        start, end = map(int, match.groups())
+        if not (1 <= start <= end <= request.count):
+            await event.respond(f"Choose a range within 1-{request.count}.")
+            return
+        if end - start + 1 > self.playlist_limit:
+            await event.respond(f"Choose up to {self.playlist_limit} entries per job to protect Koyeb free.")
+            return
+        if len(self.selections) >= MAX_SELECTIONS:
+            await event.respond("Too many open selections right now. Try again later.")
+            return
+        files = (tuple(file for index in range(start - 1, end)
+                       for file in request.listing.options_for(index)) if request.listing else ())
+        choices = (self.listing_choices(files) if files else
+                   tuple(f"{q}p" for q in VIDEO_QUALITIES))
+        selection = Selection(secrets.token_hex(4), request.source, choices, request.peer,
+                              api_endpoint=request.api_endpoint, start=start, end=end,
+                              listing=request.listing)
+        self.pending_ranges.pop(event.sender_id, None)
+        self.selections[event.sender_id] = selection
+        await event.respond(f"Entries {start}-{end} of {request.count}. Pick formats and tap Done. "
+                            "Unavailable formats will be skipped per item.",
+                            buttons=self.keyboard(selection))
 
     def keyboard(self, selection: Selection):
         def label(key: str) -> str:
@@ -545,34 +631,68 @@ class DownloaderBot:
         for owner, selection in list(self.selections.items()):
             if now - selection.created > SESSION_SECONDS:
                 self.selections.pop(owner, None)
+        for owner, request in list(self.pending_ranges.items()):
+            if now - request.created > SESSION_SECONDS:
+                self.pending_ranges.pop(owner, None)
         if uid in self.lookups:
             await event.respond("Finish or /cancel your current link lookup first.")
             return
         if len(self.lookups) >= 2:
-            await event.respond("The provider lookup slots are busy. Try again shortly.")
+            await event.respond("The link lookup slots are busy. Try again shortly.")
             return
+        mode = self.modes.get(uid, "youtube")
         try:
-            source = parse_source(event.raw_text)
+            source = (Source("terabox", parse_terabox_source(event.raw_text)) if mode == "terabox"
+                      else parse_source(event.raw_text))
         except ValueError as exc:
             await event.respond(str(exc))
             return
         self.selections.pop(uid, None)
-        if len(self.selections) >= MAX_SELECTIONS:
+        self.pending_ranges.pop(uid, None)
+        if len(self.selections) + len(self.pending_ranges) >= MAX_SELECTIONS:
             await event.respond("Too many open selections right now. Try again later.")
             return
         peer = await event.get_input_chat()
-        if source.kind == "playlist":
-            selection = Selection(secrets.token_hex(4), source, tuple(f"{q}p" for q in VIDEO_QUALITIES), peer,
-                                  api_endpoint=self.api_for(uid))
-            self.selections[uid] = selection
-            await event.respond(
-                f"Playlist: choose qualities from 360p to 4K, then tap Done. "
-                f"The first {self.playlist_limit} entries will be checked individually against the API; "
-                "only available qualities will be sent.", buttons=self.keyboard(selection))
-            return
         self.lookups[uid] = asyncio.current_task()
         notice = None
         try:
+            if source.kind == "playlist":
+                notice = await event.respond("Counting playlist videos (flat discovery, no downloads)…")
+                count = await asyncio.wait_for(
+                    asyncio.to_thread(playlist_count, source.url, MAX_DISCOVER), timeout=180)
+                if self.modes.get(uid, "youtube") != mode:
+                    await notice.edit("Mode changed. Send your link again.")
+                    return
+                self.pending_ranges[uid] = RangeRequest(source, peer, count, self.api_for(uid))
+                await notice.edit(f"Playlist reports {count} videos. Send an inclusive range like 1-29 or "
+                                  f"200-300 (within 1-{count}, up to {self.playlist_limit} per job).")
+                return
+            if source.kind == "terabox":
+                notice = await event.respond("Checking Terabox files and available qualities…")
+                listing = await fetch_terabox(self.http, source.url)
+                if self.modes.get(uid, "youtube") != mode:
+                    await notice.edit("Mode changed. Send your link again.")
+                    return
+                count = len(listing.files)
+                if count > 1:
+                    folder = Source("terabox-folder", source.url)
+                    self.pending_ranges[uid] = RangeRequest(folder, peer, count, listing=listing)
+                    extra = (f" API reports {listing.reported_total} files but provided only {count} links; "
+                             "the bot can process only provided files." if listing.reported_total > count else "")
+                    await notice.edit(f"Terabox folder: {count} available files.{extra} Send an inclusive range "
+                                      f"like 1-{min(count, 29)} (up to {self.playlist_limit} per job).")
+                else:
+                    item = listing.files[0]
+                    selection = Selection(secrets.token_hex(4), source,
+                                          self.listing_choices(listing.options_for(0)), peer,
+                                          listing=listing)
+                    self.selections[uid] = selection
+                    partial = (f"API reports {listing.reported_total} files but provided only one usable link. "
+                               if listing.reported_total > 1 else "")
+                    await notice.edit(f"{partial}{item.filename} · "
+                                      f"{human_size(item.size) if item.size else 'size unknown'}\n"
+                                      "Choose a format, then Done:", buttons=self.keyboard(selection))
+                return
             notice = await event.respond("Checking available qualities… This API may take 1–2 minutes. /cancel to stop.")
             title_task = asyncio.create_task(get_youtube_title(self.http, source.url))
             try:
@@ -583,6 +703,9 @@ class DownloaderBot:
                 if not title_task.done():
                     title_task.cancel()
                 await asyncio.gather(title_task, return_exceptions=True)
+            if self.modes.get(uid, "youtube") != mode:
+                await notice.edit("Mode changed. Send your link again.")
+                return
             choices = tuple(sorted((q for q in video.streams if q != AUDIO), key=lambda q: int(q[:-1])))
             if AUDIO in video.streams:
                 choices += (AUDIO,)
@@ -598,9 +721,9 @@ class DownloaderBot:
             if notice:
                 await self.safe_edit(notice, "Lookup cancelled.")
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
-            LOG.warning("Video lookup failed for user %s: %s", uid, type(exc).__name__)
+            LOG.warning("Link lookup failed for user %s: %s", uid, type(exc).__name__)
             if notice:
-                await self.safe_edit(notice, "Could not load this video. The API may be down or slow; try again later.")
+                await self.safe_edit(notice, "Could not load this link. The API or source may be unavailable; try later.")
         finally:
             self.lookups.pop(uid, None)
 
@@ -613,6 +736,19 @@ class DownloaderBot:
     async def callback(self, event) -> None:
         uid = event.sender_id
         parts = (event.data or b"").decode("ascii", errors="ignore").split(":")
+        if parts[0] == "m":
+            if (not event.is_private or len(parts) != 3 or self.mode_tokens.get(uid) != parts[1]
+                    or parts[2] not in ("youtube", "terabox")):
+                await event.answer("Mode selector expired. Send /change again.", alert=True)
+                return
+            mode = parts[2]
+            self.modes[uid] = mode
+            self.mode_tokens.pop(uid, None)
+            self.pending_ranges.pop(uid, None)
+            self.selections.pop(uid, None)
+            await event.answer(f"{mode.title()} selected")
+            await event.edit(f"{mode.title()} mode is active. Send a {mode.title()} link.")
+            return
         if parts[0] == "j":
             job = self.jobs.get(parts[1]) if len(parts) == 3 else None
             if (not event.is_private or not job or job.user_id != uid):
@@ -683,7 +819,8 @@ class DownloaderBot:
             return
         selected = tuple(key for key in selection.choices if key in selection.selected)
         job = Job(uid, selection.peer, event.message_id, selection.source, selected, selection.video,
-                  api_endpoint=selection.api_endpoint)
+                  api_endpoint=selection.api_endpoint, start=selection.start, end=selection.end,
+                  listing=selection.listing)
         self.selections.pop(uid, None)
         self.jobs[job.token] = job
         job.task = asyncio.create_task(self.run_job(job))
@@ -704,6 +841,28 @@ class DownloaderBot:
                     return
                 await self.turn.wait()
 
+    async def fresh_terabox_file(self, job: Job, item: TeraboxFile) -> TeraboxFile:
+        listing = job.listing
+        if listing and listing.expires_at and listing.expires_at <= time.time() + 120:
+            listing = await fetch_terabox(self.http, job.source.url)
+            job.listing = listing
+            if listing.expires_at and listing.expires_at <= time.time():
+                raise ValueError("Terabox API returned expired download links.")
+        if listing:
+            available = (file for index in range(len(listing.files))
+                         for file in listing.options_for(index))
+            match = next((file for file in available
+                          if file.file_id == item.file_id and file.quality == item.quality), None)
+            if not match:
+                available = (file for index in range(len(listing.files))
+                             for file in listing.options_for(index))
+                match = next((file for file in available
+                              if file.filename == item.filename and file.quality == item.quality), None)
+            if match:
+                return match
+            raise ValueError("Selected file/quality is no longer available from the Terabox API.")
+        return item
+
     async def run_job(self, job: Job) -> None:
         sent = missing = too_large = unknown_size = failed = 0
         job.reporter = asyncio.create_task(self.report_loop(job))
@@ -713,18 +872,57 @@ class DownloaderBot:
             async with self.slot:
                 await self.progress(job, "Starting…")
                 if job.source.kind == "playlist":
-                    await self.progress(job, "Reading playlist entries…")
+                    await self.progress(job, f"Reading playlist entries {job.start}-{job.end}…")
                     entries = await asyncio.wait_for(
-                        asyncio.to_thread(extract_playlist, job.source.url, self.playlist_limit), timeout=180)
+                        asyncio.to_thread(extract_playlist_range, job.source.url, job.start, job.end),
+                        timeout=180)
+                elif job.source.kind.startswith("terabox"):
+                    initial_listing = job.listing
+                    entries = list(initial_listing.files[job.start - 1:job.end]) if initial_listing else []
                 else:
                     entries = [PlaylistEntry(job.source.url, job.video.title if job.video else "")]
-                job.item_total = len(entries)
-                for index, entry in enumerate(entries, 1):
+                if not entries:
+                    raise ValueError("No available entries in this range.")
+                job.item_total = job.end if job.source.kind in ("playlist", "terabox-folder") else len(entries)
+                for offset, entry in enumerate(entries):
+                    if job.source.kind == "playlist":
+                        index = entry.position or job.start + offset
+                    elif job.source.kind == "terabox-folder":
+                        index = job.start + offset
+                    else:
+                        index = offset + 1
                     job.item_index = index
-                    job.current_url = entry.url
+                    job.current_url = (f"{job.source.url}#{entry.file_id}" if isinstance(entry, TeraboxFile) else entry.url)
                     job.quality = ""
                     job.title = entry.title
                     job.total_bytes = job.downloaded = job.uploaded = 0
+                    if isinstance(entry, TeraboxFile):
+                        options = {file.quality: file for file in initial_listing.options_for(job.start - 1 + offset)}
+                        for quality in job.selected:
+                            if quality not in options:
+                                missing += 1
+                                continue
+                            try:
+                                item = await self.fresh_terabox_file(job, options[quality])
+                                job.current_url = f"{job.source.url}#{item.file_id}:{item.quality}"
+                                video = Video(item.title, {item.quality: item.url}, thumbnail=item.thumbnail)
+                                job.title = video.title
+                                job.quality = item.quality
+                                job.total_bytes = job.downloaded = job.uploaded = 0
+                                job.speed = 0.0
+                                job.sample_bytes, job.sample_at = 0, time.monotonic()
+                                await self.progress(job, "Streaming Terabox → Telegram.")
+                                await self.send_stream(job, video, item.quality, item.url, index, job.item_total, item)
+                                sent += 1
+                            except FileTooLarge:
+                                too_large += 1
+                            except UnknownLength:
+                                unknown_size += 1
+                            except (aiohttp.ClientError, RPCError, asyncio.TimeoutError, ValueError, OSError) as exc:
+                                LOG.warning("Terabox transfer failed for item %s, quality %s: %s",
+                                            index, quality, type(exc).__name__)
+                                failed += 1
+                        continue
                     await self.progress(job, f"Checking formats (API may take 1–2 minutes). Sent {sent} so far.")
                     try:
                         video = job.video if job.video else await fetch_video(self.http, entry.url, job.api_endpoint)
@@ -746,12 +944,11 @@ class DownloaderBot:
                         job.sample_bytes, job.sample_at = 0, time.monotonic()
                         await self.progress(job, f"Streaming provider → Telegram. Sent {sent} so far.")
                         try:
-                            await self.send_stream(job, video, quality, stream, index, len(entries))
+                            await self.send_stream(job, video, quality, stream, index, job.item_total)
                             sent += 1
                         except FileTooLarge:
                             too_large += 1
                         except UnknownLength:
-                            LOG.warning("Unknown-size download exceeds spool limit for video %s", index)
                             unknown_size += 1
                         except (aiohttp.ClientError, RPCError, asyncio.TimeoutError, ValueError, OSError) as exc:
                             LOG.warning("Transfer failed at video %s, quality %s: %s", index, quality, exc)
@@ -765,7 +962,7 @@ class DownloaderBot:
             await self.progress(job, "Cancelled. Already uploaded files remain in the chat.", force=True)
         except (ValueError, asyncio.TimeoutError) as exc:
             job.state = "finished"
-            await self.progress(job, f"Could not read the playlist: {exc}", force=True)
+            await self.progress(job, f"Could not load the selected entries: {exc}", force=True)
         except Exception:
             job.state = "finished"
             LOG.exception("Unexpected job failure")
@@ -783,11 +980,16 @@ class DownloaderBot:
         source = job.current_url or job.source.url
         if job.thumbnail_id == source:
             return job.thumbnail, *job.thumb_size
-        video_id = source.rsplit("=", 1)[-1]
-        urls = [f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
-                f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"]
-        if video.thumbnail and video.thumbnail not in urls:
-            urls.append(video.thumbnail)
+        if job.source.kind.startswith("terabox"):
+            urls = [video.thumbnail] if video.thumbnail else []
+        else:
+            video_id = source.rsplit("=", 1)[-1]
+            # Prefer the API's supplied thumbnail; YouTube sizes are fallbacks.
+            urls = [video.thumbnail] if video.thumbnail else []
+            for candidate in (f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+                              f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"):
+                if candidate not in urls:
+                    urls.append(candidate)
         thumb = None
         for image_url in urls:
             thumb = await thumbnail_jpeg(self.http, image_url)
@@ -798,8 +1000,14 @@ class DownloaderBot:
         job.thumb_size = thumb[1:] if thumb else (0, 0)
         return job.thumbnail, *job.thumb_size
 
-    async def send_stream(self, job: Job, video: Video, quality: str, url: str, index: int, total: int) -> None:
-        suffix = ".mp3" if quality == AUDIO else ".mp4"
+    async def send_stream(self, job: Job, video: Video, quality: str, url: str, index: int, total: int,
+                          source_file: TeraboxFile | None = None) -> None:
+        suffix = (Path(source_file.filename).suffix.lower() if source_file else
+                  ".mp3" if quality == AUDIO else ".mp4")
+        suffix = suffix if re.fullmatch(r"\.[a-z0-9]{1,8}", suffix) else ".bin"
+        audio = quality.lower() == "mp3" or bool(source_file and source_file.mime.startswith("audio/"))
+        video_file = source_file.video if source_file else not audio
+        streamable = video_file and suffix == ".mp4"
         safe_title = re.sub(r"[^\w .-]", "_", video.title, flags=re.UNICODE).strip(" .") or "video"
         filename = media_name(safe_title, quality, 100) + suffix
         prefix = f"{index}/{total} · " if total > 1 else ""
@@ -817,14 +1025,15 @@ class DownloaderBot:
         def on_flood(seconds: int) -> None:
             job.rate_limit_until = time.monotonic() + seconds if seconds else 0
 
-        probe = MediaProbe() if quality != AUDIO else None
+        probe = MediaProbe(suffix) if video_file else None
         thumb_task = asyncio.create_task(self.video_thumbnail(job, video)) if probe else None
         try:
             uploaded = await upload_stream(self.client, self.http, url, filename, self.max_bytes,
                                            on_total=on_total, on_download=on_download,
                                            on_upload=on_upload, on_flood=on_flood,
                                            on_data=probe.add if probe else None,
-                                           in_flight=self.in_flight)
+                                           in_flight=self.in_flight,
+                                           expected_size=source_file.size if source_file else 0)
         except BaseException:
             if thumb_task:
                 thumb_task.cancel()
@@ -837,16 +1046,18 @@ class DownloaderBot:
             LOG.warning("Thumbnail unavailable: %s", type(exc).__name__)
             thumb_data, thumb_w, thumb_h = None, 0, 0
         info = await probe.inspect() if probe else None
-        if quality == AUDIO:
+        if audio:
             attributes = [types.DocumentAttributeAudio(duration=video.duration,
                                                        title=media_name(video.title, quality, 64))]
-        else:
+        elif video_file:
             # ffprobe inspects the actual MP4 head/tail. API duration and image
             # dimensions are fallbacks only if its metadata cannot be parsed.
             attributes = [types.DocumentAttributeVideo(duration=info.duration or video.duration,
                                                        w=info.width or thumb_w or 16,
                                                        h=info.height or thumb_h or 9,
-                                                       supports_streaming=True)]
+                                                       supports_streaming=streamable)]
+        else:
+            attributes = None
 
         async def send_with_preview(*, document: bool = False, with_thumb: bool = True) -> None:
             thumb_file = None
@@ -854,9 +1065,11 @@ class DownloaderBot:
                 thumb_file = io.BytesIO(thumb_data)
                 thumb_file.name = "preview.jpg"
             await self.client.send_file(job.peer, uploaded, caption=caption, parse_mode=None,
-                                        mime_type="audio/mpeg" if quality == AUDIO else "video/mp4",
-                                        attributes=attributes, supports_streaming=quality != AUDIO and not document,
-                                        force_document=document, thumb=thumb_file)
+                                        mime_type=(source_file.mime if source_file else
+                                                   "audio/mpeg" if audio else "video/mp4"),
+                                        attributes=attributes, supports_streaming=streamable and not document,
+                                        force_document=document or (source_file is not None and not streamable and not audio),
+                                        thumb=thumb_file)
 
         async def deliver() -> None:
             try:
@@ -864,7 +1077,7 @@ class DownloaderBot:
             except (PhotoInvalidDimensionsError, PhotoInvalidError):
                 await send_with_preview(with_thumb=False)
             except VideoContentTypeInvalidError:
-                if quality == AUDIO:
+                if audio:
                     raise
                 # Reuse the handle if Telegram rejects the MP4 as streamable.
                 try:
