@@ -3,8 +3,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from ytdown.bot import (DownloaderBot, FileTooLarge, HTTPReader, Job, Selection, UnknownLength,
-                        choose_title, get_youtube_title, media_name, upload_stream)
+from ytdown.bot import (DownloaderBot, FileTooLarge, HTTPReader, Job, MAX_MT_MB, MAX_PARTS,
+                        PART_BYTES, Selection, UnknownLength, choose_title, get_youtube_title,
+                        media_name, upload_parts, upload_stream)
 from ytdown.core import PlaylistEntry, Source, Video
 
 VIDEO_URL = "https://www.youtube.com/watch?v=3SY1i5CB03Q"
@@ -149,6 +150,24 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.requests), 21)
         self.assertTrue(all(isinstance(r, SaveBigFilePartRequest) and len(r.bytes) <= 512 * 1024
                             for r in client.requests))
+
+    async def test_near_2gb_part_boundary_checked_before_upload(self):
+        self.assertEqual(MAX_MT_MB, 2000)
+        self.assertEqual(MAX_MT_MB * 1024 * 1024 // PART_BYTES, MAX_PARTS)
+        session = MagicMock()
+        client = AsyncMock(return_value=True)
+        session.get.return_value = FakeResponse(length=MAX_PARTS * PART_BYTES + 1)
+        with self.assertRaises(FileTooLarge):
+            await upload_stream(client, session, CDN_URL, "big.mp4", MAX_MT_MB * 1024 * 1024)
+        client.assert_not_awaited()
+        # Exactly 4,000 parts passes the early size check (body is absent in
+        # this offline test, so streaming then fails with an incomplete read).
+        session.get.return_value = FakeResponse(length=MAX_PARTS * PART_BYTES)
+        with self.assertRaises(asyncio.IncompleteReadError):
+            await upload_stream(client, session, CDN_URL, "big.mp4", MAX_MT_MB * 1024 * 1024)
+        with self.assertRaises(FileTooLarge):
+            await upload_parts(client, HTTPReader(FakeResponse(), MAX_PARTS * PART_BYTES + 1),
+                               MAX_PARTS * PART_BYTES + 1, "big.mp4", 2)
 
     async def test_size_cap_redirect_and_wrong_length(self):
         session = MagicMock()

@@ -32,9 +32,11 @@ API_URL = "https://samra-youtube-api.antideploy.com/"
 MAX_WAITING = 4
 MAX_SELECTIONS = 100
 SESSION_SECONDS = 1800
-# 2047 MiB stays below Telegram's 2 GiB MTProto file limit.
-MAX_MT_MB = 2047
+# Telegram clients limit uploads to 4,000 parts of 512 KiB (2,000 MiB).
+# 2,047 MiB would need 4,094 parts and can fail near the end of an upload.
+MAX_MT_MB = 2000
 PART_BYTES = 512 * 1024
+MAX_PARTS = 4000
 SPOOL_MB = 64  # For rare providers that do not send Content-Length.
 REPORT_SECONDS = 12  # Automatic edits: keep well below Telegram flood limits.
 MIN_EDIT_SECONDS = 8
@@ -194,6 +196,8 @@ async def upload_parts(client, reader: HTTPReader, size: int, filename: str,
     """Pipeline 1–3 MTProto parts, using the correct small/big file protocol."""
     file_id = helpers.generate_random_long()
     parts = (size + PART_BYTES - 1) // PART_BYTES
+    if parts > MAX_PARTS:
+        raise FileTooLarge()
     is_big = size > 10 * 1024 * 1024
     digest = hashlib.md5() if not is_big else None  # Telegram requires MD5 for small files.
     pending: set[asyncio.Task] = set()
@@ -266,7 +270,7 @@ Pipelines bounded saveBigFilePart/saveFilePart requests from the HTTP stream,
                 raise ValueError("The download link returned a page instead of media.")
             size = response.content_length
             if size is not None:
-                if size > max_bytes:
+                if size > min(max_bytes, MAX_PARTS * PART_BYTES):
                     raise FileTooLarge()
                 if size == 0:
                     raise ValueError("The download link returned an empty file.")
@@ -407,7 +411,7 @@ class DownloaderBot:
                 "Only download media you have permission to use.")
         elif command == "/limits":
             await event.respond(
-                f"MTProto limit: {self.max_bytes // 1024 // 1024} MiB per file (up to 2 GiB). "
+                f"MTProto limit: {self.max_bytes // 1024 // 1024} MiB per file (up to 4,000 parts). "
                 f"Playlist: first {self.playlist_limit} entries. One job at a time, "
                 f"{self.in_flight} concurrent upload parts; up to {MAX_WAITING} waiting jobs. "
                 "Files without Content-Length are limited to 64 MiB. Jobs/selections are not restored after a restart.")
