@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 from yt_dlp.utils import DownloadError
 
 from ytdown.bot import DownloaderBot, Job, MODE_LABELS, is_media_link
@@ -222,6 +223,55 @@ class BotDownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("failed 1 (720p: HTTP Error 403)", text)
         self.assertNotIn("SECRET", text)
         self.assertIn("failed 1", text)
+
+
+class DailymotionFallbackTests(unittest.IsolatedAsyncioTestCase):
+    API = {"success": True, "title": "Clip", "duration": 10, "poster": "",
+           "master_m3u8": "https://cdndirector.example.com/m.m3u8",
+           "proxy_m3u8": "https://worker.example.workers.dev/api/m3u8?url=x"}
+
+    @staticmethod
+    def status_error(status):
+        return aiohttp.ClientResponseError(request_info=MagicMock(), history=(), status=status)
+
+    async def fetch(self, *reads, api=None, api_error=None):
+        from ytdown.bot import fetch_dailymotion
+        api_mock = AsyncMock(side_effect=api_error) if api_error else AsyncMock(return_value=api or self.API)
+        with patch("ytdown.bot.fetch_json_api", new=api_mock), \
+             patch("ytdown.bot.read_bounded", new=AsyncMock(side_effect=list(reads))) as reader:
+            info = await fetch_dailymotion(MagicMock(), WATCH)
+        return info, reader
+
+    async def test_refused_cdn_playlist_falls_back_to_worker_proxy(self):
+        info, reader = await self.fetch(self.status_error(403), MASTER.encode())
+        self.assertEqual([f.label for f in info.formats], ["720p", "360p"])
+        self.assertEqual(reader.await_args_list[1].args[1], self.API["proxy_m3u8"])
+
+    async def test_cdn_playlist_is_used_when_it_works(self):
+        info, reader = await self.fetch(MASTER.encode())
+        self.assertEqual(reader.await_count, 1)
+        self.assertEqual(info.title, "Clip")
+
+    async def test_both_refused_names_the_status(self):
+        with self.assertRaisesRegex(DailymotionError, "HTTP 403"):
+            await self.fetch(self.status_error(403), self.status_error(403))
+
+    async def test_api_status_is_reported(self):
+        with self.assertRaisesRegex(DailymotionError, "HTTP 429"):
+            await self.fetch(api_error=self.status_error(429))
+
+    async def test_redirected_playlist_is_not_read_as_empty(self):
+        from ytdown.dailymotion import read_bounded
+        response = SimpleNamespace(status=302, content_length=None, request_info=MagicMock(), history=(),
+                                   raise_for_status=lambda: None)
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=response)
+        context.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.get = MagicMock(return_value=context)
+        with self.assertRaises(aiohttp.ClientResponseError) as caught:
+            await read_bounded(session, "https://cdndirector.example.com/m.m3u8", 1000)
+        self.assertEqual(caught.exception.status, 302)
 
 
 if __name__ == "__main__":

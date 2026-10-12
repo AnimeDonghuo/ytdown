@@ -112,12 +112,21 @@ def estimate_bytes(fmt: DMFormat, duration: int) -> int:
     return fmt.bandwidth // 8 * duration if fmt.bandwidth and duration else 0
 
 
+def proxy_manifest(data: object) -> str:
+    """The Worker's own copy of the master playlist, served from Cloudflare rather than the CDN."""
+    value = data.get("proxy_m3u8") if isinstance(data, dict) else None
+    return value if public_https_url(value) else ""
+
+
 def ffmpeg_ready() -> bool:
     return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 
 async def read_bounded(session: aiohttp.ClientSession, url: str, limit: int) -> bytes:
     async with session.get(url, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=60, connect=20)) as resp:
+        if 300 <= resp.status < 400:  # Not followed: report it instead of parsing an empty body.
+            raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status,
+                                              message="redirect not followed")
         resp.raise_for_status()
         if resp.content_length and resp.content_length > limit:
             raise DailymotionError("Dailymotion returned more data than expected.")

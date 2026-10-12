@@ -35,7 +35,8 @@ from .terabox import (TERABOX_API_URL, TeraboxFile, TeraboxListing, normalize_te
                       parse_terabox_source)
 from .dailymotion import (DAILYMOTION_API_URL, MAX_API_BYTES, MAX_MANIFEST_BYTES, DailymotionError,
                           DailymotionInfo, download_dailymotion, estimate_bytes, ffmpeg_ready,
-                          normalize_dailymotion, parse_dailymotion_source, parse_master, read_bounded)
+                          normalize_dailymotion, parse_dailymotion_source, parse_master, proxy_manifest,
+                          read_bounded)
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg, usable_still
 
@@ -297,13 +298,38 @@ async def fetch_terabox(session: aiohttp.ClientSession, url: str,
 
 async def fetch_dailymotion(session: aiohttp.ClientSession, url: str,
                             endpoint: str = DAILYMOTION_API_URL) -> DailymotionInfo:
-    data = await fetch_json_api(session, endpoint, url, MAX_API_BYTES)
+    """Worker metadata, then the master playlist: the CDN copy first, the Worker's proxy copy if refused."""
+    try:
+        data = await fetch_json_api(session, endpoint, url, MAX_API_BYTES)
+    except aiohttp.ClientResponseError as exc:
+        LOG.warning("Dailymotion API answered HTTP %s", exc.status)
+        raise DailymotionError(f"The Dailymotion API answered HTTP {exc.status}. Try again later.") from exc
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        LOG.warning("Dailymotion API unreachable: %s", type(exc).__name__)
+        raise DailymotionError("Could not reach the Dailymotion API. Try again later.") from exc
+    except json.JSONDecodeError as exc:
+        raise DailymotionError("The Dailymotion API returned an unexpected response.") from exc
     title, duration, poster, manifest = normalize_dailymotion(data)
-    text = (await read_bounded(session, manifest, MAX_MANIFEST_BYTES)).decode("utf-8", "replace")
-    formats = parse_master(text, manifest)
-    if not formats:
-        raise DailymotionError("No downloadable Dailymotion qualities were listed.")
-    return DailymotionInfo(title, duration, poster, formats)
+    reason = "No downloadable Dailymotion qualities were listed."
+    for label, candidate in (("CDN", manifest), ("Worker proxy", proxy_manifest(data))):
+        if not candidate:
+            continue
+        try:
+            text = (await read_bounded(session, candidate, MAX_MANIFEST_BYTES)).decode("utf-8", "replace")
+        except aiohttp.ClientResponseError as exc:
+            LOG.warning("Dailymotion %s playlist refused: HTTP %s", label, exc.status)
+            reason = f"Dailymotion refused the {label} playlist (HTTP {exc.status})."
+            continue
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            LOG.warning("Dailymotion %s playlist unreachable: %s", label, type(exc).__name__)
+            reason = f"Could not reach the Dailymotion {label} playlist ({type(exc).__name__})."
+            continue
+        formats = parse_master(text, candidate)
+        if formats:
+            LOG.info("Dailymotion qualities read from the %s playlist", label)
+            return DailymotionInfo(title, duration, poster, formats)
+        reason = "No downloadable Dailymotion qualities were listed."
+    raise DailymotionError(reason)
 
 
 async def get_youtube_title(session: aiohttp.ClientSession, url: str) -> str:
@@ -1224,6 +1250,7 @@ class DownloaderBot:
 
     async def run_job(self, job: Job) -> None:
         sent = missing = too_large = unknown_size = failed = 0
+        skip_reasons: list[str] = []  # Shown in the final summary, not only in the logs.
         job.reporter = asyncio.create_task(self.report_loop(job))
         try:
             await self.progress(job, f"Queued: {', '.join(job.selected)}. Use /status or /cancel.", force=True)
@@ -1299,6 +1326,9 @@ class DownloaderBot:
                         status = getattr(exc, "status", "")
                         LOG.warning("Lookup failed for item %s (%s%s)", index, type(exc).__name__,
                                     f", HTTP {status}" if status else "")
+                        reason = f"HTTP {status}" if status else (
+                            str(exc)[:60] if isinstance(exc, ValueError) and str(exc) else type(exc).__name__)
+                        skip_reasons.append(f"item {index}: lookup {reason}")
                         failed += len(job.selected)
                         continue
                     for quality in job.selected:
@@ -1337,14 +1367,18 @@ class DownloaderBot:
                                         continue
                                 LOG.warning("Transfer failed at item %s, quality %s: HTTP %s",
                                             index, quality, exc.status)
+                                skip_reasons.append(f"item {index} {quality}: HTTP {exc.status}")
                                 failed += 1
                             except (aiohttp.ClientError, RPCError, asyncio.TimeoutError, ValueError, OSError) as exc:
                                 LOG.warning("Transfer failed at item %s, quality %s: %s", index, quality, exc)
+                                skip_reasons.append(f"item {index} {quality}: {type(exc).__name__}")
                                 failed += 1
                             break
                 job.state = "finished"
+                detail = f" ({'; '.join(skip_reasons[:6])})" if skip_reasons else ""
                 await self.progress(job, f"Finished. Sent {sent}; unavailable {missing}; over size limit {too_large}; "
-                                         f"missing size header (>64 MiB) {unknown_size}; failed {failed}.", force=True)
+                                         f"missing size header (>64 MiB) {unknown_size}; failed {failed}{detail}.",
+                                    force=True)
         except asyncio.CancelledError:
             job.state = "finished"
             job.rate_limit_until = 0
