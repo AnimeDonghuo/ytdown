@@ -32,6 +32,12 @@ class ParsingTests(unittest.TestCase):
                      "https://geo.dailymotion.com/player/xhm3k.html?video=x7tgad0"):
             self.assertEqual(parse_dailymotion_source(link), WATCH, link)
 
+    def test_accepts_newer_case_sensitive_ids(self):
+        self.assertEqual(parse_dailymotion_source("https://dai.ly/k5wsnkZKZa86T2LnlRY"),
+                         "https://www.dailymotion.com/video/k5wsnkZKZa86T2LnlRY")
+        self.assertEqual(parse_dailymotion_source("https://dailymotion.com/video/k5oZV9z1IBqgOEKNzhI"),
+                         "https://www.dailymotion.com/video/k5oZV9z1IBqgOEKNzhI")
+
     def test_rejects_other_links(self):
         for link in ("https://www.youtube.com/watch?v=3SY1i5CB03Q",
                      "http://www.dailymotion.com/video/x7tgad0",

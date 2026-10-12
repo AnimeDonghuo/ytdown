@@ -25,7 +25,8 @@ DAILYMOTION_HOSTS = ("dailymotion.com", "dai.ly")
 MAX_LINK = 2048
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_API_BYTES = 200_000
-VIDEO_ID = re.compile(r"x[a-z0-9]{3,16}", re.IGNORECASE)
+# Dailymotion IDs are alphanumeric and case-sensitive; older ones start with "x", newer ones may not.
+VIDEO_ID = re.compile(r"[A-Za-z0-9]{4,24}")
 
 
 class DailymotionError(ValueError):
