@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from ytdown.bot import API_URL, DownloaderBot, Job, Selection, cancel_entities
 from ytdown.core import Source, Video
-from ytdown.terabox import TERABOX_API_URL, parse_terabox_source
+from ytdown.terabox import parse_terabox_source
 
 VIDEO_URL = "https://www.youtube.com/watch?v=3SY1i5CB03Q"
 SHARE_URL = "https://terasharefile.com/s/16E1yDzvD_txbiR561VPxBA"
@@ -260,19 +260,22 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Stopped by me", self.sent[-1][1])
         self.assertIn("No active transfers", self.sent[-1][1])
 
-    async def test_numbered_apis_only_removes_own_custom_url(self):
+    async def test_apis_lists_each_service_and_removes_one_by_keyword(self):
         custom = "https://my-api.example.com/convert?key=abc"
         self.service.set_api(7, custom)
+        self.service.set_api(7, "https://tera.example.com/api", "terabox")
         self.event.raw_text = "/apis"
         await self.service.on_message(self.event)
         text = self.sent[-1][1]
-        self.assertIn("1. YouTube default: " + API_URL, text)
-        self.assertIn("2. Terabox: " + TERABOX_API_URL, text)
-        self.assertIn("3. YouTube custom: " + custom, text)
-        self.event.raw_text = "/apis remove 1"
-        await self.service.on_message(self.event)
-        self.assertEqual(self.service.api_for(7), custom)
-        self.event.raw_text = "/apis remove 3"
+        self.assertIn("YouTube: " + custom + " (custom)", text)
+        self.assertIn("Terabox: https://tera.example.com/api (custom)", text)
+        self.assertIn("Dailymotion: ", text)
+        self.event.raw_text = "/apis remove yt"
         await self.service.on_message(self.event)
         self.assertEqual(self.service.api_for(7), API_URL)
+        self.assertEqual(self.service.api_for(7, "terabox"), "https://tera.example.com/api")
         self.assertEqual(self.service.api_for(8), API_URL)
+        self.event.raw_text = "/apis remove daily"
+        await self.service.on_message(self.event)
+        self.assertIn("No custom Dailymotion API to remove.", self.sent[-1][1])
+

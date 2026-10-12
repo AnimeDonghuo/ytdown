@@ -42,6 +42,11 @@ from .media import MediaProbe, thumbnail_jpeg, usable_still
 LOG = logging.getLogger(__name__)
 MODE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion"}
 API_URL = "https://samra-youtube-api.antideploy.com/"
+DEFAULT_APIS = {"youtube": API_URL, "terabox": TERABOX_API_URL, "dailymotion": DAILYMOTION_API_URL}
+SERVICE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion"}
+SERVICE_KEYWORDS = {"yt": "youtube", "youtube": "youtube", "tera": "terabox", "terabox": "terabox",
+                    "daily": "dailymotion", "dailymotion": "dailymotion", "dm": "dailymotion"}
+RESET_WORDS = ("reset", "remove", "default")
 MAX_WAITING = 4
 MAX_SELECTIONS = 100
 SESSION_SECONDS = 1800
@@ -285,12 +290,14 @@ async def fetch_video(session: aiohttp.ClientSession, url: str, api_endpoint: st
         await asyncio.sleep(API_RETRY_DELAYS[attempt])
 
 
-async def fetch_terabox(session: aiohttp.ClientSession, url: str) -> TeraboxListing:
-    return normalize_terabox(await fetch_json_api(session, TERABOX_API_URL, url, 4_000_000))
+async def fetch_terabox(session: aiohttp.ClientSession, url: str,
+                         endpoint: str = TERABOX_API_URL) -> TeraboxListing:
+    return normalize_terabox(await fetch_json_api(session, endpoint, url, 4_000_000))
 
 
-async def fetch_dailymotion(session: aiohttp.ClientSession, url: str) -> DailymotionInfo:
-    data = await fetch_json_api(session, DAILYMOTION_API_URL, url, MAX_API_BYTES)
+async def fetch_dailymotion(session: aiohttp.ClientSession, url: str,
+                            endpoint: str = DAILYMOTION_API_URL) -> DailymotionInfo:
+    data = await fetch_json_api(session, endpoint, url, MAX_API_BYTES)
     title, duration, poster, manifest = normalize_dailymotion(data)
     text = (await read_bounded(session, manifest, MAX_MANIFEST_BYTES)).decode("utf-8", "replace")
     formats = parse_master(text, manifest)
@@ -470,8 +477,9 @@ class DownloaderBot:
         self.selections: dict[int, Selection] = {}
         self.lookups: dict[int, asyncio.Task] = {}
         self.jobs: dict[str, Job] = {}
-        self.api_overrides: dict[int, str] = {}
+        self.api_overrides: dict[int, dict[str, str]] = {}  # uid -> {service: custom endpoint}
         self.awaiting_api: set[int] = set()
+        self.awaiting_service: dict[int, str] = {}
         self.modes: dict[int, str] = {}
         self.mode_tokens: dict[int, str] = {}
         self.pending_ranges: dict[int, RangeRequest] = {}
@@ -487,14 +495,34 @@ class DownloaderBot:
     def user_jobs(self, uid: int) -> list[Job]:
         return [job for job in self.jobs.values() if job.user_id == uid]
 
-    def api_for(self, uid: int) -> str:
-        return self.api_overrides.get(uid, API_URL)
+    def api_for(self, uid: int, service: str = "youtube") -> str:
+        return self.api_overrides.get(uid, {}).get(service, DEFAULT_APIS[service])
 
-    def set_api(self, uid: int, raw: str) -> str:
+    def set_api(self, uid: int, raw: str, service: str = "youtube") -> str:
         endpoint = normalize_api_endpoint(raw)
-        self.api_overrides[uid] = endpoint
+        self.api_overrides.setdefault(uid, {})[service] = endpoint
         self.awaiting_api.discard(uid)
         return endpoint
+
+    def clear_api(self, uid: int, service: str | None = None) -> bool:
+        """Restore one service's built-in API, or all of them when service is None."""
+        overrides = self.api_overrides.get(uid, {})
+        if service is None:
+            removed = bool(overrides)
+            self.api_overrides.pop(uid, None)
+        else:
+            removed = overrides.pop(service, None) is not None
+            if not overrides:
+                self.api_overrides.pop(uid, None)
+        self.awaiting_api.discard(uid)
+        return removed
+
+    def api_lines(self, uid: int) -> list[str]:
+        lines = []
+        for service, label in SERVICE_LABELS.items():
+            custom = self.api_overrides.get(uid, {}).get(service)
+            lines.append(f"{label}: {custom} (custom)" if custom else f"{label}: {DEFAULT_APIS[service]} (built-in)")
+        return lines
 
     def register(self) -> None:
         self.client.add_event_handler(self.on_message, events.NewMessage(incoming=True))
@@ -649,6 +677,58 @@ class DownloaderBot:
             await self.render(job)
 
 
+    async def handle_changeapi(self, event, text: str) -> None:
+        uid = event.sender_id
+        arg = text.partition(" ")[2].strip()
+        head, _, tail = arg.partition(" ")
+        head, tail = head.lower(), tail.strip()
+        if not arg:
+            await event.respond("Choose a service: /changeapi yt, /changeapi tera or /changeapi daily, then send "
+                                "its public HTTPS API URL, for example /changeapi yt https://example.com/?url=. "
+                                "/changeapi show lists them; /changeapi reset restores all built-in APIs.")
+            return
+        if head == "show":
+            await event.respond("\n".join(self.api_lines(uid)), parse_mode=None)
+            return
+        if head in RESET_WORDS:
+            if tail and tail.lower() not in SERVICE_KEYWORDS:
+                await event.respond("Unknown service. Use yt, tera or daily.")
+                return
+            service = SERVICE_KEYWORDS[tail.lower()] if tail else None
+            self.clear_api(uid, service)
+            await event.respond(f"Built-in {SERVICE_LABELS[service]} API restored. Queued jobs are unchanged."
+                                if service else "All built-in APIs restored. Queued jobs are unchanged.")
+            return
+        if head in SERVICE_KEYWORDS:
+            service, rest = SERVICE_KEYWORDS[head], tail
+        else:
+            # Legacy form: /changeapi <URL> sets the YouTube API.
+            service, rest = "youtube", arg
+        label, keyword = SERVICE_LABELS[service], head if head in SERVICE_KEYWORDS else "yt"
+        if rest.lower() == "show":
+            await event.respond(f"{label}: {self.api_overrides.get(uid, {}).get(service) or DEFAULT_APIS[service]}"
+                                f" ({'custom' if service in self.api_overrides.get(uid, {}) else 'built-in'})",
+                                parse_mode=None)
+            return
+        if rest.lower() in RESET_WORDS:
+            self.clear_api(uid, service)
+            await event.respond(f"Built-in {label} API restored. Queued jobs are unchanged.")
+            return
+        if not rest:
+            self.awaiting_api.add(uid)
+            self.awaiting_service[uid] = service
+            await event.respond(f"Send the public HTTPS API URL for {label} now (for example "
+                                f"https://example.com/?url=). /changeapi {keyword} reset restores the built-in API, "
+                                "or /cancel to stop.")
+            return
+        try:
+            self.set_api(uid, rest, service)
+        except ValueError as exc:
+            await event.respond(str(exc))
+        else:
+            await event.respond(f"Custom {label} API saved for your future {label} links. "
+                                f"/changeapi {keyword} reset restores the built-in API.")
+
     async def on_message(self, event) -> None:
         if not event.is_private:
             await event.respond("Please use this bot in a private chat.")
@@ -666,7 +746,7 @@ class DownloaderBot:
                 "/status or /queue — one live status for running and queued jobs\n"
                 "/cancel — list jobs; /cancel_<job-id> stops one with a tappable command\n"
                 "/apis — numbered API list; /apis remove 3 resets a custom API\n"
-                "/changeapi — set your YouTube API; /changeapi reset restores default\n"
+                "/changeapi yt|tera|daily <URL> — set your own API for one service; /changeapi reset restores all\n"
                 "/limits — size and queue limits\n/help — these instructions\n\n"
                 "Only download media you have permission to use.")
         elif command == "/limits":
@@ -690,49 +770,26 @@ class DownloaderBot:
                                           Button.inline("📁 Terabox", data=f"m:{token}:terabox".encode())],
                                          [Button.inline("🎞 Dailymotion", data=f"m:{token}:dailymotion".encode())]])
         elif command == "/changeapi":
-            uid = event.sender_id
-            arg = text.partition(" ")[2].strip()
-            if arg.lower() in ("reset", "remove", "default"):
-                self.api_overrides.pop(uid, None)
-                self.awaiting_api.discard(uid)
-                await event.respond("API reset to the built-in default. Existing queued jobs keep their chosen API.")
-            elif arg.lower() == "show":
-                await event.respond("Custom API active." if uid in self.api_overrides else "Using the built-in API.")
-            elif not arg:
-                self.awaiting_api.add(uid)
-                await event.respond("Send your public HTTPS API URL now (for example https://example.com/?url=). "
-                                    "Use /changeapi reset to restore the default, or /cancel to stop.")
-            else:
-                try:
-                    self.set_api(uid, arg)
-                except ValueError as exc:
-                    await event.respond(str(exc))
-                else:
-                    await event.respond("Custom API saved for your future links. /changeapi reset restores the default.")
+            await self.handle_changeapi(event, text)
         elif command in ("/status", "/queue"):
             await self.show_dashboard(event)
         elif command == "/apis":
             uid = event.sender_id
             arg = text.split(maxsplit=2)
-            if len(arg) == 3 and arg[1].lower() == "remove" and arg[2] == "3":
-                if self.api_overrides.pop(uid, None):
-                    self.awaiting_api.discard(uid)
-                    await event.respond("Custom YouTube API #3 removed. Future links use the default; queued jobs are unchanged.")
+            if len(arg) == 3 and arg[1].lower() == "remove" and arg[2].lower() in SERVICE_KEYWORDS:
+                service = SERVICE_KEYWORDS[arg[2].lower()]
+                if self.clear_api(uid, service):
+                    await event.respond(f"Custom {SERVICE_LABELS[service]} API removed. Future links use the built-in "
+                                        "API; queued jobs are unchanged.")
                 else:
-                    await event.respond("No custom API #3 to remove.")
-            elif len(arg) == 3 and arg[1].lower() == "remove" and arg[2] in ("1", "2"):
-                await event.respond("Built-in APIs #1 and #2 cannot be removed. Use /apis remove 3 for a custom API.")
+                    await event.respond(f"No custom {SERVICE_LABELS[service]} API to remove.")
             elif len(arg) > 1:
-                await event.respond("Use /apis to list providers or /apis remove 3 to reset your custom YouTube API.")
+                await event.respond("Use /apis to list the APIs, or /apis remove yt|tera|daily to restore one "
+                                    "built-in API.")
             else:
-                custom = self.api_overrides.get(uid)
-                lines = ["Configured APIs (for your account):",
-                         f"1. YouTube default: {API_URL}" + (" (inactive)" if custom else " (active)"),
-                         f"2. Terabox: {TERABOX_API_URL} (built-in)"]
-                if custom:
-                    lines.append(f"3. YouTube custom: {custom} (active; /apis remove 3)")
-                lines.append("Built-in APIs cannot be removed. /changeapi sets a custom YouTube API.")
-                await event.respond("\n".join(lines), parse_mode=None)
+                await event.respond("\n".join(["Configured APIs (for your account):", *self.api_lines(uid),
+                                                "Change with /changeapi yt|tera|daily <URL>; restore with "
+                                                "/changeapi yt|tera|daily reset."]), parse_mode=None)
         elif command == "/cancel" or command.startswith("/cancel_"):
             uid = event.sender_id
             if command.startswith("/cancel_") and not re.fullmatch(r"/cancel_[a-f0-9]{8}", command):
@@ -779,12 +836,14 @@ class DownloaderBot:
                     self.pending_ranges.pop(event.sender_id, None)
                     await self.on_link(event)
                 else:
+                    service = self.awaiting_service.get(event.sender_id, "youtube")
                     try:
-                        self.set_api(event.sender_id, text)
+                        self.set_api(event.sender_id, text, service)
                     except ValueError as exc:
                         await event.respond(f"{exc} Send an API URL, or /changeapi reset.")
                     else:
-                        await event.respond("Custom API saved for your future links. /changeapi reset restores the default.")
+                        await event.respond(f"Custom {SERVICE_LABELS[service]} API saved for your future links. "
+                                            "/changeapi reset restores the built-in API.")
             elif event.sender_id in self.pending_ranges and not text.startswith("https://"):
                 await self.on_range(event)
             else:
@@ -889,7 +948,7 @@ class DownloaderBot:
             if source.kind == "dailymotion":
                 notice = await event.respond("Checking Dailymotion qualities…")
                 try:
-                    info = await fetch_dailymotion(self.http, source.url)
+                    info = await fetch_dailymotion(self.http, source.url, self.api_for(uid, "dailymotion"))
                 except DailymotionError as exc:
                     await notice.edit(str(exc))
                     return
@@ -897,21 +956,23 @@ class DownloaderBot:
                     await notice.edit("Mode changed. Send your link again.")
                     return
                 selection = Selection(secrets.token_hex(4), source,
-                                      tuple(fmt.label for fmt in reversed(info.formats)), peer, info)
+                                      tuple(fmt.label for fmt in reversed(info.formats)), peer, info,
+                                      api_endpoint=self.api_for(uid, "dailymotion"))
                 self.selections[uid] = selection
                 await notice.edit(f"{info.title}\nChoose one or more qualities, then tap Done:",
                                   buttons=self.keyboard(selection))
                 return
             if source.kind == "terabox":
                 notice = await event.respond("Checking Terabox files and available qualities…")
-                listing = await fetch_terabox(self.http, source.url)
+                listing = await fetch_terabox(self.http, source.url, self.api_for(uid, "terabox"))
                 if self.modes.get(uid, "youtube") != mode:
                     await notice.edit("Mode changed. Send your link again.")
                     return
                 count = len(listing.files)
                 if count > 1:
                     folder = Source("terabox-folder", source.url)
-                    self.pending_ranges[uid] = RangeRequest(folder, peer, count, listing=listing)
+                    self.pending_ranges[uid] = RangeRequest(folder, peer, count,
+                                                            api_endpoint=self.api_for(uid, "terabox"), listing=listing)
                     extra = (f" API reports {listing.reported_total} files but provided only {count} links; "
                              "the bot can process only provided files." if listing.reported_total > count else "")
                     await notice.edit(f"Terabox folder: {count} available files.{extra} Send an inclusive range "
@@ -920,7 +981,7 @@ class DownloaderBot:
                     item = listing.files[0]
                     selection = Selection(secrets.token_hex(4), source,
                                           self.listing_choices(listing.options_for(0)), peer,
-                                          listing=listing)
+                                          listing=listing, api_endpoint=self.api_for(uid, "terabox"))
                     self.selections[uid] = selection
                     partial = (f"API reports {listing.reported_total} files but provided only one usable link. "
                                if listing.reported_total > 1 else "")
@@ -1142,7 +1203,7 @@ class DownloaderBot:
     async def fresh_terabox_file(self, job: Job, item: TeraboxFile) -> TeraboxFile:
         listing = job.listing
         if listing and listing.expires_at and listing.expires_at <= time.time() + 120:
-            listing = await fetch_terabox(self.http, job.source.url)
+            listing = await fetch_terabox(self.http, job.source.url, job.api_endpoint)
             job.listing = listing
             if listing.expires_at and listing.expires_at <= time.time():
                 raise ValueError("Terabox API returned expired download links.")

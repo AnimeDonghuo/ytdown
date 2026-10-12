@@ -588,7 +588,7 @@ class QueueAndAPISettingsTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 normalize_api_endpoint(bad)
         service = DownloaderBot(MagicMock(), MagicMock())
-        event = SimpleNamespace(sender_id=7, is_private=True, raw_text="/changeapi",
+        event = SimpleNamespace(sender_id=7, is_private=True, raw_text="/changeapi yt",
                                 respond=AsyncMock(), get_input_chat=AsyncMock(return_value="peer"))
         await service.on_message(event)
         self.assertIn(7, service.awaiting_api)
