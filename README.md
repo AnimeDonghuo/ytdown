@@ -10,7 +10,7 @@ Switch with `/change` → **Dailymotion**, then send a Dailymotion video link: `
 
 Requirements and limits:
 
-- **ffmpeg and ffprobe are required** on the host. The Koyeb Docker image includes them. On a host without them (BotKeep may be one), Dailymotion jobs stop with a clear message instead of failing silently.
+- **Hosting:** Dailymotion mode is supported on **Koyeb** (the Docker image includes ffmpeg and ffprobe). It needs ffmpeg and ffprobe on the host. On BotKeep it is unavailable unless those tools exist there; Dailymotion jobs then stop with a clear message, while YouTube and Terabox keep working.
 - Each quality needs free disk space of about 1.2× its size estimate, computed from the playlist's peak bandwidth and duration. Temporary files are deleted after each quality. Qualities above the 2,000 MiB Telegram limit are skipped.
 - The stream is downloaded from Dailymotion's CDN **from the bot's own IP address**. If Dailymotion refuses that address, the job reports the HTTP status (for example `HTTP Error 403`) and the other qualities still run.
 - Private, paid or region-restricted videos fail with the API's message. Nothing is bypassed.
@@ -58,7 +58,7 @@ Notes for BotKeep:
 - **No public port is required.** Telegram traffic uses MTProto. The `/healthz` endpoint starts only if the platform gives the process a port (`PORT`, default 8000). If the port cannot be bound, the bot logs a warning and keeps running. Do not rely on `/healthz` to keep the workload alive.
 - **ffmpeg may be missing.** At startup the bot logs a warning naming any missing `ffmpeg`/`ffprobe`. Without them there are no probe-based durations or frame thumbnails: durations come from the API and thumbnails come from the API or YouTube images, with the same safety checks as before. Uploads still work. If the platform does not provide ffmpeg, expect this degraded mode.
 - **Native packages.** `cryptg` is an optional native accelerator. If its install fails on BotKeep, remove the line from `requirements.txt`; the bot falls back to pure-Python encryption and still works, only more slowly.
-- **Dailymotion needs ffmpeg.** If BotKeep does not provide `ffmpeg` and `ffprobe`, Dailymotion jobs fail with a clear message while YouTube and Terabox keep working. Dailymotion temporary files use the host's disk, so check the free storage before downloading long videos.
+- **Dailymotion is Koyeb-only for now.** Dailymotion needs ffmpeg and ffprobe, which the Koyeb Docker image provides and BotKeep may not. Without them, Dailymotion jobs fail with a clear message while YouTube and Terabox keep working. Dailymotion temporary files use the host's disk, so check the free storage before downloading long videos.
 - **Ephemeral state.** Like Koyeb, `/changeapi` settings, the queue, and status history are in memory and reset on a restart or redeploy.
 - Keep the BotKeep console open or check it when a job seems stuck. Logs show lookup retries, refused links that were refreshed, and any cover-photo fallback.
 
