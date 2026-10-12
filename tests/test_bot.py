@@ -1,7 +1,10 @@
 import asyncio
 import io
+import json
 import unittest
 from types import SimpleNamespace
+
+import aiohttp
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from ytdown.bot import (DownloaderBot, FileTooLarge, HTTPReader, Job, MAX_MT_MB, MAX_PARTS,
@@ -89,6 +92,9 @@ class FakeResponse:
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        pause = patch("ytdown.bot.LOOKUP_GAP_SECONDS", 0)
+        pause.start()
+        self.addCleanup(pause.stop)
         self.service = DownloaderBot(MagicMock(), MagicMock())
         self.service.progress = AsyncMock()
         self.sent = []
@@ -908,3 +914,106 @@ class ToggleTests(unittest.IsolatedAsyncioTestCase):
         await service.callback(event)  # Must not propagate the Telegram error.
         event.edit.assert_awaited_once()
         self.assertEqual(selection.selected, {"360p"})
+
+
+def api_error(status: int):
+    return aiohttp.ClientResponseError(request_info=MagicMock(), history=(), status=status)
+
+
+class LinkLookupRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rate_limited_lookup_is_retried_then_succeeds(self):
+        from ytdown.bot import fetch_video
+        payload = {"success": True, "title": "T", "downloads": [{"url": CDN_URL, "quality": "360p",
+                                                                  "format": "mp4", "type": "video"}]}
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=[api_error(429), payload])) as api, \
+             patch("ytdown.bot.asyncio.sleep", new=AsyncMock()) as sleeper:
+            video = await fetch_video(MagicMock(), VIDEO_URL)
+        self.assertEqual(api.await_count, 2)
+        sleeper.assert_awaited_once_with(4)
+        self.assertEqual(video.streams, {"360p": CDN_URL})
+
+    async def test_non_json_provider_page_is_retried(self):
+        from ytdown.bot import fetch_video
+        payload = {"success": True, "downloads": [{"url": CDN_URL, "quality": "480p",
+                                                    "format": "mp4", "type": "video"}]}
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=[json.JSONDecodeError("x", "y", 0),
+                                                                           payload])), \
+             patch("ytdown.bot.asyncio.sleep", new=AsyncMock()):
+            self.assertEqual((await fetch_video(MagicMock(), VIDEO_URL)).streams, {"480p": CDN_URL})
+
+    async def test_client_error_is_not_retried_and_retries_are_bounded(self):
+        from ytdown.bot import fetch_video
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=api_error(400))) as api:
+            with self.assertRaises(aiohttp.ClientResponseError):
+                await fetch_video(MagicMock(), VIDEO_URL)
+        self.assertEqual(api.await_count, 1)
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=api_error(503))) as api, \
+             patch("ytdown.bot.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(aiohttp.ClientResponseError):
+                await fetch_video(MagicMock(), VIDEO_URL)
+        self.assertEqual(api.await_count, 3)
+
+
+class RefusedLinkTests(unittest.IsolatedAsyncioTestCase):
+    FRESH_URL = "https://cdn.example.com/fresh.mp4"
+
+    def make_service(self, send_results):
+        service = DownloaderBot(MagicMock(), MagicMock())
+        service.progress = AsyncMock()
+        service.send_stream = AsyncMock(side_effect=send_results)
+        return service
+
+    async def run_playlist_item(self, service, fetch_results):
+        job = Job(1, "peer", 2, Source("playlist", "https://www.youtube.com/playlist?list=PL12345678901"),
+                  ("360p",), None)
+        service.jobs[job.token] = job
+        entries = [PlaylistEntry(VIDEO_URL, "Episode 16")]
+        with patch("ytdown.bot.extract_playlist_range", return_value=entries), \
+             patch("ytdown.bot.fetch_video", new=AsyncMock(side_effect=fetch_results)) as fetch:
+            await service.run_job(job)
+        return fetch
+
+    async def test_refused_link_gets_one_fresh_lookup_and_sends(self):
+        service = self.make_service([api_error(403), None])
+        fetch = await self.run_playlist_item(service, [
+            Video("API", {"360p": CDN_URL}), Video("API", {"360p": self.FRESH_URL})])
+        self.assertEqual(fetch.await_count, 2)
+        self.assertEqual(service.send_stream.await_count, 2)
+        self.assertEqual(service.send_stream.await_args_list[1].args[3], self.FRESH_URL)
+        self.assertIn("Sent 1", service.progress.call_args.args[1])
+        self.assertIn("failed 0", service.progress.call_args.args[1])
+
+    async def test_second_refusal_is_reported_as_failed_not_retried_forever(self):
+        service = self.make_service([api_error(403), api_error(403)])
+        fetch = await self.run_playlist_item(service, [
+            Video("API", {"360p": CDN_URL}), Video("API", {"360p": self.FRESH_URL})])
+        self.assertEqual(fetch.await_count, 2)
+        self.assertEqual(service.send_stream.await_count, 2)
+        self.assertIn("failed 1", service.progress.call_args.args[1])
+
+    async def test_refusal_after_bytes_started_is_not_refreshed(self):
+        service = self.make_service([api_error(403)])
+        async def partial_then_refused(job, *args, **kwargs):
+            job.downloaded = 1024
+            raise api_error(403)
+        service.send_stream = AsyncMock(side_effect=partial_then_refused)
+        fetch = await self.run_playlist_item(service, [Video("API", {"360p": CDN_URL})])
+        self.assertEqual(fetch.await_count, 1)
+        self.assertEqual(service.send_stream.await_count, 1)
+
+
+class StartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_health_endpoint_is_optional(self):
+        from aiohttp import web
+        from ytdown.bot import start_health
+        site = MagicMock()
+        site.start = AsyncMock(side_effect=OSError("address already in use"))
+        with patch("ytdown.bot.web.TCPSite", return_value=site):
+            self.assertFalse(await start_health(MagicMock(spec=web.AppRunner), 8000))
+
+    def test_missing_ffmpeg_is_reported_not_fatal(self):
+        from ytdown.bot import check_media_tools
+        with patch("ytdown.bot.shutil.which", return_value=None), self.assertLogs("ytdown.bot", "WARNING") as logs:
+            check_media_tools()
+        self.assertIn("ffmpeg, ffprobe not found", logs.output[0])
+

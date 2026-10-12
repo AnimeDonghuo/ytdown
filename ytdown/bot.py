@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import signal
 import tempfile
 import time
@@ -49,6 +50,9 @@ MANUAL_REFRESH_SECONDS = 2
 MAX_RANGE_VIDEOS = 150
 MAX_DISCOVER = 5000
 MAX_DASHBOARDS = 100
+API_RETRY_DELAYS = (4, 12)  # Seconds before the 2nd and 3rd link-lookup attempts.
+LOOKUP_GAP_SECONDS = 2  # Pause between sequential playlist lookups to avoid provider rate limits.
+REFRESH_STATUSES = (403, 404, 410)  # Media link refused before any bytes were sent.
 THUMB_LIMIT = 256 * 1024  # Bounded read of Telegram's returned still-image thumbnail.
 THUMB_REQUEST = 64 * 1024
 COVER_CHECK_SECONDS = 20
@@ -257,7 +261,22 @@ async def fetch_json_api(session: aiohttp.ClientSession, api_endpoint: str, url:
 
 
 async def fetch_video(session: aiohttp.ClientSession, url: str, api_endpoint: str = API_URL) -> Video:
-    return normalize_video(await fetch_json_api(session, api_endpoint, url))
+    """YouTube link lookup. Quick transient API failures (rate limits, 5xx, non-JSON pages) are retried."""
+    for attempt in range(len(API_RETRY_DELAYS) + 1):
+        try:
+            return normalize_video(await fetch_json_api(session, api_endpoint, url))
+        except aiohttp.ClientResponseError as exc:
+            transient, error = exc.status in (408, 425, 429) or exc.status >= 500, exc
+            reason = f"HTTP {exc.status}"
+        except json.JSONDecodeError as exc:  # Providers sometimes answer with an HTML rate-limit page.
+            transient, error, reason = True, exc, "non-JSON response"
+        except aiohttp.ClientConnectionError as exc:
+            transient, error, reason = True, exc, type(exc).__name__
+        if not transient or attempt == len(API_RETRY_DELAYS):
+            raise error
+        LOG.info("Link API attempt %d failed (%s); retrying in %ss", attempt + 1, reason,
+                 API_RETRY_DELAYS[attempt])
+        await asyncio.sleep(API_RETRY_DELAYS[attempt])
 
 
 async def fetch_terabox(session: aiohttp.ClientSession, url: str) -> TeraboxListing:
@@ -1120,6 +1139,8 @@ class DownloaderBot:
                     entries = await asyncio.wait_for(
                         asyncio.to_thread(extract_playlist_range, job.source.url, job.start, job.end),
                         timeout=180)
+                    LOG.info("Playlist range %s-%s: %d of %d entries readable",
+                             job.start, job.end, len(entries), job.end - job.start + 1)
                 elif job.source.kind.startswith("terabox"):
                     initial_listing = job.listing
                     entries = list(initial_listing.files[job.start - 1:job.end]) if initial_listing else []
@@ -1168,13 +1189,17 @@ class DownloaderBot:
                                 failed += 1
                         continue
                     await self.progress(job, f"Checking formats (API may take 1–2 minutes). Sent {sent} so far.")
+                    if offset and job.source.kind == "playlist":
+                        await asyncio.sleep(LOOKUP_GAP_SECONDS)
                     try:
                         video = job.video if job.video else await fetch_video(self.http, entry.url, job.api_endpoint)
                         youtube_name = entry.title or await get_youtube_title(self.http, entry.url)
                         video = replace(video, title=choose_title(youtube_name, video.title, entry.url))
                         job.title = video.title
                     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
-                        LOG.warning("Lookup failed for playlist item %s: %s", index, type(exc).__name__)
+                        status = getattr(exc, "status", "")
+                        LOG.warning("Lookup failed for item %s (%s%s)", index, type(exc).__name__,
+                                    f", HTTP {status}" if status else "")
                         failed += len(job.selected)
                         continue
                     for quality in job.selected:
@@ -1187,16 +1212,37 @@ class DownloaderBot:
                         job.speed = 0.0
                         job.sample_bytes, job.sample_at = 0, time.monotonic()
                         await self.progress(job, f"Streaming provider → Telegram. Sent {sent} so far.")
-                        try:
-                            await self.send_stream(job, video, quality, stream, index, job.item_total)
-                            sent += 1
-                        except FileTooLarge:
-                            too_large += 1
-                        except UnknownLength:
-                            unknown_size += 1
-                        except (aiohttp.ClientError, RPCError, asyncio.TimeoutError, ValueError, OSError) as exc:
-                            LOG.warning("Transfer failed at video %s, quality %s: %s", index, quality, exc)
-                            failed += 1
+                        refreshed = False
+                        while True:
+                            try:
+                                await self.send_stream(job, video, quality, stream, index, job.item_total)
+                                sent += 1
+                            except FileTooLarge:
+                                too_large += 1
+                            except UnknownLength:
+                                unknown_size += 1
+                            except aiohttp.ClientResponseError as exc:
+                                # The provider refused the link before any bytes were sent:
+                                # ask the API once for a fresh link, then give up on this quality.
+                                if exc.status in REFRESH_STATUSES and not job.downloaded and not refreshed:
+                                    refreshed = True
+                                    LOG.info("Link refused for item %s (HTTP %s); requesting a fresh link",
+                                             index, exc.status)
+                                    try:
+                                        fresh = await fetch_video(self.http, entry.url, job.api_endpoint)
+                                        fresh_stream = fresh.streams.get(quality)
+                                    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError):
+                                        fresh_stream = None
+                                    if fresh_stream:
+                                        video, stream = replace(fresh, title=video.title), fresh_stream
+                                        continue
+                                LOG.warning("Transfer failed at item %s, quality %s: HTTP %s",
+                                            index, quality, exc.status)
+                                failed += 1
+                            except (aiohttp.ClientError, RPCError, asyncio.TimeoutError, ValueError, OSError) as exc:
+                                LOG.warning("Transfer failed at item %s, quality %s: %s", index, quality, exc)
+                                failed += 1
+                            break
                 job.state = "finished"
                 await self.progress(job, f"Finished. Sent {sent}; unavailable {missing}; over size limit {too_large}; "
                                          f"missing size header (>64 MiB) {unknown_size}; failed {failed}.", force=True)
@@ -1432,6 +1478,25 @@ class DownloaderBot:
             await self.ensure_cover(job, sent_message, thumb_data)
 
 
+async def start_health(runner: web.AppRunner, port: int) -> bool:
+    """Optional /healthz endpoint (Koyeb uses it). Hosts without public ports, such as BotKeep, can skip it."""
+    try:
+        await web.TCPSite(runner, "0.0.0.0", port).start()
+        LOG.info("Health check listening on port %s", port)
+        return True
+    except OSError as exc:
+        LOG.warning("Health check not started on port %s (%s); the bot keeps running.", port, exc)
+        return False
+
+
+def check_media_tools() -> None:
+    """ffmpeg/ffprobe add durations and frame thumbnails; without them the bot falls back to API data."""
+    missing = [tool for tool in ("ffmpeg", "ffprobe") if not shutil.which(tool)]
+    if missing:
+        LOG.warning("%s not found: durations come from the API and frame thumbnails are skipped. "
+                    "Docker images include ffmpeg; BotKeep may not.", ", ".join(missing))
+
+
 async def serve(token: str, api_id: int, api_hash: str) -> None:
     # MemorySession is not a StringSession and writes no authentication file to disk.
     client = TelegramClient(MemorySession(), api_id, api_hash, receive_updates=True)
@@ -1456,9 +1521,8 @@ async def serve(token: str, api_id: int, api_hash: str) -> None:
                 pass
         try:
             await client.start(bot_token=token)
-            site = web.TCPSite(runner, "0.0.0.0", env_int("PORT", 8000, 1, 65535))
-            await site.start()
-            LOG.info("MTProto bot connected; health check ready")
+            await start_health(runner, env_int("PORT", 8000, 1, 65535))
+            LOG.info("MTProto bot connected")
             await stop.wait()
         finally:
             for task in list(service.lookups.values()) + [j.task for j in service.jobs.values() if j.task]:
@@ -1480,4 +1544,5 @@ def main() -> None:
         api_id = 0
     if not token or not api_id or not api_hash:
         raise SystemExit("Set BOT_TOKEN, API_ID, and API_HASH as environment variables.")
+    check_media_tools()
     asyncio.run(serve(token, api_id, api_hash))
