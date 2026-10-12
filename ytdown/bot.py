@@ -13,6 +13,7 @@ import secrets
 import shutil
 import signal
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -26,15 +27,20 @@ from telethon.errors import (FloodWaitError, MessageNotModifiedError, PhotoInval
 from telethon.sessions import MemorySession
 from telethon.tl import types
 from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
+from yt_dlp.utils import DownloadError
 
 from .core import (AUDIO, VIDEO_QUALITIES, PlaylistEntry, Source, Video, extract_playlist_range,
                    extract_title, normalize_video, parse_source, playlist_count, public_https_url, youtube_title)
 from .terabox import (TERABOX_API_URL, TeraboxFile, TeraboxListing, normalize_terabox,
                       parse_terabox_source)
+from .dailymotion import (DAILYMOTION_API_URL, MAX_API_BYTES, MAX_MANIFEST_BYTES, DailymotionError,
+                          DailymotionInfo, download_dailymotion, estimate_bytes, ffmpeg_ready,
+                          normalize_dailymotion, parse_dailymotion_source, parse_master, read_bounded)
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg, usable_still
 
 LOG = logging.getLogger(__name__)
+MODE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion"}
 API_URL = "https://samra-youtube-api.antideploy.com/"
 MAX_WAITING = 4
 MAX_SELECTIONS = 100
@@ -214,7 +220,7 @@ class Job:
 
 def is_media_link(raw: str) -> bool:
     """Keep media links out of a pending /changeapi URL prompt."""
-    for parser in (parse_source, parse_terabox_source):
+    for parser in (parse_source, parse_terabox_source, parse_dailymotion_source):
         try:
             parser(raw)
             return True
@@ -281,6 +287,16 @@ async def fetch_video(session: aiohttp.ClientSession, url: str, api_endpoint: st
 
 async def fetch_terabox(session: aiohttp.ClientSession, url: str) -> TeraboxListing:
     return normalize_terabox(await fetch_json_api(session, TERABOX_API_URL, url, 4_000_000))
+
+
+async def fetch_dailymotion(session: aiohttp.ClientSession, url: str) -> DailymotionInfo:
+    data = await fetch_json_api(session, DAILYMOTION_API_URL, url, MAX_API_BYTES)
+    title, duration, poster, manifest = normalize_dailymotion(data)
+    text = (await read_bounded(session, manifest, MAX_MANIFEST_BYTES)).decode("utf-8", "replace")
+    formats = parse_master(text, manifest)
+    if not formats:
+        raise DailymotionError("No downloadable Dailymotion qualities were listed.")
+    return DailymotionInfo(title, duration, poster, formats)
 
 
 async def get_youtube_title(session: aiohttp.ClientSession, url: str) -> str:
@@ -503,10 +519,11 @@ class DownloaderBot:
         waiting = [j for j in self.jobs.values() if j.state == "queued"]
         item = f"{job.item_index}/{job.item_total}" if job.item_total else "—"
         # Terabox status lines keep their original format; YouTube titles get subtitle tags.
-        youtube = not job.source.kind.startswith("terabox")
+        youtube = job.source.kind in ("video", "playlist")
         clean, tag = split_subtitle_tag(job.title) if youtube else (job.title, "")
         title = clean[:95] or ("Playlist" if job.source.kind == "playlist" else
-                               "Terabox files" if job.source.kind.startswith("terabox") else "YouTube video")
+                               "Terabox files" if job.source.kind.startswith("terabox") else
+                               "Dailymotion video" if job.source.kind == "dailymotion" else "YouTube video")
         quality = (f" [{'MP3' if youtube and job.quality == AUDIO else job.quality}]" if job.quality else "") + (
             f" {tag}" if tag else "")
         status = (f"Telegram rate limit: waiting {human_eta(job.rate_limit_until - now)}"
@@ -640,13 +657,13 @@ class DownloaderBot:
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
         if command in ("/start", "/help"):
             await event.respond(
-                "Choose YouTube or Terabox with /change, then send a link for that service. "
+                "Choose YouTube, Terabox or Dailymotion with /change, then send a link for that service. "
                 "Pick one or several available qualities and tap Done. Playlists/folders first show "
                 "their file count; send a range such as 1-29 or 200-300, then select qualities. "
                 "Send another link while a job runs to queue it. Transfers stay sequential.\n\n"
                 "A watch link containing list= is treated as a playlist; remove it for just one video.\n\n"
-                "/change — YouTube / Terabox buttons\n"
-                "/status or /queue — one live status for running, queued and recent jobs\n"
+                "/change — YouTube / Terabox / Dailymotion buttons\n"
+                "/status or /queue — one live status for running and queued jobs\n"
                 "/cancel — list jobs; /cancel_<job-id> stops one with a tappable command\n"
                 "/apis — numbered API list; /apis remove 3 resets a custom API\n"
                 "/changeapi — set your YouTube API; /changeapi reset restores default\n"
@@ -667,10 +684,11 @@ class DownloaderBot:
             token = secrets.token_hex(4)
             self.mode_tokens[uid] = token
             active = self.modes.get(uid, "youtube")
-            active_label = "YouTube" if active == "youtube" else "Terabox"
-            await event.respond(f"Current downloader: {active_label}. Choose a service for future links:",
+            await event.respond(f"Current downloader: {MODE_LABELS.get(active, 'YouTube')}. "
+                                "Choose a service for future links:",
                                 buttons=[[Button.inline("▶️ YouTube", data=f"m:{token}:youtube".encode()),
-                                          Button.inline("📁 Terabox", data=f"m:{token}:terabox".encode())]])
+                                          Button.inline("📁 Terabox", data=f"m:{token}:terabox".encode())],
+                                         [Button.inline("🎞 Dailymotion", data=f"m:{token}:dailymotion".encode())]])
         elif command == "/changeapi":
             uid = event.sender_id
             arg = text.partition(" ")[2].strip()
@@ -843,6 +861,7 @@ class DownloaderBot:
         mode = self.modes.get(uid, "youtube")
         try:
             source = (Source("terabox", parse_terabox_source(event.raw_text)) if mode == "terabox"
+                      else Source("dailymotion", parse_dailymotion_source(event.raw_text)) if mode == "dailymotion"
                       else parse_source(event.raw_text))
         except ValueError as exc:
             await event.respond(str(exc))
@@ -866,6 +885,22 @@ class DownloaderBot:
                 self.pending_ranges[uid] = RangeRequest(source, peer, count, self.api_for(uid))
                 await notice.edit(f"Playlist reports {count} videos. Send an inclusive range like 1-29 or "
                                   f"200-300 (within 1-{count}, up to {self.playlist_limit} per job).")
+                return
+            if source.kind == "dailymotion":
+                notice = await event.respond("Checking Dailymotion qualities…")
+                try:
+                    info = await fetch_dailymotion(self.http, source.url)
+                except DailymotionError as exc:
+                    await notice.edit(str(exc))
+                    return
+                if self.modes.get(uid, "youtube") != mode:
+                    await notice.edit("Mode changed. Send your link again.")
+                    return
+                selection = Selection(secrets.token_hex(4), source,
+                                      tuple(fmt.label for fmt in reversed(info.formats)), peer, info)
+                self.selections[uid] = selection
+                await notice.edit(f"{info.title}\nChoose one or more qualities, then tap Done:",
+                                  buttons=self.keyboard(selection))
                 return
             if source.kind == "terabox":
                 notice = await event.respond("Checking Terabox files and available qualities…")
@@ -955,7 +990,7 @@ class DownloaderBot:
             return
         if parts[0] == "m":
             if (not event.is_private or len(parts) != 3 or self.mode_tokens.get(uid) != parts[1]
-                    or parts[2] not in ("youtube", "terabox")):
+                    or parts[2] not in MODE_LABELS):
                 await event.answer("Mode selector expired. Send /change again.", alert=True)
                 return
             mode = parts[2]
@@ -964,7 +999,7 @@ class DownloaderBot:
             self.awaiting_api.discard(uid)
             self.pending_ranges.pop(uid, None)
             self.selections.pop(uid, None)
-            label = "YouTube" if mode == "youtube" else "Terabox"
+            label = MODE_LABELS[mode]
             await event.answer(f"{label} selected")
             await event.edit(f"{label} mode is active. Send a {label} link.")
             return
@@ -1134,6 +1169,9 @@ class DownloaderBot:
             await self.wait_turn(job)
             async with self.slot:
                 await self.progress(job, "Starting…")
+                if job.source.kind == "dailymotion":
+                    await self.run_dailymotion(job)
+                    return
                 if job.source.kind == "playlist":
                     await self.progress(job, f"Reading playlist entries {job.start}-{job.end}…")
                     entries = await asyncio.wait_for(
@@ -1262,6 +1300,93 @@ class DownloaderBot:
                 job.reporter.cancel()
                 await asyncio.gather(job.reporter, return_exceptions=True)
             await self.archive_job(job)
+
+    async def run_dailymotion(self, job: Job) -> None:
+        """One Dailymotion video: HLS variant -> temporary MP4 (yt-dlp + ffmpeg) -> upload from disk."""
+        info = job.video
+        if not isinstance(info, DailymotionInfo):
+            raise DailymotionError("The Dailymotion lookup is missing; send the link again.")
+        if not ffmpeg_ready():
+            raise DailymotionError("Dailymotion downloads need ffmpeg on this host (the Koyeb Docker image includes it).")
+        formats = {fmt.label: fmt for fmt in info.formats}
+        sent = missing = too_large = failed = 0
+        reasons: list[str] = []
+        job.item_index, job.item_total = 1, 1
+        job.title = info.title
+        job.current_url = job.source.url
+        for quality in job.selected:
+            fmt = formats.get(quality)
+            if fmt is None:
+                missing += 1
+                continue
+            job.quality = quality
+            job.total_bytes = job.downloaded = job.uploaded = 0
+            job.speed = 0.0
+            job.sample_bytes, job.sample_at = 0, time.monotonic()
+            estimate = estimate_bytes(fmt, info.duration)
+            if estimate > self.max_bytes:
+                too_large += 1
+                continue
+            tmpdir = tempfile.mkdtemp(prefix="ytdown-dm-")
+            stop = threading.Event()
+            try:
+                if estimate and shutil.disk_usage(tmpdir).free < estimate * 1.2:
+                    raise DailymotionError("Not enough free disk space on this host for this quality.")
+                await self.progress(job, f"Downloading the Dailymotion {quality} stream…")
+
+                def on_bytes(done: int, total: int) -> None:
+                    job.downloaded = done
+                    job.total_bytes = total or estimate
+
+                try:
+                    path = await asyncio.to_thread(download_dailymotion, fmt.url, tmpdir, on_bytes, stop)
+                except asyncio.CancelledError:
+                    stop.set()  # Stops the worker thread at its next progress callback.
+                    raise
+                size = os.path.getsize(path)
+                if size > self.max_bytes:
+                    too_large += 1
+                    continue
+                safe_title = re.sub(r"[^\w .-]", "_", info.title[:100], flags=re.UNICODE).strip(" .") or "video"
+                final = os.path.join(tmpdir, media_name(safe_title, quality, 100) + ".mp4")
+                os.replace(path, final)
+                thumb = await thumbnail_jpeg(self.http, info.poster) if info.poster else None
+                thumb_file = None
+                if thumb:
+                    thumb_file = io.BytesIO(thumb[0])
+                    thumb_file.name = "preview.jpg"
+                job.total_bytes = size
+                job.uploaded = 0
+
+                def on_upload(done: int, total: int) -> None:
+                    job.uploaded = done
+                    job.total_bytes = total
+
+                await self.progress(job, "Uploading to Telegram…")
+                await self.client.send_file(
+                    job.peer, final, caption=media_name(info.title, quality, 750), parse_mode=None,
+                    mime_type="video/mp4", supports_streaming=True, thumb=thumb_file,
+                    attributes=[types.DocumentAttributeVideo(duration=info.duration, w=fmt.width, h=fmt.height,
+                                                             supports_streaming=True)],
+                    progress_callback=on_upload)
+                sent += 1
+                LOG.info("Sent Dailymotion %s (%d bytes, cover %s)", quality, size, "yes" if thumb else "no")
+            except DailymotionError as exc:
+                failed += 1
+                reasons.append(f"{quality}: {exc}")
+                LOG.warning("Dailymotion %s skipped: %s", quality, exc)
+            except (DownloadError, OSError, RPCError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                failed += 1
+                status = re.search(r"HTTP Error \d{3}", str(exc))
+                reason = status.group(0) if status else type(exc).__name__
+                reasons.append(f"{quality}: {reason}")
+                LOG.warning("Dailymotion %s failed: %s", quality, reason)
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        job.state = "finished"
+        detail = f" ({'; '.join(reasons)})" if reasons else ""
+        await self.progress(job, f"Finished. Sent {sent}; unavailable {missing}; over size limit {too_large}; "
+                                 f"failed {failed}{detail}.", force=True)
 
     async def video_thumbnail(self, job: Job, video: Video) -> tuple[bytes | None, int, int]:
         source = job.current_url or job.source.url
@@ -1493,8 +1618,9 @@ def check_media_tools() -> None:
     """ffmpeg/ffprobe add durations and frame thumbnails; without them the bot falls back to API data."""
     missing = [tool for tool in ("ffmpeg", "ffprobe") if not shutil.which(tool)]
     if missing:
-        LOG.warning("%s not found: durations come from the API and frame thumbnails are skipped. "
-                    "Docker images include ffmpeg; BotKeep may not.", ", ".join(missing))
+        LOG.warning("%s not found: durations come from the API, frame thumbnails are skipped, and "
+                    "Dailymotion downloads are unavailable. Docker images include ffmpeg; BotKeep may not.",
+                    ", ".join(missing))
 
 
 async def serve(token: str, api_id: int, api_hash: str) -> None:
