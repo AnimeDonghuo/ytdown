@@ -13,9 +13,10 @@ import aiohttp
 from ytdown.bot import DownloaderBot
 from ytdown.proxy import (CHECK_TARGETS, DAILYMOTION_TARGET, KNOWN_TARGETS, RUMBLE_TARGET, TOO_FAST,
                           YOUTUBE_TARGET, CheckResult, CheckTarget, ProxyPool, ProxyRouter,
-                          ProxyState, ProxyUnavailable, SiteResult, check_proxy, parse_proxies,
-                          parse_proxy_line, proxy_fault, resolve_targets, run_checks, short_reason,
-                          site_marks, site_ok, target_for, with_url)
+                          ProxyState, ProxyUnavailable, SiteResult, check_proxy, export_text,
+                          marked_sites, parse_proxies, parse_proxy_line, parse_proxy_marks,
+                          proxy_fault, resolve_targets, run_checks, short_reason, site_marks,
+                          site_ok, target_for, with_url)
 
 URL = "https://www.youtube.com/generate_204"
 logging.getLogger("ytdown").setLevel(logging.CRITICAL)  # Keep expected drop notices quiet.
@@ -869,7 +870,7 @@ class BotProxyCommandTests(unittest.IsolatedAsyncioTestCase):
         buttons = event.respond.call_args.kwargs["buttons"]
         self.assertEqual([button.text for row in buttons for button in row],
                          ["▫️ ON", "✅ OFF", "🔄 Re-check pool", "📊 Pool status",
-                          "🧹 Remove dead", "🗑 Clear pool"])
+                          "🧹 Remove dead", "🗑 Clear pool", "📄 Export live"])
         token = self.service.proxy_tokens[7]
         toggle = SimpleNamespace(sender_id=7, is_private=True, data=f"p:{token}:on".encode(),
                                  answer=AsyncMock(), edit=AsyncMock())
@@ -1462,5 +1463,178 @@ class ApiCheckBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Checked with each service's own API", report)
         # Every proxy failed for an API-side reason: the pool must not be emptied.
         self.assertEqual(self.service.pool_for(7).entries["http://1.2.3.4:8080"].status, "untested")
+
+
+class ProxyExportHelperTests(unittest.TestCase):
+    """The export format round-trips through the parser that reads it back."""
+
+    def test_marked_sites_reads_shorts_and_full_names(self):
+        self.assertEqual(marked_sites("DM,RU"), {"dailymotion": True, "rumble": True})
+        self.assertEqual(marked_sites("YT dailymotion terabox"),
+                         {"youtube": True, "dailymotion": True, "terabox": True})
+        self.assertEqual(marked_sites("slow but fine"), {})
+        self.assertEqual(marked_sites(""), {})
+
+    def test_parse_proxy_marks_ignores_headers_and_plain_lines(self):
+        text = ("# 2 live proxies exported with /proxychk export, marks below\n"
+                "1.2.3.4:8080  # DM,RU\n"
+                "5.6.7.8:9090\n"
+                "9.9.9.9:3128  # slow, but working\n"
+                "not-a-proxy  # DM\n")
+        self.assertEqual(parse_proxy_marks(text),
+                         {"http://1.2.3.4:8080": {"dailymotion": True, "rumble": True}})
+
+    def test_export_text_writes_marks_only_when_there_are_some(self):
+        states = [ProxyState(parse_proxy_line("5.6.7.8:9090"), "alive", sites={"rumble": True}),
+                  ProxyState(parse_proxy_line("1.2.3.4:8080"), "alive", sites={"youtube": False})]
+        self.assertEqual(export_text(states, "# header"),
+                         "# header\nhttp://5.6.7.8:9090  # RU\nhttp://1.2.3.4:8080\n")
+        self.assertEqual(export_text(states).splitlines()[0], "http://5.6.7.8:9090  # RU")
+
+    def test_add_with_marks_restores_the_state_a_check_would_have_set(self):
+        pool = ProxyPool()
+        added = pool.add([parse_proxy_line("1.2.3.4:8080"), parse_proxy_line("5.6.7.8:9090")],
+                         {"http://1.2.3.4:8080": {"dailymotion": True}})
+        self.assertEqual(added.added, 2)
+        self.assertEqual(pool.entries["http://1.2.3.4:8080"].status, "alive")
+        self.assertEqual(pool.entries["http://1.2.3.4:8080"].sites, {"dailymotion": True})
+        self.assertEqual(pool.entries["http://5.6.7.8:9090"].status, "untested")
+        # A proxy already in the pool keeps the health it has.
+        pool.mark_checked(CheckResult(parse_proxy_line("1.2.3.4:8080"), True, 70))
+        pool.add([parse_proxy_line("1.2.3.4:8080")], {"http://1.2.3.4:8080": {}})
+        self.assertEqual(pool.entries["http://1.2.3.4:8080"].latency_ms, 70)
+
+
+class ProxyExportTests(unittest.IsolatedAsyncioTestCase):
+    """A pool can be saved as a .txt and pasted back after a restart."""
+
+    def setUp(self):
+        self.client = MagicMock()
+        self.client.send_message = AsyncMock(return_value=SimpleNamespace(id=11))
+        self.client.edit_message = AsyncMock()
+        self.service = DownloaderBot(self.client, MagicMock())
+
+    def event(self, text="", *, uid=7, notice=None):
+        message = SimpleNamespace(document=None, attributes=[])
+        return SimpleNamespace(sender_id=uid, raw_text=text, is_private=True, message=message,
+                               client=self.client, answer=AsyncMock(),
+                               respond=AsyncMock(return_value=notice or
+                                                 SimpleNamespace(edit=AsyncMock(),
+                                                                 respond=AsyncMock())),
+                               get_input_chat=AsyncMock(return_value="peer"))
+
+    def stock_pool(self):
+        """Two live proxies (one only for Rumble), one dead and one untested."""
+        pool = self.service.pool_for(7)
+        pool.add([parse_proxy_line("1.2.3.4:8080"), parse_proxy_line("5.6.7.8:9090"),
+                  parse_proxy_line("9.9.9.9:3128"), parse_proxy_line("8.8.8.8:1080")])
+        dead = "http://9.9.9.9:3128"
+        pool.mark_checked(CheckResult(parse_proxy_line("1.2.3.4:8080"), True, 40, "",
+                                      (SiteResult("dailymotion", "Dailymotion API", True, 40),
+                                       SiteResult("rumble", "Rumble API", True, 44))))
+        pool.mark_checked(CheckResult(parse_proxy_line("5.6.7.8:9090"), True, 90, "",
+                                      (SiteResult("dailymotion", "Dailymotion API", False, 0, "timeout"),
+                                       SiteResult("rumble", "Rumble API", True, 88))))
+        pool.mark_checked(CheckResult(parse_proxy_line("9.9.9.9:3128"), False, 0, "timeout",
+                                      (SiteResult("dailymotion", "Dailymotion API", False, 0, "timeout"),
+                                       SiteResult("rumble", "Rumble API", False, 0, "timeout"))))
+        self.assertEqual(pool.entries[dead].status, "dead")
+        return pool
+
+    def exported(self, event) -> str:
+        buffer = event.respond.call_args.kwargs["file"]
+        self.assertEqual(buffer.name, "working_proxies.txt")
+        return buffer.getvalue().decode()
+
+    async def test_export_sends_the_live_pool_with_its_marks(self):
+        self.stock_pool()
+        event = self.event("/proxychk export")
+        await self.service.on_message(event)
+        text = self.exported(event)
+        lines = text.splitlines()
+        self.assertIn("exported with /proxychk export", lines[0])  # Self-describing header.
+        self.assertIn("http://1.2.3.4:8080  # DM,RU", lines[1])  # Fastest live proxy first.
+        self.assertIn("http://5.6.7.8:9090  # RU", lines[2])
+        self.assertNotIn("9.9.9.9", text)  # Dead proxies are never exported.
+        self.assertNotIn("8.8.8.8", text)  # Untested ones need /proxychk export all.
+        caption = event.respond.call_args.args[0]
+        self.assertIn("2 live proxies saved", caption)
+        self.assertIn("PROXY_LIST", caption)
+
+    async def test_export_all_adds_the_untested_proxies_but_not_the_dead(self):
+        self.stock_pool()
+        event = self.event("/proxychk export all")
+        await self.service.on_message(event)
+        text = self.exported(event)
+        self.assertIn("http://8.8.8.8:1080", text)
+        self.assertNotIn("9.9.9.9", text)
+        self.assertIn("and 1 untested", event.respond.call_args.args[0])
+
+    async def test_export_without_live_proxies_says_what_to_do(self):
+        event = self.event("/proxychk export")
+        await self.service.on_message(event)
+        self.assertIn("The pool is empty", event.respond.call_args.args[0])
+        pool = self.service.pool_for(7)
+        pool.add([parse_proxy_line("1.2.3.4:8080")])
+        event = self.event("/proxychk export")
+        await self.service.on_message(event)
+        self.assertIn("/proxychk export all", event.respond.call_args.args[0])
+        pool.mark_checked(CheckResult(parse_proxy_line("1.2.3.4:8080"), False, 0, "timeout"))
+        event = self.event("/proxychk export all")
+        await self.service.on_message(event)
+        self.assertIn("nothing to export", event.respond.call_args.args[0])
+
+    async def test_the_export_panel_button_sends_the_list(self):
+        self.stock_pool()
+        panel = self.event("/proxy")
+        await self.service.on_message(panel)
+        token = self.service.proxy_tokens[7]
+        click = self.event("", notice=None)
+        click.data = f"p:{token}:export".encode()
+        click.respond = AsyncMock()
+        await self.service.callback(click)
+        self.assertEqual(click.answer.call_args.args[0], "Sending the list…")
+        self.assertIn("http://1.2.3.4:8080", self.exported(click))
+
+    async def test_a_pasted_export_comes_back_live_with_its_marks(self):
+        self.stock_pool()
+        event = self.event("/proxychk export")
+        await self.service.on_message(event)
+        payload = self.exported(event)
+        # A restart: a fresh bot with an empty pool.
+        fresh = DownloaderBot(MagicMock(), MagicMock())
+        fresh.client.send_message = AsyncMock(return_value=SimpleNamespace(id=11))
+        fresh.client.edit_message = AsyncMock()
+        fresh.awaiting_proxy.add(7)
+        seen = {}
+
+        async def fake_run(proxies, **kwargs):
+            pool = fresh.pool_for(7)
+            seen["states"] = {state.proxy.host: (state.status, dict(state.sites))
+                              for state in pool.entries.values()}
+            return []
+
+        paste = self.event(payload)
+        with patch("ytdown.bot.run_checks", new=AsyncMock(side_effect=fake_run)):
+            await fresh.on_message(paste)
+            await fresh.proxy_checks[7]
+        self.assertEqual(seen["states"], {"1.2.3.4": ("alive", {"dailymotion": True, "rumble": True}),
+                                          "5.6.7.8": ("alive", {"rumble": True})})
+        self.assertIn("2 carry marks from an earlier export",
+                      paste.respond.call_args_list[0].args[0])
+        self.assertEqual(fresh.pool_for(7).summary().splitlines()[0],
+                         "Pool: 2 total · 2 live · 0 untested · 0 dead")
+
+    async def test_the_proxy_list_env_var_restores_marks_too(self):
+        payload = ("# exported earlier\n1.2.3.4:8080  # DM\n5.6.7.8:9090  # RU\n")
+        with patch.dict("os.environ", {"PROXY_LIST": payload}):
+            service = DownloaderBot(MagicMock(), MagicMock())
+        pool = service.pool_for(3)
+        self.assertEqual(pool.entries["http://1.2.3.4:8080"].status, "alive")
+        self.assertEqual(pool.entries["http://1.2.3.4:8080"].sites, {"dailymotion": True})
+        self.assertEqual(pool.entries["http://5.6.7.8:9090"].sites, {"rumble": True})
+        self.assertEqual(pool.summary().splitlines()[0], "Pool: 2 total · 2 live · 0 untested · 0 dead")
+
+
 if __name__ == "__main__":
     unittest.main()

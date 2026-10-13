@@ -405,8 +405,14 @@ class ProxyPool:
     def get(self, proxy: Proxy) -> ProxyState | None:
         return self.entries.get(proxy.url)
 
-    def add(self, proxies: Iterable[Proxy]) -> PoolAdd:
-        """Add proxies, keeping the health of any that are already in the pool."""
+    def add(self, proxies: Iterable[Proxy],
+            marks: Mapping[str, Mapping[str, bool]] | None = None) -> PoolAdd:
+        """Add proxies, keeping the health of any that are already in the pool.
+
+        ``marks`` (see ``parse_proxy_marks``) restores what an exported list
+        recorded for a proxy: it comes back **live** with its per-site marks, so
+        a list saved before a restart works again without another check.
+        """
         added = duplicates = overflow = 0
         for proxy in proxies:
             if proxy.url in self.entries:
@@ -415,7 +421,9 @@ class ProxyPool:
             if len(self.entries) >= self.limit:
                 overflow += 1
                 continue
-            self.entries[proxy.url] = ProxyState(proxy)
+            restored = dict((marks or {}).get(proxy.url) or {})
+            self.entries[proxy.url] = ProxyState(proxy, "alive" if restored else "untested",
+                                                 sites=restored)
             added += 1
         return PoolAdd(added, duplicates, overflow)
 
@@ -603,6 +611,47 @@ def site_marks(sites: dict[str, bool]) -> str:
     """Compact list of the sites a proxy reaches, e.g. "YT,DM"."""
     return ",".join(target.short for target in KNOWN_TARGETS
                     if sites.get(target.key) is True) or "—"
+
+
+def marked_sites(comment: str) -> dict[str, bool]:
+    """Read a ``# DM,RU`` comment back into per-site marks (the inverse of ``site_marks``)."""
+    names = {piece.lower() for piece in re.split(r"[^A-Za-z0-9]+", comment or "") if piece}
+    return {target.key: True for target in KNOWN_TARGETS
+            if target.key in names or target.short.lower() in names}
+
+
+def parse_proxy_marks(text: str) -> dict[str, dict[str, bool]]:
+    """Per-proxy site marks from an exported list, e.g. ``1.2.3.4:8080  # DM,RU``.
+
+    ``/proxychk export`` writes each proxy's marks as a trailing comment; this
+    reads them back, so a list saved before a restart comes back with its
+    per-service results instead of losing them.
+    """
+    table: dict[str, dict[str, bool]] = {}
+    for raw_line in (text or "").splitlines():
+        head, hashes, comment = raw_line.partition("#")
+        if not hashes or not head.strip():
+            continue  # No comment, or a whole-line comment such as an export header.
+        marks = marked_sites(comment)
+        if not marks:
+            continue
+        line = re.sub(r"\s+#.*$", "", raw_line).strip()
+        for candidate in _line_candidates(line):
+            try:
+                proxy = parse_proxy_line(candidate)
+            except ValueError:
+                continue
+            table[proxy.url] = marks
+    return table
+
+
+def export_text(states: Iterable[ProxyState], header: str = "") -> str:
+    """The paste-back list: one proxy per line, its site marks in a comment."""
+    lines = [header] if header else []
+    for state in states:
+        marks = site_marks(state.sites)
+        lines.append(f"{state.proxy.url}  # {marks}" if marks != "—" else state.proxy.url)
+    return "\n".join(lines) + "\n"
 
 
 def human_ago(seconds: float) -> str:

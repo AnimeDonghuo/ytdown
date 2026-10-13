@@ -17,6 +17,7 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Mapping
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import aiohttp
@@ -43,9 +44,9 @@ from .rumble import (RUMBLE_API_URL, RumbleError, extract_rumble, normalize_rumb
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg, usable_still
 from .proxy import (CHECK_TARGETS, KNOWN_TARGETS, MAX_PROXIES, MIN_LATENCY_MS, SERVICE_KEYS, TOO_FAST,
-                    CheckResult, CheckStats, CheckTarget, Proxy, ProxyPool, ProxyRouter, parse_proxies,
-                    proxy_fault, resolve_targets, run_checks, short_reason, site_marks, target_for,
-                    target_label, with_url)
+                    CheckResult, CheckStats, CheckTarget, Proxy, ProxyPool, ProxyRouter, ProxyState,
+                    export_text, parse_proxies, parse_proxy_marks, proxy_fault, resolve_targets,
+                    run_checks, short_reason, site_marks, target_for, target_label, with_url)
 
 LOG = logging.getLogger(__name__)
 MODE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion", "rumble": "Rumble"}
@@ -622,7 +623,11 @@ class DownloaderBot:
         self.proxy_check_urls: list[str] = [check_url] if check_url else []
         # The sites a check tests; per-user API probes are resolved at check time.
         self.proxy_check_targets = resolve_targets(self.proxy_check_keys, check_url)
-        self.proxy_seed = parse_proxies(os.getenv("PROXY_LIST", ""), MAX_PROXIES)[0]
+        seed_text = os.getenv("PROXY_LIST", "")
+        self.proxy_seed = parse_proxies(seed_text, MAX_PROXIES)[0]
+        # A list exported by /proxychk export can go straight into PROXY_LIST:
+        # its site marks come back too.
+        self.proxy_seed_marks = parse_proxy_marks(seed_text)
 
     def user_jobs(self, uid: int) -> list[Job]:
         return [job for job in self.jobs.values() if job.user_id == uid]
@@ -695,7 +700,7 @@ class DownloaderBot:
         if pool is None:
             pool = ProxyPool(self.proxy_pool_max, self.proxy_fail_limit)
             if self.proxy_seed:
-                pool.add(self.proxy_seed)
+                pool.add(self.proxy_seed, self.proxy_seed_marks)
             self.pools[uid] = pool
         return pool
 
@@ -814,7 +819,8 @@ class DownloaderBot:
                 [Button.inline("🔄 Re-check pool", data=f"p:{token}:recheck".encode()),
                  Button.inline("📊 Pool status", data=f"p:{token}:status".encode())],
                 [Button.inline("🧹 Remove dead", data=f"p:{token}:purge".encode()),
-                 Button.inline("🗑 Clear pool", data=f"p:{token}:clear".encode())]]
+                 Button.inline("🗑 Clear pool", data=f"p:{token}:clear".encode())],
+                [Button.inline("📄 Export live", data=f"p:{token}:export".encode())]]
 
     async def show_proxy_panel(self, event) -> None:
         uid = event.sender_id
@@ -854,6 +860,9 @@ class DownloaderBot:
             await self.close_router(uid)
             await event.answer(f"Cleared {count} proxies")
             await self.edit_proxy_panel(event, uid, self.proxy_status_text(uid))
+        elif action == "export":
+            await event.answer("Sending the list…")
+            await self.proxy_export_command(event)
         elif action == "recheck":
             if uid in self.proxy_checks:
                 await event.answer("A proxy check is already running.", alert=True)
@@ -876,9 +885,10 @@ class DownloaderBot:
             LOG.warning("Could not edit a proxy progress message", exc_info=True)
 
     def start_proxy_check(self, uid: int, proxies: list[Proxy], *, edit, notice=None,
-                          notes: list[str] | None = None) -> None:
+                          notes: list[str] | None = None,
+                          marks: Mapping[str, Mapping[str, bool]] | None = None) -> None:
         task = asyncio.create_task(self.run_proxy_check(uid, proxies, edit=edit, notice=notice,
-                                                        notes=notes or []))
+                                                        notes=notes or [], marks=marks or {}))
         self.proxy_checks[uid] = task
 
         def finished(done: asyncio.Task) -> None:
@@ -890,10 +900,11 @@ class DownloaderBot:
         task.add_done_callback(finished)
 
     async def run_proxy_check(self, uid: int, proxies: list[Proxy], *, edit, notice=None,
-                              notes: list[str]) -> None:
+                              notes: list[str],
+                              marks: Mapping[str, Mapping[str, bool]] | None = None) -> None:
         """Check every proxy against every configured site and report what works."""
         pool = self.pool_for(uid)
-        added = pool.add(proxies)
+        added = pool.add(proxies, marks)  # marks: an exported list pasted back
         targets = self.check_targets_for(uid)
         names = " + ".join(target.label for target in targets)
         min_latency = self.min_latency_for(uid)
@@ -996,6 +1007,50 @@ class DownloaderBot:
         except Exception:
             LOG.warning("Could not send the working proxy list", exc_info=True)
 
+    def exportable(self, uid: int, everything: bool = False) -> list[ProxyState]:
+        """Pool entries worth saving: the live ones, plus untested ones on request."""
+        states = [state for state in self.pool_for(uid).entries.values()
+                  if state.status == "alive" or (everything and state.status == "untested")]
+        return sorted(states, key=lambda state: (state.status != "alive", state.latency_ms))
+
+    async def proxy_export_command(self, event, argument: str = "") -> None:
+        """Send the pool back as a .txt list that can be pasted in after a restart."""
+        uid = event.sender_id
+        everything = argument.strip().lower() in ("all", "untested", "every", "everything")
+        pool = self.pool_for(uid)
+        states = self.exportable(uid, everything)
+        if not states:
+            if not len(pool):
+                note = "The pool is empty — add proxies with /proxychk."
+            elif everything:
+                note = f"All {len(pool)} stored proxies are marked dead — nothing to export."
+            else:
+                note = (f"The pool holds {len(pool)} proxies, but none of them is live yet — run "
+                        "/proxychk, or use /proxychk export all to save the untested ones too.")
+            await event.respond(note, parse_mode=None)
+            return
+        live = sum(1 for state in states if state.status == "alive")
+        header = (f"# {live} live of {len(states)} proxies exported with /proxychk export on "
+                  f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}. Paste this file back "
+                  "with /proxychk: the marks after # (DM, RU, YT, TB) come back with it.")
+        buffer = io.BytesIO(export_text(states, header).encode())
+        buffer.name = "working_proxies.txt"
+        caption = (f"📄 {live} live prox{'y' if live == 1 else 'ies'}"
+                   + (f" and {len(states) - live} untested" if len(states) > live else "")
+                   + " saved. Paste this file into /proxychk after a restart and they come back "
+                     "alive with their site marks. To restore them automatically at every start, "
+                     "put the same lines in the PROXY_LIST environment variable.")
+        try:
+            await event.respond(caption, file=buffer, parse_mode=None)
+        except Exception:
+            LOG.warning("Could not send the exported proxy list", exc_info=True)
+            if buffer.getbuffer().nbytes <= 3_500:  # Small pools can travel as text.
+                await event.respond(caption + "\n\nCould not send the file, so here is the "
+                                    "list:\n" + buffer.getvalue().decode(), parse_mode=None)
+            else:
+                await event.respond("Could not send the proxy file here — try "
+                                    "/proxychk export again.", parse_mode=None)
+
     async def proxy_url_command(self, event, url: str) -> None:
         """Point proxy checks at your own API host instead of the first site."""
         if not url:
@@ -1071,12 +1126,15 @@ class DownloaderBot:
             await event.respond("No usable proxies found. Send lines such as host:port or "
                                 "user:pass@host:port." + detail)
             return
+        marks = parse_proxy_marks(text)  # Live again before the check finishes.
         notice = await event.respond(
             f"Checking {len(proxies)} proxies against "
-            + " + ".join(target.label for target in self.proxy_check_targets)
-            + "… Large lists take a while; /proxychk stop cancels.")
+            + " + ".join(target.label for target in self.proxy_check_targets) + "…"
+            + (f" {len(marks)} carry marks from an earlier export — they are live again."
+               if marks else "")
+            + " Large lists take a while; /proxychk stop cancels.")
         self.start_proxy_check(uid, proxies, edit=lambda body: notice.edit(body),
-                               notice=notice, notes=errors)
+                               notice=notice, notes=errors, marks=marks)
 
     async def on_proxy_file(self, event) -> None:
         message = getattr(event, "message", None)
@@ -1363,6 +1421,7 @@ class DownloaderBot:
                 "/proxychk url <https://…> — also check your own API host\n"
                 "/proxychk sites dailymotion,rumble,youtube,terabox — choose which sites are tested\n"
                 "/proxychk fast <ms|off> — replies faster than this fail automatically\n"
+                "/proxychk export [all] — save the pool as a .txt to paste back after a restart\n"
                 "/proxy — proxy mode ON/OFF, pool status, re-check or clear the pool\n"
                 "/limits — size and queue limits\n/help — these instructions\n\n"
                 "Only download media you have permission to use.")
@@ -1416,6 +1475,8 @@ class DownloaderBot:
                 await self.proxy_sites_command(event, rest)
             elif head in ("fast", "min", "speed"):
                 await self.proxy_fast_command(event, rest)
+            elif head in ("export", "save", "download", "dump"):
+                await self.proxy_export_command(event, rest)
             else:
                 self.awaiting_api.discard(uid)
                 self.awaiting_proxy.add(uid)
@@ -1458,9 +1519,12 @@ class DownloaderBot:
                 await event.respond(f"Cleared {count} proxies and turned proxy mode off.")
             elif argument in ("", "status", "pool", "list"):
                 await self.show_proxy_panel(event)
+            elif argument.split(maxsplit=1)[0] in ("export", "save", "download", "dump"):
+                await self.proxy_export_command(event, argument.partition(" ")[2])
             else:
                 await event.respond("Use /proxy for the ON/OFF panel, /proxy on|off, "
-                                    "/proxy clear, or /proxychk to add proxies.")
+                                    "/proxy clear, /proxy export to save the live list, or "
+                                    "/proxychk to add proxies.")
         elif command == "/apis":
             uid = event.sender_id
             arg = text.split(maxsplit=2)
@@ -1794,7 +1858,8 @@ class DownloaderBot:
         if parts[0] == "p":
             # The token ties the buttons to the panel this user opened last.
             if (not event.is_private or len(parts) != 3 or self.proxy_tokens.get(uid) != parts[1]
-                    or parts[2] not in ("on", "off", "status", "recheck", "purge", "clear")):
+                    or parts[2] not in ("on", "off", "status", "recheck", "purge", "clear",
+                                        "export")):
                 await event.answer("Proxy panel expired. Send /proxy again.", alert=True)
                 return
             await self.proxy_action(event, uid, parts[2])
