@@ -16,7 +16,7 @@ import logging
 import re
 import time
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Awaitable, Callable, Iterable
 from urllib.parse import quote, unquote, urlsplit
 
@@ -30,6 +30,34 @@ PROXY_SCHEMES = ("http", "https", "socks", "socks4", "socks4a", "socks5", "socks
 MAX_PROXIES = 5000
 CHECK_URL = "https://www.youtube.com/generate_204"
 PROXY_FAIL_LIMIT = 2  # Consecutive real-use failures before a proxy is dropped.
+
+
+@dataclass(frozen=True)
+class CheckTarget:
+    """One site a proxy is checked against.
+
+    ``nocontent`` marks a probe that answers 200/204 with an empty body
+    (``generate_204``); the others read a small text file, so an HTML answer
+    means something between the proxy and the site intercepted the request.
+    """
+
+    key: str
+    label: str
+    short: str
+    url: str
+    hosts: tuple[str, ...] = ()
+    nocontent: bool = False
+
+
+CHECK_TARGETS = (
+    CheckTarget("youtube", "YouTube", "YT", CHECK_URL, nocontent=True,
+                hosts=("youtube.com", "youtu.be", "ytimg.com", "googlevideo.com",
+                       "youtube-nocookie.com", "ggpht.com")),
+    CheckTarget("dailymotion", "Dailymotion", "DM", "https://www.dailymotion.com/robots.txt",
+                hosts=("dailymotion.com", "dmcdn.net", "dm-event.net")),
+    CheckTarget("rumble", "Rumble", "RU", "https://rumble.com/robots.txt",
+                hosts=("rumble.com",)),
+)
 PROXY_ATTEMPTS = 3  # Proxies tried for one request before the direct fallback.
 RETRY_STATUSES = frozenset({407, 502, 503, 504})  # Proxy-level HTTP errors, not the site's.
 SESSION_CACHE = 8  # Routed sessions kept open (idle ones are closed first).
@@ -137,7 +165,7 @@ def _split_host_port(value: str) -> tuple[str, int]:
 def parse_proxy_line(line: str) -> Proxy:
     """Accept the common proxy-list forms: host:port[:user:pass], user:pass@host:port,
     scheme://[user:pass@]host:port (http, https, socks4, socks5 and friends)."""
-    raw = line.strip().strip(",;").strip()
+    raw = re.sub(r"\s+#.*$", "", line).strip().strip(",;").strip()  # drop "# YT,DM" comments
     if not raw:
         raise ValueError("empty line")
     parts = raw.split()
@@ -212,9 +240,9 @@ def parse_proxies(text: str, limit: int = MAX_PROXIES) -> tuple[list[Proxy], lis
     errors: list[str] = []
     seen: set[str] = set()
     for raw_line in (text or "").splitlines() or [text or ""]:
-        line = raw_line.strip()
+        line = re.sub(r"\s+#.*$", "", raw_line).strip()  # "# YT,DM" comments stay out of splitting
         if not line or line.startswith(("#", "//")):
-            continue
+            continue  # Whole-line comments.
         for candidate in _line_candidates(line):
             try:
                 proxy = parse_proxy_line(candidate)
@@ -242,6 +270,11 @@ class ProxyState:
     latency_ms: int = 0
     detail: str = ""
     checked_at: float = 0.0  # time.monotonic of the last check or use.
+    sites: dict[str, bool] = field(default_factory=dict)  # target key -> reachable,
+
+    def reaches(self, site: str | None) -> bool:
+        """Unusable only when this site was checked and did not answer."""
+        return site is None or self.sites.get(site) is not False
 
 
 @dataclass(frozen=True)
@@ -256,11 +289,40 @@ class PoolAdd:
 
 
 @dataclass(frozen=True)
-class CheckResult:
-    proxy: Proxy
+class SiteResult:
+    """Outcome of one site probe for one proxy."""
+
+    key: str
+    label: str
     ok: bool
     latency_ms: int = 0
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    proxy: Proxy
+    ok: bool  # True when at least one checked site answered through the proxy.
+    latency_ms: int = 0
+    detail: str = ""
+    sites: tuple[SiteResult, ...] = ()
+
+    def marks(self) -> dict[str, bool]:
+        return {site.key: site.ok for site in self.sites}
+
+    def site_line(self) -> str:
+        return " · ".join(f"{site.label} {'ok' if site.ok else site.detail or 'failed'}"
+                          for site in self.sites)
+
+
+@dataclass(frozen=True)
+class CheckStats:
+    """Totals of the last completed proxy check."""
+
+    when: float
+    checked: int
+    working: int  # Proxies that reached at least one site.
+    sites: dict[str, int] = field(default_factory=dict)  # target key -> working proxies
 
 
 # Wording yt-dlp uses when the host/proxy, not the video, is the problem.
@@ -289,7 +351,7 @@ class ProxyPool:
         self.limit = max(1, limit)
         self.fail_limit = max(1, fail_limit)  # Consecutive failures before removal.
         self.entries: dict[str, ProxyState] = {}
-        self.last_check: tuple[float, int, int] | None = None  # (monotonic, working, checked)
+        self.last_check: CheckStats | None = None
         self._cursor = 0
 
     def __len__(self) -> int:
@@ -330,12 +392,21 @@ class ProxyPool:
     def live(self) -> list[ProxyState]:
         return [state for state in self.entries.values() if state.status == "alive"]
 
+    def live_for(self, site: str) -> list[ProxyState]:
+        """Proxies known to reach one site (untested ones do not count)."""
+        return [state for state in self.live() if state.sites.get(site) is True]
+
     def untested(self) -> list[ProxyState]:
         return [state for state in self.entries.values() if state.status == "untested"]
 
-    def candidates(self, count: int = PROXY_ATTEMPTS) -> list[ProxyState]:
-        """Round-robin over usable proxies so one request does not hammer one proxy."""
-        usable = [state for state in self.entries.values() if state.status != "dead"]
+    def candidates(self, count: int = PROXY_ATTEMPTS, site: str | None = None) -> list[ProxyState]:
+        """Round-robin over usable proxies so one request does not hammer one proxy.
+
+        ``site`` skips proxies that were checked against that site and failed, so
+        a proxy blocked by one service is not wasted on requests for it.
+        """
+        usable = [state for state in self.entries.values()
+                  if state.status != "dead" and state.reaches(site)]
         if not usable:
             return []
         start = self._cursor % len(usable)
@@ -347,7 +418,8 @@ class ProxyPool:
         if state is None:
             return
         self.entries[proxy.url] = ProxyState(proxy, "alive", state.ok_count + 1, 0,
-                                             latency_ms or state.latency_ms, "", time.monotonic())
+                                             latency_ms or state.latency_ms, "",
+                                             time.monotonic(), state.sites)
 
     def record_failure(self, proxy: Proxy, detail: str,
                        limit: int | None = None) -> ProxyState | None:
@@ -359,28 +431,70 @@ class ProxyPool:
             return self.remove(proxy)
         self.entries[proxy.url] = ProxyState(proxy, state.status, state.ok_count,
                                              state.fail_count + 1, state.latency_ms,
-                                             detail, time.monotonic())
+                                             detail, time.monotonic(), state.sites)
         return None
 
     def mark_checked(self, result: CheckResult) -> None:
-        """Apply a health check: alive/dead status, latency and reason."""
+        """Apply a health check: per-site results, alive/dead status and latency."""
         state = self.entries.get(result.proxy.url)
         if state is None:
             return
+        sites = dict(state.sites)
+        sites.update(result.marks())
         self.entries[result.proxy.url] = ProxyState(
             result.proxy, "alive" if result.ok else "dead",
             state.ok_count + (1 if result.ok else 0), 0,
-            result.latency_ms, result.detail, time.monotonic())
+            result.latency_ms, result.detail, time.monotonic(), sites)
 
     def summary(self) -> str:
         alive = len(self.live())
         dead = sum(1 for state in self.entries.values() if state.status == "dead")
         untested = len(self.entries) - alive - dead
         line = f"Pool: {len(self.entries)} total · {alive} live · {untested} untested · {dead} dead"
-        if self.last_check:
-            when, working, checked = self.last_check
-            line += f"\nLast check: {working}/{checked} working · {human_ago(time.monotonic() - when)}"
+        stats = self.last_check
+        if stats:
+            line += (f"\nLast check {human_ago(time.monotonic() - stats.when)}: "
+                     f"{stats.checked} tested · {stats.working} reachable")
         return line
+
+
+def resolve_targets(keys: str = "", url: str = "") -> tuple[CheckTarget, ...]:
+    """Pick which sites to check; ``url`` overrides the first selected site's URL."""
+    wanted = {piece.lower() for piece in re.split(r"[,;\s]+", keys or "") if piece}
+    chosen = [target for target in CHECK_TARGETS if not wanted or target.key in wanted]
+    if not chosen:
+        chosen = [CHECK_TARGETS[0]]
+    if url:
+        chosen[0] = replace(chosen[0], url=url)
+    return tuple(chosen)
+
+
+def target_for(url_or_host: str) -> str | None:
+    """Site key for a URL or host, so a request can prefer proxies that reach it."""
+    host = (url_or_host or "").strip().lower()
+    if "//" in host:
+        host = urlsplit(host).hostname or ""
+    host = host.rstrip(".")
+    if not host:
+        return None
+    for target in CHECK_TARGETS:
+        if any(host == domain or host.endswith("." + domain) for domain in target.hosts):
+            return target.key
+    return None
+
+
+def target_label(key: str) -> str:
+    return next((target.label for target in CHECK_TARGETS if target.key == key), key.title())
+
+
+def target_short(key: str) -> str:
+    return next((target.short for target in CHECK_TARGETS if target.key == key), key[:2].upper())
+
+
+def site_marks(sites: dict[str, bool]) -> str:
+    """Compact list of the sites a proxy reaches, e.g. "YT,DM"."""
+    return ",".join(target.short for target in CHECK_TARGETS
+                    if sites.get(target.key) is True) or "—"
 
 
 def human_ago(seconds: float) -> str:
@@ -441,35 +555,81 @@ def request_kwargs(proxy: Proxy) -> dict:
     return {} if proxy.socks else {"proxy": proxy.url}
 
 
-async def check_proxy(proxy: Proxy, *, url: str = CHECK_URL, timeout: float = 8.0,
-                      headers=None, session_factory=make_session) -> CheckResult:
-    """Send one small request through the proxy and report whether it worked."""
+def site_ok(target: CheckTarget, status: int, body: bytes) -> tuple[bool, str]:
+    """Decide whether an HTTP answer proves this proxy reached this site."""
+    if status in RETRY_STATUSES:
+        return False, f"proxy replied HTTP {status}"
+    if target.nocontent:
+        # generate_204 must answer empty: a body means something interfered.
+        if status in (200, 204) and not body:
+            return True, ""
+        return False, f"unexpected reply HTTP {status}"
+    if status in (301, 302, 303, 307, 308):
+        return True, ""  # The site answered with a redirect.
+    if status == 404:
+        return True, ""  # The site answered; only the probe path is missing.
+    if status == 200:
+        if not body:
+            return False, "empty reply"
+        if body.lstrip(b" \t\r\n")[:1] == b"<":
+            return False, "HTML page, not site content"
+        return True, ""
+    return False, f"HTTP {status}"
+
+
+async def probe_site(session: aiohttp.ClientSession, proxy: Proxy, target: CheckTarget,
+                     timeout: float) -> SiteResult:
+    """One request through an existing session; network problems become a result."""
     started = time.monotonic()
     try:
-        session = session_factory(proxy, timeout=timeout, headers=headers, limit=1, force_close=True)
-    except ProxyUnavailable as exc:
-        return CheckResult(proxy, False, 0, short_reason(exc, 60))
-    except (aiohttp.ClientError, OSError) as exc:
-        return CheckResult(proxy, False, 0, describe_error(exc))
-    except ValueError as exc:  # This library rejects the proxy URL or credentials.
-        return CheckResult(proxy, False, 0, short_reason(exc, 60))
-    try:
-        async with session:
-            async with session.get(url, allow_redirects=False, auto_decompress=False,
-                                   timeout=aiohttp.ClientTimeout(total=timeout, connect=timeout),
-                                   **request_kwargs(proxy)) as response:
-                body = await response.content.read(4096)
-                status = response.status
+        # identity keeps the body readable, so an HTML answer is recognisable.
+        async with session.get(target.url, allow_redirects=False, auto_decompress=False,
+                               headers={"Accept-Encoding": "identity"},
+                               timeout=aiohttp.ClientTimeout(total=timeout, connect=timeout),
+                               **request_kwargs(proxy)) as response:
+            body = await response.content.read(4096)
+            status = response.status
     except CONNECTION_ERRORS as exc:
-        return CheckResult(proxy, False, 0, describe_error(exc))
+        return SiteResult(target.key, target.label, False, 0, describe_error(exc))
     except ValueError as exc:  # aiohttp rejects malformed proxy URLs/headers.
-        return CheckResult(proxy, False, 0, short_reason(exc, 60))
+        return SiteResult(target.key, target.label, False, 0, short_reason(exc, 60))
     latency = int((time.monotonic() - started) * 1000)
-    if status == 204 or (200 <= status < 400 and not body):
-        return CheckResult(proxy, True, latency)
-    if status in RETRY_STATUSES:
-        return CheckResult(proxy, False, latency, f"proxy replied HTTP {status}")
-    return CheckResult(proxy, False, latency, f"unexpected reply HTTP {status}")
+    ok, detail = site_ok(target, status, body)
+    return SiteResult(target.key, target.label, ok, latency, detail)
+
+
+async def check_proxy(proxy: Proxy, *, targets: tuple[CheckTarget, ...] = CHECK_TARGETS,
+                      timeout: float = 8.0, headers=None,
+                      session_factory=make_session) -> CheckResult:
+    """Check one proxy against every configured site and summarise the answer."""
+    chosen = tuple(targets) or CHECK_TARGETS
+    reason = ""
+    session = None
+    try:
+        session = session_factory(proxy, timeout=timeout, headers=headers, limit=4, force_close=True)
+    except ProxyUnavailable as exc:
+        reason = short_reason(exc, 60)
+    except (aiohttp.ClientError, OSError) as exc:
+        reason = describe_error(exc)
+    except Exception as exc:  # A broken proxy URL or missing SOCKS support.
+        reason = short_reason(exc, 60)
+    results: list[SiteResult] = []
+    if reason:
+        results = [SiteResult(target.key, target.label, False, 0, reason) for target in chosen]
+    else:
+        try:
+            async with session:
+                for target in chosen:
+                    results.append(await probe_site(session, proxy, target, timeout))
+        except CONNECTION_ERRORS as exc:
+            results.extend(SiteResult(target.key, target.label, False, 0, describe_error(exc))
+                           for target in chosen[len(results):])
+    answered = [site for site in results if site.ok]
+    detail = next((site.detail for site in results if not site.ok and site.detail), "")
+    return CheckResult(proxy, bool(answered),
+                       min((site.latency_ms for site in answered), default=0),
+                       detail or ("" if answered else "no site answered"),
+                       tuple(results))
 
 
 @dataclass
@@ -498,7 +658,9 @@ class RoutedRequest:
     async def __aenter__(self):
         router = self.router
         last_error: BaseException | None = None
-        for state in router.pool.candidates():
+        # Skip proxies already known to be blocked for this specific site.
+        site = target_for(self.url)
+        for state in router.pool.candidates(site=site):
             lease = None
             started = time.monotonic()
             try:
@@ -580,9 +742,9 @@ class ProxyRouter:
         """Same signature as ``ClientSession.get`` but with pool failover."""
         return RoutedRequest(self, url, kwargs)
 
-    def next_proxy(self) -> Proxy | None:
+    def next_proxy(self, site: str | None = None) -> Proxy | None:
         """One live proxy for callers that cannot use aiohttp (yt-dlp)."""
-        candidates = self.pool.candidates(1)
+        candidates = self.pool.candidates(1, site=site)
         return candidates[0].proxy if candidates else None
 
     def note_failure(self, state: ProxyState, detail: str) -> bool:
@@ -670,6 +832,12 @@ class ProxyRouter:
         alive = len(self.pool.live())
         total = len(self.pool)
         text = f"{alive} live/{total} in pool"
+        stats = self.pool.last_check
+        counts = (stats.sites if stats else {target.key: len(self.pool.live_for(target.key))
+                                             for target in CHECK_TARGETS} if self.pool.entries else {})
+        for key, count in counts.items():
+            if count:
+                text += f" · {target_short(key)} {count}"
         if not alive and not self.strict:
             text += " · using a direct connection"
         if self.dropped:
@@ -679,11 +847,16 @@ class ProxyRouter:
         return text
 
 
-async def run_checks(proxies: list[Proxy], *, url: str = CHECK_URL, timeout: float = 8.0,
-                     workers: int = 24, headers=None, session_factory=make_session,
+async def run_checks(proxies: list[Proxy], *, targets: tuple[CheckTarget, ...] = CHECK_TARGETS,
+                     timeout: float = 8.0, workers: int = 24, headers=None,
+                     session_factory=make_session,
                      on_progress: Callable[[int, int, CheckResult], Awaitable[None]] | None = None
                      ) -> list[CheckResult]:
-    """Check many proxies with bounded concurrency; results keep input order."""
+    """Check many proxies with bounded concurrency; results keep input order.
+
+    Each worker probes every configured site for its proxy, so the connection
+    count stays bounded by ``workers`` however many sites are checked.
+    """
     semaphore = asyncio.Semaphore(max(1, workers))
     results: list[CheckResult] = [None] * len(proxies)  # type: ignore[list-item]
     done = 0
@@ -691,7 +864,7 @@ async def run_checks(proxies: list[Proxy], *, url: str = CHECK_URL, timeout: flo
     async def run(index: int, proxy: Proxy) -> None:
         nonlocal done
         async with semaphore:
-            result = await check_proxy(proxy, url=url, timeout=timeout, headers=headers,
+            result = await check_proxy(proxy, targets=targets, timeout=timeout, headers=headers,
                                        session_factory=session_factory)
         results[index] = result
         done += 1

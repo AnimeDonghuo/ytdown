@@ -8,9 +8,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 
 from ytdown.bot import DownloaderBot
-from ytdown.proxy import (CheckResult, ProxyPool, ProxyRouter, ProxyState, ProxyUnavailable,
-                          check_proxy, parse_proxies, parse_proxy_line, proxy_fault, run_checks,
-                          short_reason)
+from ytdown.proxy import (CHECK_TARGETS, CheckResult, ProxyPool, ProxyRouter, ProxyState,
+                          ProxyUnavailable, SiteResult, check_proxy, parse_proxies,
+                          parse_proxy_line, proxy_fault, resolve_targets, run_checks, short_reason,
+                          site_marks, site_ok, target_for)
 
 URL = "https://www.youtube.com/generate_204"
 logging.getLogger("ytdown").setLevel(logging.CRITICAL)  # Keep expected drop notices quiet.
@@ -78,6 +79,17 @@ def refused(proxy=None, url=None):
     return FakeContext(error=ConnectionRefusedError("connection refused"))
 
 
+def site_results(ok: bool, detail: str = "timeout") -> tuple[SiteResult, ...]:
+    """A result covering every default site."""
+    return tuple(SiteResult(target.key, target.label, ok, 25 if ok else 0, "" if ok else detail)
+                 for target in CHECK_TARGETS)
+
+
+def result_for(proxy, ok: bool = True, latency: int = 30, detail: str = "",
+               sites: tuple[SiteResult, ...] | None = None) -> CheckResult:
+    return CheckResult(proxy, ok, latency, detail, sites if sites is not None else site_results(ok))
+
+
 def proxy_list(*values) -> ProxyPool:
     pool = ProxyPool()
     pool.add([parse_proxy_line(value) for value in values])
@@ -127,10 +139,55 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("not-a-proxy", errors[0])
 
+    def test_working_list_file_round_trips(self):
+        # The bot hands working proxies back with site marks as comments;
+        # pasting that file again must yield the same proxies.
+        text = ("http://1.2.3.4:8080  # YT,DM,RU\n"
+                "socks5://user:pass@5.6.7.8:1080  # RU\n"
+                "http://user:pa#ss@6.7.8.9:3128\n")
+        proxies, errors = parse_proxies(text)
+        self.assertEqual(errors, [])
+        self.assertEqual([proxy.url for proxy in proxies],
+                         ["http://1.2.3.4:8080", "socks5://user:pass@5.6.7.8:1080",
+                          "http://user:pa%23ss@6.7.8.9:3128"])
+
     def test_limit_is_reported(self):
         proxies, errors = parse_proxies("\n".join(f"1.2.3.{i}:8080" for i in range(1, 6)), 2)
         self.assertEqual(len(proxies), 2)
         self.assertTrue(any("only the first 2" in error for error in errors))
+
+
+class TargetTests(unittest.TestCase):
+    def test_default_targets_cover_youtube_dailymotion_and_rumble(self):
+        self.assertEqual([target.key for target in CHECK_TARGETS],
+                         ["youtube", "dailymotion", "rumble"])
+        for target in CHECK_TARGETS:
+            self.assertTrue(target.url.startswith("https://"))
+            self.assertTrue(target.hosts)
+            self.assertTrue(target.label and target.short)
+
+    def test_target_lookup_by_url_or_host(self):
+        self.assertEqual(target_for("https://www.dailymotion.com/video/x8abc"), "dailymotion")
+        self.assertEqual(target_for("https://www.rumble.com/v123-title.html"), "rumble")
+        self.assertEqual(target_for("https://i.ytimg.com/vi/xyz/hqdefault.jpg"), "youtube")
+        self.assertEqual(target_for("https://www.youtube.com/oembed"), "youtube")
+        self.assertEqual(target_for("https://samra-youtube-api.antideploy.com/?url=x"), None)
+        self.assertEqual(target_for(""), None)
+
+    def test_resolve_targets_selection(self):
+        self.assertEqual([target.key for target in resolve_targets()],
+                         ["youtube", "dailymotion", "rumble"])
+        self.assertEqual([target.key for target in resolve_targets("rumble, youtube")],
+                         ["youtube", "rumble"])
+        self.assertEqual([target.key for target in resolve_targets("nonsense")], ["youtube"])
+        override = resolve_targets("", "https://api.example.com/healthz")
+        self.assertEqual(override[0].url, "https://api.example.com/healthz")
+        self.assertEqual(len(override), 3)
+
+    def test_site_marks(self):
+        self.assertEqual(site_marks({"youtube": True, "dailymotion": True, "rumble": False}),
+                         "YT,DM")
+        self.assertEqual(site_marks({}), "—")
 
 
 class PoolTests(unittest.TestCase):
@@ -169,6 +226,26 @@ class PoolTests(unittest.TestCase):
         self.assertIsNone(pool.record_failure(proxy, "timeout"))
         self.assertIsNotNone(pool.record_failure(proxy, "timeout"))
         self.assertEqual(pool.fail_limit, 3)
+
+    def test_candidates_skip_proxies_blocked_for_a_site(self):
+        pool = proxy_list("1.2.3.4:8080", "5.6.7.8:9090")
+        first, second = parse_proxy_line("1.2.3.4:8080"), parse_proxy_line("5.6.7.8:9090")
+        pool.mark_checked(CheckResult(first, True, 30, "",
+                                      (SiteResult("youtube", "YouTube", True, 30),
+                                       SiteResult("dailymotion", "Dailymotion", False, 0, "HTTP 403"),
+                                       SiteResult("rumble", "Rumble", True, 40))))
+        pool.mark_checked(CheckResult(second, True, 60, "",
+                                      (SiteResult("youtube", "YouTube", True, 60),
+                                       SiteResult("dailymotion", "Dailymotion", True, 50),
+                                       SiteResult("rumble", "Rumble", False, 0, "timeout"))))
+        self.assertEqual(pool.entries[first.url].sites["dailymotion"], False)
+        self.assertEqual([state.proxy.host for state in pool.candidates(2, site="dailymotion")],
+                         ["5.6.7.8"])
+        self.assertEqual([state.proxy.host for state in pool.candidates(1, site="youtube")],
+                         ["1.2.3.4"])
+        pool._cursor = 0
+        self.assertEqual([state.proxy.host for state in pool.candidates(1)], ["1.2.3.4"])
+        self.assertEqual(pool.live_for("rumble"), [pool.entries[first.url]])
 
     def test_failures_drop_proxy_after_the_limit(self):
         pool = proxy_list("1.2.3.4:8080")
@@ -304,6 +381,36 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         await router.close()
         self.assertTrue(created[1].closed)
 
+    async def test_router_prefers_proxies_that_reach_the_requested_site(self):
+        pool = proxy_list("1.2.3.4:8080", "5.6.7.8:9090")
+        blocked, good = parse_proxy_line("1.2.3.4:8080"), parse_proxy_line("5.6.7.8:9090")
+        pool.mark_checked(CheckResult(blocked, True, 20, "",
+                                      (SiteResult("youtube", "YouTube", True, 20),
+                                       SiteResult("dailymotion", "Dailymotion", False, 0, "HTTP 403"),
+                                       SiteResult("rumble", "Rumble", False, 0, "timeout"))))
+        pool.mark_checked(CheckResult(good, True, 50, "",
+                                      (SiteResult("youtube", "YouTube", True, 50),
+                                       SiteResult("dailymotion", "Dailymotion", True, 45),
+                                       SiteResult("rumble", "Rumble", True, 55))))
+        sessions = {}
+
+        def factory(proxy):
+            sessions[proxy.url] = FakeSession()
+            return sessions[proxy.url]
+
+        router = ProxyRouter(pool, FakeSession(), timeout=aiohttp.ClientTimeout(total=5),
+                             headers={}, session_factory=factory)
+        async with router.get("https://www.dailymotion.com/robots.txt"):
+            pass
+        self.assertIn("http://5.6.7.8:9090", sessions)  # Dailymotion-capable proxy chosen.
+        sessions.clear()
+        async with router.get("https://www.youtube.com/generate_204"):
+            pass
+        self.assertTrue(sessions)  # Any YouTube-capable proxy is fine.
+        self.assertNotIn("http://5.6.7.8:9090", [])  # (sanity for the assertion above)
+        self.assertEqual(router.next_proxy("dailymotion").host, "5.6.7.8")
+        await router.close()
+
     async def test_broken_session_setup_counts_as_a_proxy_failure(self):
         pool = proxy_list("1.2.3.4:8080", "5.6.7.8:9090")
         broken = "http://1.2.3.4:8080"
@@ -339,27 +446,96 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
             return session
         return build
 
-    async def test_working_check(self):
+    def site_factory(self, *, allowed=("youtube", "dailymotion", "rumble"), html=(), status=None):
+        """Answers per site: 204 for generate_204 probes, robots.txt text otherwise."""
+        def handler(proxy, url):
+            target = next((item for item in CHECK_TARGETS if item.url == url), None)
+            if target is None:
+                return FakeContext(FakeResponse(200, b"ok"))
+            if status and target.key in status:
+                code, body = status[target.key]
+                return FakeContext(FakeResponse(code, body))
+            if target.key not in allowed:
+                return FakeContext(FakeResponse(403))
+            if target.nocontent:
+                return FakeContext(FakeResponse(204))
+            if target.key in html:
+                return FakeContext(FakeResponse(200, b"<html>captive portal</html>"))
+            return FakeContext(FakeResponse(200, b"User-agent: *\nDisallow: /search\n"))
+
+        def build(proxy, **kwargs):
+            session = FakeSession(handler)
+            session.kwargs = kwargs
+            return session
+        return build
+
+    async def test_working_check_covers_every_site(self):
         result = await check_proxy(parse_proxy_line("1.2.3.4:8080"),
-                                   session_factory=self.factory(FakeContext(FakeResponse(204))))
+                                   session_factory=self.site_factory())
         self.assertTrue(result.ok)
         self.assertGreaterEqual(result.latency_ms, 0)
+        self.assertEqual([site.key for site in result.sites],
+                         [target.key for target in CHECK_TARGETS])
+        self.assertTrue(all(site.ok for site in result.sites))
+        self.assertEqual(result.marks(),
+                         {"youtube": True, "dailymotion": True, "rumble": True})
+        self.assertIn("YouTube ok · Dailymotion ok · Rumble ok", result.site_line())
+        self.assertEqual(site_marks(result.marks()), "YT,DM,RU")
+
+    async def test_proxy_blocked_by_one_site_stays_usable_for_the_others(self):
+        result = await check_proxy(parse_proxy_line("1.2.3.4:8080"),
+                                   session_factory=self.site_factory(allowed=("youtube", "rumble")))
+        self.assertTrue(result.ok)  # Something worked, so the proxy stays.
+        self.assertEqual(result.marks(),
+                         {"youtube": True, "dailymotion": False, "rumble": True})
+        self.assertIn("Dailymotion HTTP 403", result.site_line())
+        self.assertEqual(site_marks(result.marks()), "YT,RU")
+
+    async def test_captive_portal_html_is_not_a_pass(self):
+        result = await check_proxy(parse_proxy_line("1.2.3.4:8080"),
+                                   session_factory=self.site_factory(html=("dailymotion",)))
+        self.assertEqual(result.marks(),
+                         {"youtube": True, "dailymotion": False, "rumble": True})
+        blocked = next(site for site in result.sites if site.key == "dailymotion")
+        self.assertEqual(blocked.detail, "HTML page, not site content")
+
+    async def test_single_target_checks_only_that_site(self):
+        result = await check_proxy(parse_proxy_line("1.2.3.4:8080"), targets=(CHECK_TARGETS[2],),
+                                   session_factory=self.site_factory())
+        self.assertEqual([site.key for site in result.sites], ["rumble"])
+        self.assertEqual(result.marks(), {"rumble": True})
+
+    async def test_site_ok_rules(self):
+        youtube, dailymotion = CHECK_TARGETS[0], CHECK_TARGETS[1]
+        self.assertEqual(site_ok(youtube, 204, b""), (True, ""))
+        self.assertEqual(site_ok(youtube, 200, b"<html>"), (False, "unexpected reply HTTP 200"))
+        self.assertEqual(site_ok(dailymotion, 200, b"User-agent: *"), (True, ""))
+        self.assertEqual(site_ok(dailymotion, 302, b""), (True, ""))
+        self.assertEqual(site_ok(dailymotion, 404, b""), (True, ""))
+        self.assertEqual(site_ok(dailymotion, 200, b""), (False, "empty reply"))
+        self.assertEqual(site_ok(dailymotion, 503, b""), (False, "proxy replied HTTP 503"))
 
     async def test_http_failures_are_reported(self):
-        for status, expected in ((407, "proxy replied HTTP 407"), (200, "unexpected reply HTTP 200"),
-                                 (403, "unexpected reply HTTP 403")):
-            body = b"<html>login</html>" if status == 200 else b""
-            result = await check_proxy(parse_proxy_line("1.2.3.4:8080"),
-                                       session_factory=self.factory(
-                                           FakeContext(FakeResponse(status, body))))
-            self.assertFalse(result.ok, status)
-            self.assertEqual(result.detail, expected)
+        every = {target.key: (407, b"") for target in CHECK_TARGETS}
+        result = await check_proxy(parse_proxy_line("1.2.3.4:8080"),
+                                   session_factory=self.site_factory(status=every))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.detail, "proxy replied HTTP 407")
+        forbidden = {"rumble": (403, b"")}
+        result = await check_proxy(parse_proxy_line("1.2.3.4:8080"),
+                                   session_factory=self.site_factory(status=forbidden))
+        self.assertTrue(result.ok)  # Only Rumble blocked it.
+        self.assertEqual(result.marks()["rumble"], False)
+        self.assertEqual(next(site.detail for site in result.sites if site.key == "rumble"),
+                         "HTTP 403")
 
     async def test_connection_errors_and_timeouts(self):
         refused_result = await check_proxy(parse_proxy_line("1.2.3.4:8080"),
                                            session_factory=self.factory(refused()))
         self.assertFalse(refused_result.ok)
         self.assertEqual(refused_result.detail, "network error")
+        self.assertEqual([site.detail for site in refused_result.sites],
+                         ["network error"] * len(CHECK_TARGETS))
         timeout = FakeContext(error=asyncio.TimeoutError())
         self.assertEqual((await check_proxy(parse_proxy_line("1.2.3.4:8080"),
                                             session_factory=self.factory(timeout))).detail, "timeout")
@@ -435,26 +611,89 @@ class BotProxyCommandTests(unittest.IsolatedAsyncioTestCase):
         async def fake_run(proxies, **kwargs):
             results = []
             for index, proxy in enumerate(proxies):
-                result = CheckResult(proxy, index == 0, 40 + index * 10)
+                sites = (site_results(True) if index == 0
+                         else tuple(SiteResult(target.key, target.label, target.key == "youtube",
+                                               0, "timeout") for target in CHECK_TARGETS))
+                result = CheckResult(proxy, index == 0, 40 + index * 10, "", sites)
                 results.append(result)
                 await kwargs["on_progress"](index + 1, len(proxies), result)
             return results
 
-        with patch("ytdown.bot.run_checks", new=AsyncMock(side_effect=fake_run)):
+        with patch("ytdown.bot.run_checks", new=AsyncMock(side_effect=fake_run)) as checks:
             await self.service.on_message(event)
             self.assertNotIn(7, self.service.awaiting_proxy)
             task = self.service.proxy_checks[7]
             await task
+        self.assertEqual([target.key for target in checks.call_args.kwargs["targets"]],
+                         ["youtube", "dailymotion", "rumble"])
         pool = self.service.pool_for(7)
         self.assertEqual(len(pool), 2)
         self.assertEqual([state.proxy.host for state in pool.live()], ["1.2.3.4"])
         self.assertEqual(pool.entries["http://5.6.7.8:9090"].status, "dead")
+        self.assertEqual(pool.entries["http://5.6.7.8:9090"].sites,
+                         {"youtube": True, "dailymotion": False, "rumble": False})
         report = notice.edit.call_args_list[-1].args[0]
-        self.assertIn("Working: 1 · dead: 1", report)
+        self.assertIn("Reachable: 1 · no site reached: 1", report)
+        self.assertIn("Per site: YouTube 2 ok · Dailymotion 1 ok · Rumble 1 ok", report)
         self.assertIn("1 live · 0 untested · 1 dead", report)
         self.assertIn("bad-line", report)  # Parse problems are reported back.
-        self.assertIn("1.2.3.4:8080 (40 ms)", report)
+        self.assertIn("http://1.2.3.4:8080 — YT,DM,RU (40 ms)", report)
         self.assertNotIn(7, self.service.proxy_checks)
+
+    async def test_proxychk_url_command_switches_the_check_target(self):
+        event = self.event("/proxychk url https://api.example.com/healthz")
+        await self.service.on_message(event)
+        targets = self.service.proxy_check_targets
+        self.assertEqual(targets[0].key, "custom")
+        self.assertEqual(targets[0].label, "api.example.com")
+        self.assertEqual(targets[0].url, "https://api.example.com/healthz")
+        self.assertEqual([target.key for target in targets[1:]], ["dailymotion", "rumble"])
+        self.assertIn("api.example.com", event.respond.call_args.args[0])
+        event = self.event("/proxychk url http://127.0.0.1/health")
+        await self.service.on_message(event)
+        self.assertIn("public HTTPS URL", event.respond.call_args.args[0])
+        self.assertEqual(self.service.proxy_check_targets[0].key, "custom")  # Unchanged.
+        event = self.event("/proxychk url")
+        await self.service.on_message(event)
+        self.assertIn("Send the URL to test", event.respond.call_args.args[0])
+
+    async def test_proxychk_sites_command(self):
+        event = self.event("/proxychk sites youtube,rumble")
+        await self.service.on_message(event)
+        self.assertEqual([target.key for target in self.service.proxy_check_targets],
+                         ["youtube", "rumble"])
+        self.assertIn("YouTube", event.respond.call_args.args[0])
+        event = self.event("/proxychk sites nope")
+        await self.service.on_message(event)
+        self.assertIn("Unknown site: nope", event.respond.call_args.args[0])
+        self.assertEqual(len(self.service.proxy_check_targets), 2)  # Unchanged.
+        event = self.event("/proxychk sites default")
+        await self.service.on_message(event)
+        self.assertEqual([target.key for target in self.service.proxy_check_targets],
+                         ["youtube", "dailymotion", "rumble"])
+        event = self.event("/proxychk sites site")  # Unknown
+        await self.service.on_message(event)
+        self.assertIn("Unknown site", event.respond.call_args.args[0])
+
+    async def test_panel_shows_site_coverage(self):
+        pool = self.service.pool_for(7)
+        first, second = parse_proxy_line("1.2.3.4:8080"), parse_proxy_line("5.6.7.8:9090")
+        pool.add([first, second])
+        pool.mark_checked(CheckResult(first, True, 40, "",
+                                      (SiteResult("youtube", "YouTube", True, 40),
+                                       SiteResult("dailymotion", "Dailymotion", False, 0, "HTTP 403"),
+                                       SiteResult("rumble", "Rumble", True, 45))))
+        pool.mark_checked(CheckResult(second, True, 90, "",
+                                      (SiteResult("youtube", "YouTube", True, 90),
+                                       SiteResult("dailymotion", "Dailymotion", True, 88),
+                                       SiteResult("rumble", "Rumble", False, 0, "timeout"))))
+        self.service.proxy_state[7] = True
+        event = self.event("/proxy")
+        await self.service.on_message(event)
+        text = event.respond.call_args.args[0]
+        self.assertIn("Check sites: YouTube + Dailymotion + Rumble", text)
+        self.assertIn("Reaching: YouTube 2 · Dailymotion 1 · Rumble 1", text)
+        self.assertIn("YT 2", self.service.proxy_line(7))  # Dashboard line keeps short marks.
 
     async def test_proxychk_rejects_a_useless_list(self):
         self.service.awaiting_proxy.add(7)
@@ -549,7 +788,7 @@ class BotProxyCommandTests(unittest.IsolatedAsyncioTestCase):
         token = self.service.proxy_tokens[7]
         click = SimpleNamespace(sender_id=7, is_private=True, data=f"p:{token}:recheck".encode(),
                                 answer=AsyncMock(), edit=AsyncMock())
-        results = [CheckResult(parse_proxy_line("1.2.3.4:8080"), True, 55)]
+        results = [result_for(parse_proxy_line("1.2.3.4:8080"), True, 55)]
 
         async def fake_run(proxies, **kwargs):
             for count, result in enumerate(results, start=1):
@@ -560,7 +799,7 @@ class BotProxyCommandTests(unittest.IsolatedAsyncioTestCase):
             await self.service.callback(click)
             await self.service.proxy_checks[7]
         self.assertIn("Checking 1 proxies…", click.answer.call_args.args[0])
-        self.assertIn("Working: 1", click.edit.call_args_list[-1].args[0])
+        self.assertIn("Reachable: 1", click.edit.call_args_list[-1].args[0])
 
     async def test_cancel_proxy_stops_a_running_check(self):
         self.service.awaiting_proxy.add(7)
