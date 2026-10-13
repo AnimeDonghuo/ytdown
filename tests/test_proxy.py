@@ -8,10 +8,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 
 from ytdown.bot import DownloaderBot
-from ytdown.proxy import (CHECK_TARGETS, CheckResult, ProxyPool, ProxyRouter, ProxyState,
-                          ProxyUnavailable, SiteResult, check_proxy, parse_proxies,
+from ytdown.proxy import (CHECK_TARGETS, DAILYMOTION_TARGET, KNOWN_TARGETS, RUMBLE_TARGET, TOO_FAST,
+                          YOUTUBE_TARGET, CheckResult, CheckTarget, ProxyPool, ProxyRouter,
+                          ProxyState, ProxyUnavailable, SiteResult, check_proxy, parse_proxies,
                           parse_proxy_line, proxy_fault, resolve_targets, run_checks, short_reason,
-                          site_marks, site_ok, target_for)
+                          site_marks, site_ok, target_for, with_url)
 
 URL = "https://www.youtube.com/generate_204"
 logging.getLogger("ytdown").setLevel(logging.CRITICAL)  # Keep expected drop notices quiet.
@@ -158,13 +159,16 @@ class ParseTests(unittest.TestCase):
 
 
 class TargetTests(unittest.TestCase):
-    def test_default_targets_cover_youtube_dailymotion_and_rumble(self):
-        self.assertEqual([target.key for target in CHECK_TARGETS],
-                         ["youtube", "dailymotion", "rumble"])
-        for target in CHECK_TARGETS:
+    def test_default_targets_are_dailymotion_and_rumble_only(self):
+        self.assertEqual([target.key for target in CHECK_TARGETS], ["dailymotion", "rumble"])
+        self.assertEqual(CHECK_TARGETS, (DAILYMOTION_TARGET, RUMBLE_TARGET))
+        for target in KNOWN_TARGETS:
             self.assertTrue(target.url.startswith("https://"))
             self.assertTrue(target.hosts)
             self.assertTrue(target.label and target.short)
+        # YouTube stays available, but only when it is asked for by name.
+        self.assertEqual(YOUTUBE_TARGET.key, "youtube")
+        self.assertTrue(YOUTUBE_TARGET.nocontent)
 
     def test_target_lookup_by_url_or_host(self):
         self.assertEqual(target_for("https://www.dailymotion.com/video/x8abc"), "dailymotion")
@@ -175,18 +179,35 @@ class TargetTests(unittest.TestCase):
         self.assertEqual(target_for(""), None)
 
     def test_resolve_targets_selection(self):
-        self.assertEqual([target.key for target in resolve_targets()],
-                         ["youtube", "dailymotion", "rumble"])
-        self.assertEqual([target.key for target in resolve_targets("rumble, youtube")],
+        self.assertEqual([target.key for target in resolve_targets()], ["dailymotion", "rumble"])
+        self.assertEqual([target.key for target in resolve_targets("youtube, rumble")],
                          ["youtube", "rumble"])
-        self.assertEqual([target.key for target in resolve_targets("nonsense")], ["youtube"])
-        override = resolve_targets("", "https://api.example.com/healthz")
-        self.assertEqual(override[0].url, "https://api.example.com/healthz")
-        self.assertEqual(len(override), 3)
+        self.assertEqual([target.key for target in resolve_targets("youtube, youtube")],
+                         ["youtube"])
+        self.assertEqual([target.key for target in resolve_targets("nonsense")],
+                         ["dailymotion", "rumble"])
+        self.assertEqual([target.key for target in resolve_targets("youtube")], ["youtube"])
+
+    def test_with_url_adds_or_replaces_a_probe(self):
+        # A user's own host is appended and marked lax (empty or text answers pass).
+        targets = with_url(CHECK_TARGETS, "https://api.example.com/healthz")
+        self.assertEqual([target.key for target in targets], ["dailymotion", "rumble", "custom"])
+        self.assertTrue(targets[-1].lax)
+        self.assertEqual(targets[-1].label, "api.example.com")
+        # A second custom URL replaces the first instead of piling up.
+        targets = with_url(targets, "https://other.example.com/health")
+        self.assertEqual([target.key for target in targets], ["dailymotion", "rumble", "custom"])
+        self.assertEqual(targets[-1].url, "https://other.example.com/health")
+        # A URL that belongs to a known site replaces that site's probe.
+        targets = with_url(CHECK_TARGETS, "https://www.rumble.com/some/watch-page")
+        self.assertEqual([target.key for target in targets], ["dailymotion", "rumble"])
+        self.assertEqual(targets[1].url, "https://www.rumble.com/some/watch-page")
+        self.assertFalse(targets[1].nocontent)
 
     def test_site_marks(self):
-        self.assertEqual(site_marks({"youtube": True, "dailymotion": True, "rumble": False}),
-                         "YT,DM")
+        self.assertEqual(site_marks({"dailymotion": True, "rumble": True, "youtube": False}),
+                         "DM,RU")
+        self.assertEqual(site_marks({"youtube": True}), "YT")
         self.assertEqual(site_marks({}), "—")
 
 
@@ -446,10 +467,10 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
             return session
         return build
 
-    def site_factory(self, *, allowed=("youtube", "dailymotion", "rumble"), html=(), status=None):
+    def site_factory(self, *, allowed=("dailymotion", "rumble"), html=(), status=None):
         """Answers per site: 204 for generate_204 probes, robots.txt text otherwise."""
         def handler(proxy, url):
-            target = next((item for item in CHECK_TARGETS if item.url == url), None)
+            target = next((item for item in KNOWN_TARGETS if item.url == url), None)
             if target is None:
                 return FakeContext(FakeResponse(200, b"ok"))
             if status and target.key in status:
@@ -469,51 +490,104 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
             return session
         return build
 
-    async def test_working_check_covers_every_site(self):
+    async def test_working_check_covers_every_selected_site(self):
         result = await check_proxy(parse_proxy_line("1.2.3.4:8080"),
                                    session_factory=self.site_factory())
         self.assertTrue(result.ok)
         self.assertGreaterEqual(result.latency_ms, 0)
-        self.assertEqual([site.key for site in result.sites],
-                         [target.key for target in CHECK_TARGETS])
+        self.assertEqual([site.key for site in result.sites], ["dailymotion", "rumble"])
         self.assertTrue(all(site.ok for site in result.sites))
-        self.assertEqual(result.marks(),
-                         {"youtube": True, "dailymotion": True, "rumble": True})
-        self.assertIn("YouTube ok · Dailymotion ok · Rumble ok", result.site_line())
-        self.assertEqual(site_marks(result.marks()), "YT,DM,RU")
+        self.assertEqual(result.marks(), {"dailymotion": True, "rumble": True})
+        self.assertIn("Dailymotion ok · Rumble ok", result.site_line())
+        self.assertEqual(site_marks(result.marks()), "DM,RU")
+
+    async def test_youtube_can_still_be_checked_on_request(self):
+        result = await check_proxy(parse_proxy_line("1.2.3.4:8080"),
+                                   targets=resolve_targets("youtube"),
+                                   session_factory=self.site_factory(allowed=("youtube",)))
+        self.assertEqual([site.key for site in result.sites], ["youtube"])
+        self.assertTrue(result.ok)
+        self.assertEqual(site_marks(result.marks()), "YT")
 
     async def test_proxy_blocked_by_one_site_stays_usable_for_the_others(self):
         result = await check_proxy(parse_proxy_line("1.2.3.4:8080"),
-                                   session_factory=self.site_factory(allowed=("youtube", "rumble")))
+                                   session_factory=self.site_factory(allowed=("rumble",)))
         self.assertTrue(result.ok)  # Something worked, so the proxy stays.
-        self.assertEqual(result.marks(),
-                         {"youtube": True, "dailymotion": False, "rumble": True})
+        self.assertEqual(result.marks(), {"dailymotion": False, "rumble": True})
         self.assertIn("Dailymotion HTTP 403", result.site_line())
-        self.assertEqual(site_marks(result.marks()), "YT,RU")
+        self.assertEqual(site_marks(result.marks()), "RU")
 
     async def test_captive_portal_html_is_not_a_pass(self):
         result = await check_proxy(parse_proxy_line("1.2.3.4:8080"),
                                    session_factory=self.site_factory(html=("dailymotion",)))
-        self.assertEqual(result.marks(),
-                         {"youtube": True, "dailymotion": False, "rumble": True})
+        self.assertEqual(result.marks(), {"dailymotion": False, "rumble": True})
         blocked = next(site for site in result.sites if site.key == "dailymotion")
         self.assertEqual(blocked.detail, "HTML page, not site content")
 
     async def test_single_target_checks_only_that_site(self):
-        result = await check_proxy(parse_proxy_line("1.2.3.4:8080"), targets=(CHECK_TARGETS[2],),
+        result = await check_proxy(parse_proxy_line("1.2.3.4:8080"), targets=(RUMBLE_TARGET,),
                                    session_factory=self.site_factory())
         self.assertEqual([site.key for site in result.sites], ["rumble"])
         self.assertEqual(result.marks(), {"rumble": True})
 
+    async def test_custom_health_url_accepts_empty_or_text(self):
+        custom = CheckTarget("custom", "api.example.com", "API", "https://api.example.com/health",
+                             lax=True)
+
+        def factory(**response):
+            def build(proxy, **inner):
+                return FakeSession(lambda p, u: FakeContext(FakeResponse(**response)))
+            return build
+
+        empty = await check_proxy(parse_proxy_line("1.2.3.4:8080"), targets=(custom,),
+                                  session_factory=factory(status=204))
+        self.assertTrue(empty.ok)
+        text = await check_proxy(parse_proxy_line("1.2.3.4:8080"), targets=(custom,),
+                                 session_factory=factory(status=200, body=b'{"status":"ok"}'))
+        self.assertTrue(text.ok)
+        html = await check_proxy(parse_proxy_line("1.2.3.4:8080"), targets=(custom,),
+                                 session_factory=factory(status=200, body=b"<html>login</html>"))
+        self.assertFalse(html.ok)
+
+    async def test_too_fast_replies_fail_automatically(self):
+        class SlowContext(FakeContext):
+            def __init__(self, response, delay):
+                super().__init__(response)
+                self.delay = delay
+
+            async def __aenter__(self):
+                await asyncio.sleep(self.delay)
+                return await super().__aenter__()
+
+        def factory(delay):
+            return lambda proxy, **kwargs: FakeSession(
+                lambda p, u: SlowContext(FakeResponse(200, b"User-agent: *\n"), delay))
+
+        # A believable round trip passes; the same answer below the guard fails.
+        slow = await check_proxy(parse_proxy_line("1.2.3.4:8080"), session_factory=factory(0.05),
+                                 min_latency_ms=30)
+        self.assertTrue(slow.ok)
+        fast = await check_proxy(parse_proxy_line("1.2.3.4:8080"), session_factory=factory(0.0),
+                                 min_latency_ms=30)
+        self.assertFalse(fast.ok)
+        self.assertTrue(all(site.detail.startswith(TOO_FAST) for site in fast.sites))
+        self.assertIn("too fast (", fast.detail)
+        # 0 disables the guard, so the same instant answer passes again.
+        off = await check_proxy(parse_proxy_line("1.2.3.4:8080"), session_factory=factory(0.0),
+                                min_latency_ms=0)
+        self.assertTrue(off.ok)
+
     async def test_site_ok_rules(self):
-        youtube, dailymotion = CHECK_TARGETS[0], CHECK_TARGETS[1]
-        self.assertEqual(site_ok(youtube, 204, b""), (True, ""))
-        self.assertEqual(site_ok(youtube, 200, b"<html>"), (False, "unexpected reply HTTP 200"))
-        self.assertEqual(site_ok(dailymotion, 200, b"User-agent: *"), (True, ""))
-        self.assertEqual(site_ok(dailymotion, 302, b""), (True, ""))
-        self.assertEqual(site_ok(dailymotion, 404, b""), (True, ""))
-        self.assertEqual(site_ok(dailymotion, 200, b""), (False, "empty reply"))
-        self.assertEqual(site_ok(dailymotion, 503, b""), (False, "proxy replied HTTP 503"))
+        self.assertEqual(site_ok(YOUTUBE_TARGET, 204, b""), (True, ""))
+        self.assertEqual(site_ok(YOUTUBE_TARGET, 200, b"<html>"),
+                         (False, "HTML page, not site content"))
+        self.assertEqual(site_ok(YOUTUBE_TARGET, 200, b"hello"),
+                         (False, "unexpected reply HTTP 200"))
+        self.assertEqual(site_ok(DAILYMOTION_TARGET, 200, b"User-agent: *"), (True, ""))
+        self.assertEqual(site_ok(DAILYMOTION_TARGET, 302, b""), (True, ""))
+        self.assertEqual(site_ok(DAILYMOTION_TARGET, 404, b""), (True, ""))
+        self.assertEqual(site_ok(DAILYMOTION_TARGET, 200, b""), (False, "empty reply"))
+        self.assertEqual(site_ok(DAILYMOTION_TARGET, 503, b""), (False, "proxy replied HTTP 503"))
 
     async def test_http_failures_are_reported(self):
         every = {target.key: (407, b"") for target in CHECK_TARGETS}
@@ -553,10 +627,10 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
         progress = []
 
         class Tracked:
-            """Stands in for the response context manager and tracks overlap."""
+            """Response context manager that tracks how many probes run at once."""
 
-            def __init__(self):
-                self.context = FakeContext(FakeResponse(204))
+            def __init__(self, response):
+                self.context = FakeContext(response)
 
             async def __aenter__(self):
                 active["now"] += 1
@@ -569,7 +643,12 @@ class CheckTests(unittest.IsolatedAsyncioTestCase):
                 return await self.context.__aexit__(*args)
 
         def build(proxy, **kwargs):
-            return FakeSession(lambda p, u: Tracked())
+            def handler(p, url):
+                target = next((item for item in KNOWN_TARGETS if item.url == url), None)
+                if target is not None and target.nocontent:
+                    return Tracked(FakeResponse(204))
+                return Tracked(FakeResponse(200, b"User-agent: *\n"))
+            return FakeSession(handler)
 
         async def on_progress(count, total, result):
             progress.append((count, total, result.proxy.host))
@@ -612,8 +691,8 @@ class BotProxyCommandTests(unittest.IsolatedAsyncioTestCase):
             results = []
             for index, proxy in enumerate(proxies):
                 sites = (site_results(True) if index == 0
-                         else tuple(SiteResult(target.key, target.label, target.key == "youtube",
-                                               0, "timeout") for target in CHECK_TARGETS))
+                         else tuple(SiteResult(target.key, target.label, False, 0, "timeout")
+                                    for target in CHECK_TARGETS))
                 result = CheckResult(proxy, index == 0, 40 + index * 10, "", sites)
                 results.append(result)
                 await kwargs["on_progress"](index + 1, len(proxies), result)
@@ -625,37 +704,85 @@ class BotProxyCommandTests(unittest.IsolatedAsyncioTestCase):
             task = self.service.proxy_checks[7]
             await task
         self.assertEqual([target.key for target in checks.call_args.kwargs["targets"]],
-                         ["youtube", "dailymotion", "rumble"])
+                         ["dailymotion", "rumble"])
+        self.assertEqual(checks.call_args.kwargs["min_latency_ms"], 20)
         pool = self.service.pool_for(7)
         self.assertEqual(len(pool), 2)
         self.assertEqual([state.proxy.host for state in pool.live()], ["1.2.3.4"])
         self.assertEqual(pool.entries["http://5.6.7.8:9090"].status, "dead")
         self.assertEqual(pool.entries["http://5.6.7.8:9090"].sites,
-                         {"youtube": True, "dailymotion": False, "rumble": False})
+                         {"dailymotion": False, "rumble": False})
         report = notice.edit.call_args_list[-1].args[0]
         self.assertIn("Reachable: 1 · no site reached: 1", report)
-        self.assertIn("Per site: YouTube 2 ok · Dailymotion 1 ok · Rumble 1 ok", report)
+        self.assertIn("Per site: Dailymotion 1 ok · Rumble 1 ok", report)
         self.assertIn("1 live · 0 untested · 1 dead", report)
         self.assertIn("bad-line", report)  # Parse problems are reported back.
-        self.assertIn("http://1.2.3.4:8080 — YT,DM,RU (40 ms)", report)
+        self.assertIn("http://1.2.3.4:8080 — DM,RU (40 ms)", report)
         self.assertNotIn(7, self.service.proxy_checks)
 
-    async def test_proxychk_url_command_switches_the_check_target(self):
+    async def test_proxychk_url_command_adds_a_custom_check(self):
         event = self.event("/proxychk url https://api.example.com/healthz")
         await self.service.on_message(event)
         targets = self.service.proxy_check_targets
-        self.assertEqual(targets[0].key, "custom")
-        self.assertEqual(targets[0].label, "api.example.com")
-        self.assertEqual(targets[0].url, "https://api.example.com/healthz")
-        self.assertEqual([target.key for target in targets[1:]], ["dailymotion", "rumble"])
+        self.assertEqual([target.key for target in targets], ["dailymotion", "rumble", "custom"])
+        self.assertEqual(targets[-1].label, "api.example.com")
+        self.assertEqual(targets[-1].url, "https://api.example.com/healthz")
+        self.assertTrue(targets[-1].lax)
         self.assertIn("api.example.com", event.respond.call_args.args[0])
+        # A URL that belongs to a known site replaces that site's probe.
+        event = self.event("/proxychk url https://www.rumble.com/watch/v1")
+        await self.service.on_message(event)
+        targets = self.service.proxy_check_targets
+        self.assertEqual([target.key for target in targets], ["dailymotion", "rumble", "custom"])
+        self.assertEqual(targets[1].url, "https://www.rumble.com/watch/v1")
+        self.assertIn("replaces the Rumble probe", event.respond.call_args.args[0])
         event = self.event("/proxychk url http://127.0.0.1/health")
         await self.service.on_message(event)
         self.assertIn("public HTTPS URL", event.respond.call_args.args[0])
-        self.assertEqual(self.service.proxy_check_targets[0].key, "custom")  # Unchanged.
+        self.assertEqual(self.service.proxy_check_targets[-1].key, "custom")  # Unchanged.
         event = self.event("/proxychk url")
         await self.service.on_message(event)
         self.assertIn("Send the URL to test", event.respond.call_args.args[0])
+
+    async def test_proxychk_fast_command_sets_the_guard(self):
+        self.assertEqual(self.service.min_latency_for(7), 20)  # Default.
+        event = self.event("/proxychk fast 60")
+        await self.service.on_message(event)
+        self.assertEqual(self.service.min_latency_for(7), 60)
+        self.assertIn("60 ms", event.respond.call_args.args[0])
+        event = self.event("/proxychk fast off")
+        await self.service.on_message(event)
+        self.assertEqual(self.service.min_latency_for(7), 0)
+        self.assertIn("off", event.respond.call_args.args[0])
+        event = self.event("/proxychk fast")
+        await self.service.on_message(event)
+        self.assertIn("Too-fast guard off", event.respond.call_args.args[0])
+        event = self.event("/proxychk fast 5000")
+        await self.service.on_message(event)
+        self.assertEqual(self.service.min_latency_for(7), 5000)
+        self.assertEqual(self.service.min_latency_for(8), 20)  # Per user.
+
+    async def test_too_fast_proxies_are_reported(self):
+        event = self.event("/proxychk")
+        await self.service.on_message(event)
+        notice = SimpleNamespace(edit=AsyncMock(), respond=AsyncMock())
+        event = self.event("1.2.3.4:8080", notice=notice)
+
+        async def fake_run(proxies, **kwargs):
+            sites = tuple(SiteResult(target.key, target.label, False, 3, "too fast (3 ms < 20 ms)")
+                          for target in CHECK_TARGETS)
+            result = CheckResult(proxies[0], False, 0, "too fast", sites)
+            await kwargs["on_progress"](1, 1, result)
+            return [result]
+
+        with patch("ytdown.bot.run_checks", new=AsyncMock(side_effect=fake_run)) as checks:
+            await self.service.on_message(event)
+            await self.service.proxy_checks[7]
+        self.assertEqual(checks.call_args.kwargs["min_latency_ms"], 20)
+        report = notice.edit.call_args_list[-1].args[0]
+        self.assertIn("arrived under 20 ms and failed automatically", report)
+        self.assertIn("http://1.2.3.4:8080", report)
+        self.assertEqual(self.service.pool_for(7).entries["http://1.2.3.4:8080"].status, "dead")
 
     async def test_proxychk_sites_command(self):
         event = self.event("/proxychk sites youtube,rumble")
@@ -663,14 +790,19 @@ class BotProxyCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([target.key for target in self.service.proxy_check_targets],
                          ["youtube", "rumble"])
         self.assertIn("YouTube", event.respond.call_args.args[0])
+        event = self.event("/proxychk sites dailymotion")
+        await self.service.on_message(event)
+        self.assertEqual([target.key for target in self.service.proxy_check_targets],
+                         ["dailymotion"])
         event = self.event("/proxychk sites nope")
         await self.service.on_message(event)
         self.assertIn("Unknown site: nope", event.respond.call_args.args[0])
-        self.assertEqual(len(self.service.proxy_check_targets), 2)  # Unchanged.
+        self.assertEqual([target.key for target in self.service.proxy_check_targets],
+                         ["dailymotion"])  # Unchanged by the invalid request.
         event = self.event("/proxychk sites default")
         await self.service.on_message(event)
         self.assertEqual([target.key for target in self.service.proxy_check_targets],
-                         ["youtube", "dailymotion", "rumble"])
+                         ["dailymotion", "rumble"])
         event = self.event("/proxychk sites site")  # Unknown
         await self.service.on_message(event)
         self.assertIn("Unknown site", event.respond.call_args.args[0])
@@ -691,9 +823,10 @@ class BotProxyCommandTests(unittest.IsolatedAsyncioTestCase):
         event = self.event("/proxy")
         await self.service.on_message(event)
         text = event.respond.call_args.args[0]
-        self.assertIn("Check sites: YouTube + Dailymotion + Rumble", text)
-        self.assertIn("Reaching: YouTube 2 · Dailymotion 1 · Rumble 1", text)
-        self.assertIn("YT 2", self.service.proxy_line(7))  # Dashboard line keeps short marks.
+        self.assertIn("Check sites: Dailymotion + Rumble", text)
+        self.assertIn("Replies under 20 ms auto-fail", text)
+        self.assertIn("Reaching: Dailymotion 1 · Rumble 1", text)
+        self.assertIn("DM 1", self.service.proxy_line(7))  # Dashboard line keeps short marks.
 
     async def test_proxychk_rejects_a_useless_list(self):
         self.service.awaiting_proxy.add(7)

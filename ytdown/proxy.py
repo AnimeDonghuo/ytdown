@@ -47,19 +47,26 @@ class CheckTarget:
     url: str
     hosts: tuple[str, ...] = ()
     nocontent: bool = False
+    lax: bool = False  # User-supplied URL: accept an empty or plain-text answer.
 
 
-CHECK_TARGETS = (
-    CheckTarget("youtube", "YouTube", "YT", CHECK_URL, nocontent=True,
-                hosts=("youtube.com", "youtu.be", "ytimg.com", "googlevideo.com",
-                       "youtube-nocookie.com", "ggpht.com")),
-    CheckTarget("dailymotion", "Dailymotion", "DM", "https://www.dailymotion.com/robots.txt",
-                hosts=("dailymotion.com", "dmcdn.net", "dm-event.net")),
-    CheckTarget("rumble", "Rumble", "RU", "https://rumble.com/robots.txt",
-                hosts=("rumble.com",)),
-)
+# Default checks: Dailymotion and Rumble only. YouTube stays available through
+# /proxychk sites youtube (and PROXY_CHECK_SITES) for pools used on YouTube.
+DAILYMOTION_TARGET = CheckTarget("dailymotion", "Dailymotion", "DM",
+                                 "https://www.dailymotion.com/robots.txt",
+                                 hosts=("dailymotion.com", "dmcdn.net", "dm-event.net"))
+RUMBLE_TARGET = CheckTarget("rumble", "Rumble", "RU", "https://rumble.com/robots.txt",
+                            hosts=("rumble.com",))
+YOUTUBE_TARGET = CheckTarget("youtube", "YouTube", "YT", CHECK_URL, nocontent=True,
+                             hosts=("youtube.com", "youtu.be", "ytimg.com", "googlevideo.com",
+                                    "youtube-nocookie.com", "ggpht.com"))
+CHECK_TARGETS = (DAILYMOTION_TARGET, RUMBLE_TARGET)
+# Every site a check can be pointed at, not just the selected ones.
+KNOWN_TARGETS = (DAILYMOTION_TARGET, RUMBLE_TARGET, YOUTUBE_TARGET)
 PROXY_ATTEMPTS = 3  # Proxies tried for one request before the direct fallback.
 RETRY_STATUSES = frozenset({407, 502, 503, 504})  # Proxy-level HTTP errors, not the site's.
+MIN_LATENCY_MS = 20  # Replies faster than this mean no real round trip: auto-fail.
+TOO_FAST = "too fast"  # Prefix of the failure reason, matched by the bot's report.
 SESSION_CACHE = 8  # Routed sessions kept open (idle ones are closed first).
 HOSTNAME = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?$")
 
@@ -459,14 +466,33 @@ class ProxyPool:
 
 
 def resolve_targets(keys: str = "", url: str = "") -> tuple[CheckTarget, ...]:
-    """Pick which sites to check; ``url`` overrides the first selected site's URL."""
-    wanted = {piece.lower() for piece in re.split(r"[,;\s]+", keys or "") if piece}
-    chosen = [target for target in CHECK_TARGETS if not wanted or target.key in wanted]
-    if not chosen:
-        chosen = [CHECK_TARGETS[0]]
-    if url:
-        chosen[0] = replace(chosen[0], url=url)
-    return tuple(chosen)
+    """Pick which sites to check; an empty ``keys`` keeps the Dailymotion + Rumble default."""
+    parts = [piece.lower() for piece in re.split(r"[,;\s]+", keys or "") if piece]
+    if not parts:
+        return with_url(CHECK_TARGETS, url)
+    # Keep the order the user typed, ignoring names we do not know.
+    chosen: dict[str, CheckTarget] = {}
+    for part in parts:
+        target = next((item for item in KNOWN_TARGETS if item.key == part), None)
+        if target is not None and target.key not in chosen:
+            chosen[target.key] = target
+    return with_url(tuple(chosen.values()) or CHECK_TARGETS, url)
+
+
+def with_url(targets, url: str) -> tuple[CheckTarget, ...]:
+    """Add or replace a check URL: the same site's probe is replaced, others are kept."""
+    items = list(targets)
+    if not url:
+        return tuple(items)
+    key = target_for(url)
+    index = next((position for position, target in enumerate(items) if target.key == key), None) \
+        if key else None
+    if index is not None:  # e.g. a Dailymotion URL replaces the built-in Dailymotion probe.
+        items[index] = replace(items[index], url=url, nocontent=False)
+        return tuple(items)
+    custom = CheckTarget("custom", urlsplit(url).hostname or "custom", "API", url, lax=True)
+    items = [target for target in items if target.key != "custom"] + [custom]
+    return tuple(items)
 
 
 def target_for(url_or_host: str) -> str | None:
@@ -477,23 +503,23 @@ def target_for(url_or_host: str) -> str | None:
     host = host.rstrip(".")
     if not host:
         return None
-    for target in CHECK_TARGETS:
+    for target in KNOWN_TARGETS:
         if any(host == domain or host.endswith("." + domain) for domain in target.hosts):
             return target.key
     return None
 
 
 def target_label(key: str) -> str:
-    return next((target.label for target in CHECK_TARGETS if target.key == key), key.title())
+    return next((target.label for target in KNOWN_TARGETS if target.key == key), key.title())
 
 
 def target_short(key: str) -> str:
-    return next((target.short for target in CHECK_TARGETS if target.key == key), key[:2].upper())
+    return next((target.short for target in KNOWN_TARGETS if target.key == key), key[:2].upper())
 
 
 def site_marks(sites: dict[str, bool]) -> str:
     """Compact list of the sites a proxy reaches, e.g. "YT,DM"."""
-    return ",".join(target.short for target in CHECK_TARGETS
+    return ",".join(target.short for target in KNOWN_TARGETS
                     if sites.get(target.key) is True) or "—"
 
 
@@ -556,30 +582,37 @@ def request_kwargs(proxy: Proxy) -> dict:
 
 
 def site_ok(target: CheckTarget, status: int, body: bytes) -> tuple[bool, str]:
-    """Decide whether an HTTP answer proves this proxy reached this site."""
+    """Decide whether an HTTP answer proves this proxy reached this site.
+
+    A short, plain-text answer counts as site content; HTML is how captive
+    portals and login walls reply, so it never passes.
+    """
     if status in RETRY_STATUSES:
         return False, f"proxy replied HTTP {status}"
-    if target.nocontent:
-        # generate_204 must answer empty: a body means something interfered.
-        if status in (200, 204) and not body:
-            return True, ""
-        return False, f"unexpected reply HTTP {status}"
     if status in (301, 302, 303, 307, 308):
         return True, ""  # The site answered with a redirect.
     if status == 404:
         return True, ""  # The site answered; only the probe path is missing.
-    if status == 200:
+    if status in (200, 204):
         if not body:
-            return False, "empty reply"
+            # generate_204 and user health endpoints answer empty.
+            return (True, "") if target.nocontent or target.lax else (False, "empty reply")
         if body.lstrip(b" \t\r\n")[:1] == b"<":
             return False, "HTML page, not site content"
+        if target.nocontent:  # A body means something else answered generate_204.
+            return False, f"unexpected reply HTTP {status}"
         return True, ""
     return False, f"HTTP {status}"
 
 
 async def probe_site(session: aiohttp.ClientSession, proxy: Proxy, target: CheckTarget,
-                     timeout: float) -> SiteResult:
-    """One request through an existing session; network problems become a result."""
+                     timeout: float, min_latency_ms: int = 0) -> SiteResult:
+    """One request through an existing session; network problems become a result.
+
+    ``min_latency_ms`` rejects replies that arrive implausibly fast: a proxy
+    cannot reach a remote site in a few milliseconds, so such an answer came
+    from the proxy itself (cached, forged or a local intercept).
+    """
     started = time.monotonic()
     try:
         # identity keeps the body readable, so an HTML answer is recognisable.
@@ -595,11 +628,14 @@ async def probe_site(session: aiohttp.ClientSession, proxy: Proxy, target: Check
         return SiteResult(target.key, target.label, False, 0, short_reason(exc, 60))
     latency = int((time.monotonic() - started) * 1000)
     ok, detail = site_ok(target, status, body)
+    if ok and min_latency_ms and latency < min_latency_ms:
+        return SiteResult(target.key, target.label, False, latency,
+                          f"{TOO_FAST} ({latency} ms < {min_latency_ms} ms)")
     return SiteResult(target.key, target.label, ok, latency, detail)
 
 
 async def check_proxy(proxy: Proxy, *, targets: tuple[CheckTarget, ...] = CHECK_TARGETS,
-                      timeout: float = 8.0, headers=None,
+                      timeout: float = 8.0, headers=None, min_latency_ms: int = 0,
                       session_factory=make_session) -> CheckResult:
     """Check one proxy against every configured site and summarise the answer."""
     chosen = tuple(targets) or CHECK_TARGETS
@@ -620,7 +656,8 @@ async def check_proxy(proxy: Proxy, *, targets: tuple[CheckTarget, ...] = CHECK_
         try:
             async with session:
                 for target in chosen:
-                    results.append(await probe_site(session, proxy, target, timeout))
+                    results.append(await probe_site(session, proxy, target, timeout,
+                                                    min_latency_ms))
         except CONNECTION_ERRORS as exc:
             results.extend(SiteResult(target.key, target.label, False, 0, describe_error(exc))
                            for target in chosen[len(results):])
@@ -849,7 +886,7 @@ class ProxyRouter:
 
 async def run_checks(proxies: list[Proxy], *, targets: tuple[CheckTarget, ...] = CHECK_TARGETS,
                      timeout: float = 8.0, workers: int = 24, headers=None,
-                     session_factory=make_session,
+                     min_latency_ms: int = 0, session_factory=make_session,
                      on_progress: Callable[[int, int, CheckResult], Awaitable[None]] | None = None
                      ) -> list[CheckResult]:
     """Check many proxies with bounded concurrency; results keep input order.
@@ -865,6 +902,7 @@ async def run_checks(proxies: list[Proxy], *, targets: tuple[CheckTarget, ...] =
         nonlocal done
         async with semaphore:
             result = await check_proxy(proxy, targets=targets, timeout=timeout, headers=headers,
+                                       min_latency_ms=min_latency_ms,
                                        session_factory=session_factory)
         results[index] = result
         done += 1

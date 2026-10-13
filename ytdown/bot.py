@@ -32,9 +32,10 @@ from .terabox import (TERABOX_API_URL, TeraboxFile, TeraboxListing, normalize_te
                       parse_terabox_source)
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg
-from .proxy import (CHECK_TARGETS, MAX_PROXIES, CheckResult, CheckStats, CheckTarget, Proxy,
-                    ProxyPool, ProxyRouter, parse_proxies, proxy_fault, resolve_targets,
-                    run_checks, short_reason, site_marks, target_label)
+from .proxy import (CHECK_TARGETS, KNOWN_TARGETS, MAX_PROXIES, MIN_LATENCY_MS, TOO_FAST, CheckResult,
+                    CheckStats, Proxy, ProxyPool, ProxyRouter, parse_proxies, proxy_fault,
+                    resolve_targets, run_checks, short_reason, site_marks, target_for, target_label,
+                    with_url)
 
 LOG = logging.getLogger(__name__)
 API_URL = "https://samra-youtube-api.antideploy.com/"
@@ -457,6 +458,9 @@ class DownloaderBot:
         self.proxy_workers = env_int("PROXY_CHECK_WORKERS", 24, 1, 100)
         self.proxy_timeout = float(env_int("PROXY_CHECK_TIMEOUT", 8, 2, 60))
         self.proxy_fail_limit = env_int("PROXY_FAIL_LIMIT", 2, 1, 10)
+        # Replies faster than this cannot have come from a real round trip.
+        self.proxy_min_latency = env_int("PROXY_MIN_LATENCY_MS", MIN_LATENCY_MS, 0, 5000)
+        self.proxy_min_latency_user: dict[int, int] = {}  # Per-user /proxychk fast override.
         check_url = os.getenv("PROXY_CHECK_URL", "").strip()
         check_url = check_url if public_https_url(check_url) else ""
         self.proxy_check_targets = resolve_targets(
@@ -488,6 +492,14 @@ class DownloaderBot:
 
     def proxy_enabled(self, uid: int) -> bool:
         return self.proxy_state.get(uid, self.proxy_default_on)
+
+    def min_latency_for(self, uid: int) -> int:
+        return self.proxy_min_latency_user.get(uid, self.proxy_min_latency)
+
+    def fast_guard_text(self, uid: int) -> str:
+        value = self.min_latency_for(uid)
+        return (f"Replies under {value} ms auto-fail (PROXY_MIN_LATENCY_MS / /proxychk fast)"
+                if value else "Too-fast guard off")
 
     def router_for(self, uid: int) -> ProxyRouter:
         router = self.routers.get(uid)
@@ -556,7 +568,8 @@ class DownloaderBot:
         targets = self.proxy_check_targets
         lines = [f"🌐 Proxy mode: {'ON' if on else 'OFF'}",
                  "Check sites: " + " + ".join(target.label for target in targets)
-                 + " — /proxychk url <public https URL> tests your own API host too",
+                 + " — /proxychk sites youtube,rumble or /proxychk url <https URL> changes this",
+                 self.fast_guard_text(uid),
                  pool.summary()]
         counts = (pool.last_check.sites if pool.last_check
                   else {target.key: len(pool.live_for(target.key)) for target in targets})
@@ -672,11 +685,14 @@ class DownloaderBot:
         added = pool.add(proxies)
         targets = self.proxy_check_targets
         names = " + ".join(target.label for target in targets)
+        min_latency = self.min_latency_for(uid)
         started, finished = time.monotonic(), 0
         working = 0
         site_counts = {target.key: 0 for target in targets}
         next_edit = started
-        await self.edit_text(edit, f"🔎 Checking {len(proxies)} proxies against {names}…")
+        await self.edit_text(edit, f"🔎 Checking {len(proxies)} proxies against {names}"
+                                   + (f" · under {min_latency} ms fails" if min_latency else "")
+                                   + "…")
 
         async def on_progress(count: int, total: int, result: CheckResult) -> None:
             nonlocal next_edit, finished, working
@@ -696,7 +712,8 @@ class DownloaderBot:
 
         try:
             results = await run_checks(proxies, targets=targets, timeout=self.proxy_timeout,
-                                       workers=self.proxy_workers, on_progress=on_progress)
+                                       workers=self.proxy_workers,
+                                       min_latency_ms=min_latency, on_progress=on_progress)
         except asyncio.CancelledError:
             pool.last_check = CheckStats(time.monotonic(), finished, working, dict(site_counts))
             await self.edit_text(edit, f"Proxy check cancelled after {finished}/{len(proxies)} "
@@ -714,6 +731,17 @@ class DownloaderBot:
             lines.append(f"Pool limit is {pool.limit}, so {added.overflow} proxies were not stored.")
         if added.duplicates:
             lines.append(f"{added.duplicates} were already in the pool.")
+        too_fast = [result for result in results
+                    if result.sites and all(site.detail.startswith(TOO_FAST) for site in result.sites)]
+        fast_sites = sum(1 for result in results for site in result.sites
+                         if site.detail.startswith(TOO_FAST))
+        if fast_sites and min_latency:
+            examples = ", ".join(result.proxy.label for result in too_fast[:3])
+            lines.append(f"⚡ {fast_sites} repl{'y' if fast_sites == 1 else 'ies'} arrived under "
+                         f"{min_latency} ms and failed automatically — that is too fast for a real "
+                         "round trip through a proxy"
+                         + (f" (for example {examples})" if examples else "")
+                         + ". /proxychk fast <ms> tunes this, /proxychk fast off disables it.")
         lines.extend(notes[:3])
         if live:
             fastest = sorted(live, key=lambda item: item.latency_ms)
@@ -759,36 +787,53 @@ class DownloaderBot:
                                 "(no localhost, private IPs, or explicit ports).")
             return
         host = urlsplit(url).hostname or "custom"
-        targets = self.proxy_check_targets or (CHECK_TARGETS[0],)
-        replaced = targets[0]
-        others = ", ".join(target.label for target in targets[1:])
-        self.proxy_check_targets = (CheckTarget("custom", host, "API", url),) + tuple(targets[1:])
-        await event.respond(f"Proxy checks will test {host} ({url}) instead of "
-                            f"{replaced.label} ({replaced.url})"
-                            + (f", plus {others}" if others else "")
-                            + ". Send /proxychk to test a list, or /proxy → Re-check pool. "
-                            "/proxychk sites default restores the built-in sites.")
+        replaced = next((target for target in self.proxy_check_targets
+                         if target.url == url or target.key == (target_for(url) or "")), None)
+        self.proxy_check_targets = with_url(self.proxy_check_targets, url)
+        action = (f"replaces the {replaced.label} probe" if replaced is not None
+                  else "is added to the checks")
+        await event.respond(f"{url} ({host}) {action}: now testing "
+                            + " + ".join(f"{target.label} ({target.url})"
+                                         for target in self.proxy_check_targets)
+                            + ". Send /proxychk to test a list, or /proxy → Re-check pool.")
 
     async def proxy_sites_command(self, event, keys: str) -> None:
         """Choose which sites a proxy check tests."""
-        known = {target.key for target in CHECK_TARGETS}
+        known = {target.key for target in KNOWN_TARGETS}  # YouTube stays selectable by name.
         parts = [part for part in re.split(r"[,;\s]+", keys.lower()) if part]
         if parts and all(part in ("default", "all", "reset", "builtin") for part in parts):
             self.proxy_check_targets = CHECK_TARGETS
-            await event.respond("Proxy checks restored to "
+            await event.respond("Proxy checks restored to the default "
                                 + " + ".join(target.label for target in CHECK_TARGETS) + ".")
             return
         unknown = [part for part in parts if part not in known]
         if unknown:
-            await event.respond("Unknown site: " + ", ".join(unknown) + ". Use youtube, dailymotion, "
-                                "rumble (for example /proxychk sites youtube,rumble), or "
-                                "/proxychk sites default.")
+            await event.respond("Unknown site: " + ", ".join(unknown) + ". Use dailymotion, rumble "
+                                "or youtube (for example /proxychk sites rumble,youtube), or "
+                                "/proxychk sites default for Dailymotion + Rumble.")
             return
         self.proxy_check_targets = resolve_targets(keys)
         await event.respond("Proxy checks will test "
                             + " + ".join(f"{target.label} ({target.url})"
                                          for target in self.proxy_check_targets)
                             + ". Send /proxychk to test a list, or /proxy → Re-check pool.")
+
+    async def proxy_fast_command(self, event, value: str) -> None:
+        """Set the too-fast guard: replies faster than this always fail."""
+        uid = event.sender_id
+        if value.lower() in ("off", "0", "none"):
+            self.proxy_min_latency_user[uid] = 0
+            await event.respond("Too-fast guard off: instant replies count as a pass again.")
+            return
+        if not value.isdigit():
+            await event.respond(f"Use /proxychk fast <milliseconds> or off. Current: "
+                                f"{self.fast_guard_text(uid)}")
+            return
+        milliseconds = max(0, min(5000, int(value)))
+        self.proxy_min_latency_user[uid] = milliseconds
+        await event.respond(f"Proxy replies faster than {milliseconds} ms now fail the check "
+                            "instead of counting as working." if milliseconds else
+                            "Too-fast guard off.")
 
     async def on_proxy_text(self, event, text: str) -> None:
         uid = event.sender_id
@@ -1017,9 +1062,10 @@ class DownloaderBot:
                 "/cancel — list jobs; /cancel_<job-id> stops one with a tappable command\n"
                 "/apis — numbered API list; /apis remove 3 resets a custom API\n"
                 "/changeapi — set your YouTube API; /changeapi reset restores default\n"
-                "/proxychk — paste or upload a proxy list; checks YouTube, Dailymotion and Rumble\n"
-                "/proxychk url <https://…> — also test your own API host\n"
-                "/proxychk sites youtube,rumble — choose which sites are tested\n"
+                "/proxychk — paste or upload a proxy list; checks Dailymotion + Rumble\n"
+                "/proxychk url <https://…> — also check your own API host\n"
+                "/proxychk sites dailymotion,rumble,youtube — choose which sites are tested\n"
+                "/proxychk fast <ms|off> — replies faster than this fail automatically\n"
                 "/proxy — proxy mode ON/OFF, pool status, re-check or clear the pool\n"
                 "/limits — size and queue limits\n/help — these instructions\n\n"
                 "Only download media you have permission to use.")
@@ -1033,8 +1079,10 @@ class DownloaderBot:
                 f"Proxy pool: up to {self.proxy_pool_max} stored, {self.proxy_check_max} checked per "
                 f"/proxychk against "
                 + " + ".join(target.label for target in self.proxy_check_targets)
-                + f", {self.proxy_workers} parallel checks. "
-                "Jobs/selections are not restored after a restart.")
+                + f", {self.proxy_workers} parallel checks, "
+                + ("replies under " + str(self.proxy_min_latency) + " ms auto-failing. "
+                   if self.proxy_min_latency else "too-fast guard off. ")
+                + "Jobs/selections are not restored after a restart.")
         elif command == "/change":
             uid = event.sender_id
             # A pending /changeapi or /proxychk prompt must never capture the next URL.
@@ -1086,6 +1134,8 @@ class DownloaderBot:
                 await self.proxy_url_command(event, rest)
             elif head in ("sites", "site"):
                 await self.proxy_sites_command(event, rest)
+            elif head in ("fast", "min", "speed"):
+                await self.proxy_fast_command(event, rest)
             else:
                 self.awaiting_api.discard(uid)
                 self.awaiting_proxy.add(uid)
@@ -1101,8 +1151,8 @@ class DownloaderBot:
                         for target in self.proxy_check_targets) + ": a proxy that reaches only some "
                     "sites is still usable for those. Working ones join your pool and dead ones are "
                     f"marked, with {self.proxy_workers} parallel workers. /proxychk stop cancels. "
-                    "Use /proxychk url <https://…> to test your own API host, "
-                    "/proxychk sites youtube for a single site.",
+                    "/proxychk sites picks the sites; /proxychk url <https://…> adds your own API "
+                    "host. " + self.fast_guard_text(uid) + ".",
                     parse_mode=None)
         elif command == "/proxy":
             uid = event.sender_id
