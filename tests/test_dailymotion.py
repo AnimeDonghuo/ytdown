@@ -590,7 +590,8 @@ class DailymotionDownloadTests(unittest.TestCase):
                             format_id="hls-720", height=720)
         self.assertTrue(path.endswith("stream.mp4"))
         self.assertEqual(DownloadYDL.seen[0], ("info", media))
-        self.assertEqual(DownloadYDL.options[0]["format"], "hls-720")
+        self.assertEqual(DownloadYDL.options[0]["format"],
+                         "hls-720/best[height=720]/best[height<=720]/best")
 
     def test_every_route_failing_names_why(self):
         out_dir = tempfile.mkdtemp()

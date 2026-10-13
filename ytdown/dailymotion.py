@@ -374,8 +374,9 @@ def download_dailymotion(manifest_url: str, out_dir: str, on_bytes, stop: thread
 
     routes: list[tuple[str, dict, str]] = []  # (label, target, format selector)
     if media:
-        routes.append(("the stream Dailymotion listed", {"info": media},
-                       format_id or quality_selector(height)))
+        # The listed stream by id, or the best of that height if the id changed.
+        listed = f"{format_id}/{quality_selector(height)}" if format_id else quality_selector(height)
+        routes.append(("the stream Dailymotion listed", {"info": media}, listed))
     if manifest_url:
         routes.append(("the playlist URL",
                        {"info": stream_info(manifest_url, height=height, duration=duration,
