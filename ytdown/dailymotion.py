@@ -40,6 +40,8 @@ class DMFormat:
     width: int
     height: int
     bandwidth: int  # Peak bits per second from the manifest; 0 if unknown.
+    protocol: str = ""  # yt-dlp protocol ("m3u8_native", "https"); "" = read it from the URL.
+    format_id: str = ""  # yt-dlp format id, when the extraction named one.
 
 
 def parse_dailymotion_source(raw: str) -> str:
@@ -103,7 +105,7 @@ def parse_master(text: str, base_url: str) -> tuple[DMFormat, ...]:
                 continue
             current = best.get(height)
             if current is None or bandwidth > current.bandwidth:
-                best[height] = DMFormat(f"{height}p", url, width, height, bandwidth)
+                best[height] = DMFormat(f"{height}p", url, width, height, bandwidth, "m3u8_native")
     return tuple(best[h] for h in sorted(best, reverse=True))
 
 
@@ -175,15 +177,39 @@ def extract_dailymotion(watch_url: str, proxy: str | None = None) -> Dailymotion
         bandwidth = int(entry.get("tbr") or 0) * 1000
         current = best.get(height)
         if current is None or bandwidth > current.bandwidth:
-            best[height] = DMFormat(f"{height}p", url, int(entry.get("width") or 0), height, bandwidth)
+            best[height] = DMFormat(f"{height}p", url, int(entry.get("width") or 0), height, bandwidth,
+                                    protocol, str(entry.get("format_id") or ""))
     if not best:
         raise DailymotionError("Dailymotion listed no downloadable qualities.")
     title = str(info.get("title") or "Dailymotion video").strip()[:200] or "Dailymotion video"
     duration = info.get("duration")
     duration = max(0, int(duration)) if isinstance(duration, (int, float)) else 0
-    poster = info.get("thumbnail") if public_https_url(info.get("thumbnail")) else ""
     formats = tuple(best[h] for h in sorted(best, reverse=True))
-    return DailymotionInfo(title, duration, poster, formats)
+    # The extraction is kept: downloading from it uses the exact protocol and
+    # headers yt-dlp chose, instead of asking its generic extractor to guess.
+    return DailymotionInfo(title, duration, dm_thumbnail(info), formats, info)
+
+
+def dm_thumbnail(info: dict) -> str:
+    """Best thumbnail URL a yt-dlp extraction reported ("" when there is none).
+
+    The Dailymotion extractor fills ``thumbnails`` rather than the ``thumbnail``
+    shortcut, so reading only ``thumbnail`` is how covers went missing.
+    """
+    candidates = [info.get("thumbnail")]
+    candidates += [entry.get("url") for entry in reversed(info.get("thumbnails") or [])
+                   if isinstance(entry, dict)]
+    return next((url for url in candidates if public_https_url(url)), "")
+
+
+def dm_poster_url(watch_url: str) -> str:
+    """Dailymotion's thumbnail endpoint for a watch URL, used when no poster is known.
+
+    It redirects to the JPEG, so it costs one request and simply yields no cover
+    when the video has no thumbnail.
+    """
+    xid = (watch_url or "").rstrip("/").rsplit("/", 1)[-1]
+    return f"https://www.dailymotion.com/thumbnail/video/{xid}" if VIDEO_ID.fullmatch(xid) else ""
 
 
 def ytdlp_reason(exc: Exception) -> str:
@@ -222,19 +248,103 @@ class DailymotionInfo:
     duration: int
     poster: str
     formats: tuple[DMFormat, ...] = ()
+    media: dict | None = None  # The yt-dlp extraction these formats came from, if any.
+
+
+MIN_MEDIA_BYTES = 8 * 1024  # Smaller than any real video file.
+
+
+def looks_like_video(head: bytes) -> bool:
+    """True when these first bytes are a media container a player can open."""
+    if head[4:8] == b"ftyp" or head[:4] in (b"moov", b"styp", b"free", b"wide", b"mdat", b"skip"):
+        return True  # ISO base media (MP4/MOV).
+    if head[:4] == b"\x1a\x45\xdf\xa3":  # Matroska/WebM.
+        return True
+    if head[:3] == b"FLV" or head[:4] == b"OggS":
+        return True
+    if head[:1] == b"\x47":  # MPEG-TS sync byte: HLS muxed without a remux.
+        return True
+    return head[:4] == b"RIFF" and head[8:12] == b"AVI "
+
+
+def media_problem(path: str, duration: int = 0) -> str:
+    """Why this file cannot be the video that was asked for ("" when it looks fine).
+
+    A refused or mis-handled media URL does not always make yt-dlp fail: its
+    generic extractor happily saves a playlist, an error page or a JSON body as
+    an MP4, and a few KB of that was then uploaded as the video. Checking the
+    first bytes (and the size against the known duration) is what keeps a fake
+    file from ever reaching the user.
+    """
+    if not path or not os.path.exists(path):
+        return "the download produced no file"
+    size = os.path.getsize(path)
+    with open(path, "rb") as handle:
+        head = handle.read(16)
+    if not looks_like_video(head):
+        return f"the {size}-byte answer is not a video file"
+    if size < MIN_MEDIA_BYTES:
+        return f"only {size} bytes came back"
+    if duration > 0 and size < duration * 100:  # Under 100 bytes/second is not a video.
+        return f"only {size} bytes for a {duration}s video"
+    return ""
+
+
+def stream_info(url: str, *, height: int = 0, duration: int = 0, protocol: str = "",
+                title: str = "") -> dict:
+    """Describe one media URL to yt-dlp instead of letting it guess.
+
+    Handing yt-dlp a bare URL runs the *generic* extractor, which treats an HLS
+    playlist as an ordinary file: a few KB of playlist text then land on disk
+    named ``.mp4`` and the job "succeeds" with a file no player can open. Saying
+    what the URL is (HLS, or a plain MP4) removes that guess.
+    """
+    # The caller knows the protocol ("m3u8_native" for every parsed playlist); the
+    # URL is only a fallback hint, and Worker playlists spell it "api/m3u8".
+    kind = protocol or ("m3u8_native" if "m3u8" in url.lower() else "https")
+    media = {"url": url, "protocol": kind, "ext": "mp4", "format_id": "dailymotion",
+             "http_headers": {"Referer": "https://www.dailymotion.com/"}}
+    if height:
+        media["height"] = height
+    info = {"id": "dailymotion", "title": title or "Dailymotion video",
+            "extractor": "dailymotion", "extractor_key": "Dailymotion", "formats": [media]}
+    if duration:
+        info["duration"] = duration
+    return info
+
+
+def discard_streams(out_dir: str) -> None:
+    """Drop what a previous route left behind, so yt-dlp does not skip this one."""
+    for path in glob.glob(os.path.join(out_dir, "stream.*")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def newest_stream(out_dir: str) -> str:
+    """The largest file the last attempt left behind ("" when there is none)."""
+    paths = [path for path in glob.glob(os.path.join(out_dir, "stream.*"))
+             if not path.endswith((".part", ".ytdl"))]
+    return max(paths, key=os.path.getsize) if paths else ""
 
 
 def download_dailymotion(manifest_url: str, out_dir: str, on_bytes, stop: threading.Event,
-                        proxy: str | None = None, watch_url: str = "", height: int = 0) -> str:
+                         proxy: str | None = None, watch_url: str = "", height: int = 0,
+                         media: dict | None = None, protocol: str = "", format_id: str = "",
+                         duration: int = 0, title: str = "") -> str:
     """Blocking yt-dlp download of one variant into out_dir; returns the MP4 path.
 
     on_bytes(done, total) is called from the worker thread. Setting `stop` aborts the
     download at the next progress callback. `proxy` routes the requests through the
     caller's pool proxy (yt-dlp understands http/https/socks proxy URLs).
 
-    Provider URLs expire and are often signed for one address, so when the saved
-    ``manifest_url`` is refused and the caller knows the ``watch_url``, yt-dlp is
-    asked for a fresh copy of the same quality instead of failing the job.
+    Provider URLs expire and are often signed for one address, so several routes are
+    tried in order: the stream the extraction already found (yt-dlp knows its
+    protocol and headers), the playlist URL that was listed (described explicitly,
+    never guessed), and finally the watch page with a fresh extraction. Every route's
+    file is checked before it is handed back, so a refused download can never be sent
+    as a video.
     """
     if not ffmpeg_ready():
         raise DailymotionError("Dailymotion downloads need ffmpeg and ffprobe on this host.")
@@ -246,9 +356,8 @@ def download_dailymotion(manifest_url: str, out_dir: str, on_bytes, stop: thread
             on_bytes(int(status.get("downloaded_bytes") or 0),
                      int(status.get("total_bytes") or status.get("total_bytes_estimate") or 0))
 
-    options = {
+    shared = {
         "outtmpl": os.path.join(out_dir, "stream.%(ext)s"),
-        "format": "best",
         "merge_output_format": "mp4",
         "quiet": True,
         "noprogress": True,
@@ -261,33 +370,43 @@ def download_dailymotion(manifest_url: str, out_dir: str, on_bytes, stop: thread
         "progress_hooks": [hook],
     }
     if proxy:
-        options["proxy"] = proxy
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.extract_info(manifest_url, download=True)
-    except DownloadCancelled:
-        raise
-    except Exception:
-        if not watch_url:
-            raise
-        # Fresh URLs, same proxy: exactly the route a manual retry would take.
-        retry = ytdlp_options(proxy, format=quality_selector(height), outtmpl=options["outtmpl"],
-                              merge_output_format="mp4", noprogress=True, quiet=True,
-                              no_warnings=True, noplaylist=True, retries=3, fragment_retries=3,
-                              socket_timeout=30, concurrent_fragment_downloads=1,
-                              progress_hooks=[hook])
+        shared["proxy"] = proxy
+
+    routes: list[tuple[str, dict, str]] = []  # (label, target, format selector)
+    if media:
+        routes.append(("the stream Dailymotion listed", {"info": media},
+                       format_id or quality_selector(height)))
+    if manifest_url:
+        routes.append(("the playlist URL",
+                       {"info": stream_info(manifest_url, height=height, duration=duration,
+                                            protocol=protocol, title=title)}, "best"))
+    if watch_url:
+        routes.append(("the watch page", {"url": watch_url}, quality_selector(height)))
+    if not routes:
+        raise DailymotionError("No Dailymotion stream to download.")
+
+    problems: list[str] = []
+    for label, target, selector in routes:
+        discard_streams(out_dir)  # Each route starts from a clean directory.
+        options = dict(shared, format=selector)
         try:
-            with yt_dlp.YoutubeDL(retry) as ydl:
-                ydl.extract_info(watch_url, download=True)
+            with yt_dlp.YoutubeDL(options) as ydl:
+                if "info" in target:
+                    ydl.process_ie_result(target["info"], download=True)
+                else:
+                    ydl.extract_info(target["url"], download=True)
         except DownloadCancelled:
             raise
-        except Exception as second:
-            raise DailymotionError(
-                f"Could not download this Dailymotion quality: {short_reason(second)}") from second
-    mp4 = [path for path in glob.glob(os.path.join(out_dir, "stream.*")) if path.endswith(".mp4")]
-    if not mp4:
-        raise DailymotionError("The stream could not be converted to MP4.")
-    return mp4[0]
+        except Exception as exc:
+            problems.append(f"{label}: {short_reason(exc)}")
+            continue
+        path = newest_stream(out_dir)
+        problem = media_problem(path, duration)
+        if not problem:
+            return path
+        problems.append(f"{label}: {problem}")
+    raise DailymotionError("Could not download this Dailymotion quality: "
+                           + " · ".join(problems[:3]))
 
 
 def quality_selector(height: int) -> str:

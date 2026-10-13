@@ -1,4 +1,5 @@
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -8,8 +9,9 @@ from yt_dlp.utils import DownloadError
 
 from ytdown.bot import DownloaderBot, Job, MODE_LABELS, is_media_link
 from ytdown.core import Source
-from ytdown.dailymotion import (DailymotionError, DailymotionInfo, DMFormat, estimate_bytes,
-                                normalize_dailymotion, parse_dailymotion_source, parse_master)
+from ytdown.dailymotion import (DailymotionError, DailymotionInfo, DMFormat, dm_thumbnail,
+                                estimate_bytes, looks_like_video, media_problem, normalize_dailymotion,
+                                parse_dailymotion_source, parse_master, stream_info)
 
 MASTER = """#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,CODECS="avc1.64001f,mp4a.40.2"
@@ -23,6 +25,56 @@ http://insecure.example.com/x.m3u8
 """
 WATCH = "https://www.dailymotion.com/video/x7tgad0"
 FORMAT_720 = DMFormat("720p", "https://cdn.example.com/720/index.m3u8", 1280, 720, 2500000)
+# 9 KiB with an MP4 box header: what a real (if tiny) download leaves behind.
+REAL_MP4 = b"\x00\x00\x00\x18ftypisom" + b"\x00" * (9 * 1024)
+# 3.6 KB of playlist text: exactly what the generic extractor saved as "288p.mp4".
+MANIFEST_TEXT = b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n" + b"segment.ts\n" * 300
+
+
+class DownloadYDL:
+    """yt-dlp stand-in for the download path: every route is handled by the test."""
+
+    options: list[dict] = []
+    seen: list[tuple] = []
+
+    def __init__(self, options, plan):
+        self.options = options
+        self.plan = plan
+        DownloadYDL.options.append(options)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def extract_info(self, url, download=False):
+        DownloadYDL.seen.append(("url", url))
+        self.plan("url", url, download)
+        return {"title": "t"}
+
+    def process_ie_result(self, info, download=True):
+        DownloadYDL.seen.append(("info", info))
+        self.plan("info", info, download)
+        return info
+
+
+def write_media(out_dir, data=REAL_MP4, name="stream.mp4"):
+    path = os.path.join(out_dir, name)
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return path
+
+
+def run_download(plan, out_dir, manifest, **kwargs):
+    """Run download_dailymotion with a yt-dlp whose every route follows `plan`."""
+    DownloadYDL.options, DownloadYDL.seen = [], []
+    with patch("yt_dlp.YoutubeDL", new=lambda options: DownloadYDL(options, plan)), \
+         patch("ytdown.dailymotion.ffmpeg_ready", return_value=True):
+        from ytdown.dailymotion import download_dailymotion
+        import threading
+        return download_dailymotion(manifest, out_dir, lambda done, total: None,
+                                    threading.Event(), **kwargs)
 
 
 class ParsingTests(unittest.TestCase):
@@ -190,6 +242,23 @@ class BotDownloadTests(unittest.IsolatedAsyncioTestCase):
         thumb = self.sent[0][2]["thumb"]
         self.assertEqual(thumb.getvalue(), b"\xff\xd8jpeg")
 
+    async def test_download_gets_the_extraction_and_its_format_details(self):
+        service = self.make_service()
+        fmt = DMFormat("720p", "https://cdn.example.com/720.m3u8?sec=1", 1280, 720, 2500000,
+                       "m3u8_native", "hls-720")
+        job = self.job(service, DailymotionInfo("Clip", 87, "", (fmt,), {"id": "x7tgad0"}))
+        with patch("ytdown.bot.download_dailymotion", new=self.download), \
+             patch("ytdown.bot.ffmpeg_ready", return_value=True), \
+             patch("ytdown.bot.thumbnail_jpeg", new=AsyncMock(return_value=None)):
+            await service.run_job(job)
+        self.assertEqual(self.download_kwargs["media"], {"id": "x7tgad0"})
+        self.assertEqual(self.download_kwargs["protocol"], "m3u8_native")
+        self.assertEqual(self.download_kwargs["format_id"], "hls-720")
+        self.assertEqual(self.download_kwargs["duration"], 87)
+        self.assertEqual(self.download_kwargs["title"], "Clip")
+        self.assertEqual((self.download_kwargs["watch_url"], self.download_kwargs["height"]),
+                         (WATCH, 720))
+
     async def test_oversize_quality_is_refused_before_download(self):
         service = self.make_service()
         service.max_bytes = 1000
@@ -254,6 +323,9 @@ class DailymotionFallbackTests(unittest.IsolatedAsyncioTestCase):
         info, reader = await self.fetch(MASTER.encode())
         self.assertEqual(reader.await_count, 1)
         self.assertEqual(info.title, "Clip")
+        # The API reported no poster, so Dailymotion's own thumbnail endpoint is used.
+        self.assertEqual(info.poster, "https://www.dailymotion.com/thumbnail/video/x7tgad0")
+        self.assertIsNone(info.media)  # Nothing was extracted on this path.
 
     async def test_both_refused_names_the_status(self):
         with self.assertRaisesRegex(DailymotionError, "HTTP 403"):
@@ -352,6 +424,16 @@ class DailymotionBypassTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(FakeYDL.calls[0]["proxy"], "http://1.2.3.4:8080")
         self.assertTrue(FakeYDL.calls[0]["noplaylist"])
 
+    def test_extract_keeps_the_extraction_for_the_download(self):
+        from ytdown.dailymotion import extract_dailymotion
+        info = dict(self.YTDLP_INFO, thumbnails=[{"url": "https://s1.dmcdn.net/v/poster.jpg", "height": 720}])
+        info.pop("thumbnail", None)
+        with patch("yt_dlp.YoutubeDL", new=ytdlp_patch(info=info)):
+            result = extract_dailymotion(WATCH)
+        self.assertTrue(result.poster.endswith("poster.jpg"))  # thumbnails, not "thumbnail"
+        self.assertIsInstance(result.media, dict)  # The download reuses this extraction.
+        self.assertEqual(result.formats[0].protocol, "m3u8_native")
+
     def test_extract_reports_a_yt_dlp_failure(self):
         from ytdown.dailymotion import extract_dailymotion
         with patch("yt_dlp.YoutubeDL", new=ytdlp_patch(error=DownloadError(
@@ -395,59 +477,152 @@ class DailymotionBypassTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(DailymotionError, "HTTP 403"):
                 await fetch_dailymotion(MagicMock(), WATCH)
 
-    def test_quality_selector_prefers_the_exact_height(self):
-        from ytdown.dailymotion import quality_selector
-        self.assertEqual(quality_selector(720), "best[height=720]/best[height<=720]/best")
-        self.assertEqual(quality_selector(0), "best")
-
-    def test_download_retries_from_the_watch_url_when_the_manifest_is_refused(self):
-        from ytdown.dailymotion import download_dailymotion
-        import tempfile, threading
+    def test_download_repairs_a_refused_manifest_from_the_watch_url(self):
         out_dir = tempfile.mkdtemp()
-        manifest = "https://cdn.example.com/720.m3u8?sec=expired"
-        written = []
 
-        def on_watch(url, options):
-            with open(os.path.join(out_dir, "stream.mp4"), "wb") as handle:
-                handle.write(b"x" * 100)
-            written.append(url)
+        def plan(kind, target, download):
+            if kind == "url" and target == WATCH:
+                write_media(out_dir)
+            else:
+                raise DownloadError("ERROR: unable to download video data: HTTP Error 403")
 
-        def factory(options):
-            ydl = FakeYDL(options)
-
-            def extract_info(url, download=False):
-                if url == manifest:
-                    raise DownloadError("ERROR: unable to download video data: HTTP Error 403")
-                if url == WATCH and download:
-                    on_watch(url, options)
-                    return {"title": "t"}
-                raise AssertionError(url)
-            ydl.extract_info = extract_info
-            return ydl
-
-        FakeYDL.calls = []
-        with patch("yt_dlp.YoutubeDL", new=factory), \
-             patch("ytdown.dailymotion.ffmpeg_ready", return_value=True):
-            path = download_dailymotion(manifest, out_dir, lambda done, total: None,
-                                        threading.Event(), proxy="http://1.2.3.4:8080",
-                                        watch_url=WATCH, height=720)
+        path = run_download(plan, out_dir, manifest="https://cdn.example.com/720.m3u8?sec=expired",
+                            watch_url=WATCH, height=720, proxy="http://1.2.3.4:8080")
         self.assertTrue(path.endswith("stream.mp4"))
-        self.assertEqual(written, [WATCH])
-        self.assertEqual(FakeYDL.calls[1]["format"], "best[height=720]/best[height<=720]/best")
-        self.assertEqual(FakeYDL.calls[1]["proxy"], "http://1.2.3.4:8080")
+        self.assertEqual(DownloadYDL.options[1]["format"], "best[height=720]/best[height<=720]/best")
+        self.assertEqual(DownloadYDL.options[1]["proxy"], "http://1.2.3.4:8080")
 
-    def test_download_without_a_watch_url_keeps_the_plain_error(self):
-        from ytdown.dailymotion import download_dailymotion
-        import tempfile, threading
-        def factory(options):
-            ydl = FakeYDL(options)
-            ydl.extract_info = MagicMock(side_effect=DownloadError("ERROR: 403 Forbidden"))
-            return ydl
-        with patch("yt_dlp.YoutubeDL", new=factory), \
-             patch("ytdown.dailymotion.ffmpeg_ready", return_value=True):
-            with self.assertRaises(DownloadError):
-                download_dailymotion("https://cdn.example.com/x.m3u8", tempfile.mkdtemp(),
-                                     lambda done, total: None, threading.Event())
+
+class DailymotionPosterTests(unittest.TestCase):
+    """A cover is sent even when the Worker API reports no poster."""
+
+    def test_known_poster_wins_and_the_endpoint_is_the_fallback(self):
+        from ytdown.bot import dailymotion_poster
+        self.assertEqual(dailymotion_poster(WATCH, "https://s2.dmcdn.net/v/x1080"),
+                         "https://s2.dmcdn.net/v/x1080")
+        self.assertEqual(dailymotion_poster(WATCH),
+                         "https://www.dailymotion.com/thumbnail/video/x7tgad0")
+        self.assertEqual(dailymotion_poster("https://www.dailymotion.com/video/" + "x" * 3000), "")
+
+    def test_extraction_thumbnails_are_read(self):
+        info = {"title": "Clip", "formats": [], "thumbnails": [
+            {"url": "https://s1.dmcdn.net/small.jpg", "height": 240},
+            {"url": "https://s1.dmcdn.net/big.jpg", "height": 720}]}
+        self.assertEqual(dm_thumbnail(info), "https://s1.dmcdn.net/big.jpg")
+        self.assertEqual(dm_thumbnail({"thumbnail": "https://s1.dmcdn.net/one.jpg"}), "https://s1.dmcdn.net/one.jpg")
+        self.assertEqual(dm_thumbnail({}), "")
+
+
+class DailymotionDownloadTests(unittest.TestCase):
+    """What actually lands on disk: a real container, or an error."""
+
+    MANIFEST_URL = "https://worker.example.workers.dev/api/m3u8?url=x7tgad0"
+
+    def test_the_playlist_url_is_described_to_yt_dlp_instead_of_guessed(self):
+        out_dir = tempfile.mkdtemp()
+        seen = []
+
+        def plan(kind, target, download):
+            seen.append((kind, target))
+            write_media(out_dir)
+
+        path = run_download(plan, out_dir, manifest=self.MANIFEST_URL)
+        self.assertTrue(path.endswith("stream.mp4"))
+        kind, described = seen[0]
+        self.assertEqual(kind, "info")  # Never the generic extractor on a media URL.
+        media = described["formats"][0]
+        self.assertEqual(media["protocol"], "m3u8_native")
+        self.assertEqual(media["url"], self.MANIFEST_URL)
+        self.assertEqual(media["http_headers"]["Referer"], "https://www.dailymotion.com/")
+
+    def test_stream_info_marks_hls_and_keeps_the_url(self):
+        info = stream_info(self.MANIFEST_URL, height=720, duration=87)
+        media = info["formats"][0]
+        self.assertEqual(media["protocol"], "m3u8_native")
+        self.assertEqual(media["url"], self.MANIFEST_URL)
+        self.assertEqual(media["height"], 720)
+        self.assertEqual(media["http_headers"]["Referer"], "https://www.dailymotion.com/")
+        self.assertEqual(info["duration"], 87)
+        plain = stream_info("https://cdn.example.com/v/720.mp4")
+        self.assertEqual(plain["formats"][0]["protocol"], "https")
+
+    def test_a_manifest_saved_as_mp4_is_never_returned(self):
+        out_dir = tempfile.mkdtemp()
+
+        def plan(kind, target, download):
+            write_media(out_dir, data=MANIFEST_TEXT)  # What the generic extractor saved.
+
+        with self.assertRaises(DailymotionError) as caught:
+            run_download(plan, out_dir, manifest=self.MANIFEST_URL)
+        self.assertIn("is not a video file", str(caught.exception))
+
+    def test_the_watch_page_rescues_a_garbage_playlist_download(self):
+        out_dir = tempfile.mkdtemp()
+
+        def plan(kind, target, download):
+            write_media(out_dir, data=REAL_MP4 if target == WATCH else MANIFEST_TEXT)
+
+        path = run_download(plan, out_dir, manifest=self.MANIFEST_URL, watch_url=WATCH, height=288)
+        self.assertTrue(path.endswith("stream.mp4"))
+        self.assertEqual(os.path.getsize(path), len(REAL_MP4))
+        self.assertEqual(DownloadYDL.options[1]["format"], "best[height=288]/best[height<=288]/best")
+
+    def test_a_truncated_file_for_a_long_video_is_refused(self):
+        out_dir = tempfile.mkdtemp()
+
+        def plan(kind, target, download):
+            write_media(out_dir)  # 9 KB of MP4, but the video is 7 minutes long.
+
+        with self.assertRaises(DailymotionError) as caught:
+            run_download(plan, out_dir, manifest=self.MANIFEST_URL, duration=420)
+        self.assertIn("for a 420s video", str(caught.exception))
+
+    def test_the_extracted_stream_is_tried_first_with_its_own_format(self):
+        out_dir = tempfile.mkdtemp()
+        media = {"id": "x7tgad0", "title": "Clip",
+                 "formats": [{"url": "https://cdn.example.com/720.m3u8?sec=2",
+                              "protocol": "m3u8_native", "ext": "mp4", "format_id": "hls-720"}]}
+
+        def plan(kind, target, download):
+            write_media(out_dir)
+
+        path = run_download(plan, out_dir, manifest=self.MANIFEST_URL, media=media,
+                            format_id="hls-720", height=720)
+        self.assertTrue(path.endswith("stream.mp4"))
+        self.assertEqual(DownloadYDL.seen[0], ("info", media))
+        self.assertEqual(DownloadYDL.options[0]["format"], "hls-720")
+
+    def test_every_route_failing_names_why(self):
+        out_dir = tempfile.mkdtemp()
+
+        def plan(kind, target, download):
+            raise DownloadError("ERROR: 403 Forbidden")
+
+        with self.assertRaises(DailymotionError) as caught:
+            run_download(plan, out_dir, manifest=self.MANIFEST_URL, watch_url=WATCH)
+        message = str(caught.exception)
+        self.assertIn("the playlist URL", message)
+        self.assertIn("the watch page: ERROR: 403 Forbidden", message)
+
+    def test_media_problem_reads_the_container(self):
+        out_dir = tempfile.mkdtemp()
+        good = os.path.join(out_dir, "good.mp4")
+        with open(good, "wb") as handle:
+            handle.write(REAL_MP4)
+        self.assertEqual(media_problem(good, 3), "")
+        small = os.path.join(out_dir, "small.mp4")
+        tiny = b"\x00\x00\x00\x18ftypisom" + b"x" * 100  # Right magic, far too small.
+        with open(small, "wb") as handle:
+            handle.write(tiny)
+        self.assertEqual(media_problem(small), f"only {len(tiny)} bytes came back")
+        text_file = os.path.join(out_dir, "manifest.mp4")
+        with open(text_file, "wb") as handle:
+            handle.write(MANIFEST_TEXT)
+        self.assertIn("is not a video file", media_problem(text_file, 420))
+        self.assertIn("no file", media_problem(os.path.join(out_dir, "missing.mp4")))
+        self.assertTrue(looks_like_video(b"\x1aE\xdf\xa3\x01\x00"))  # WebM
+        self.assertTrue(looks_like_video(b"\x47\x40\x00\x10"))  # MPEG-TS
+        self.assertFalse(looks_like_video(b"<!DOCTYPE html>"))
 
 
 if __name__ == "__main__":

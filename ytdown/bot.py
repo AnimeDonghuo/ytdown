@@ -36,9 +36,9 @@ from .terabox import (TERABOX_API_URL, TeraboxFile, TeraboxListing, normalize_te
                       parse_terabox_source)
 from .dailymotion import (DAILYMOTION_API_URL, MAX_API_BYTES, MAX_MANIFEST_BYTES, DailymotionError,
                           DailymotionInfo, download_dailymotion,
-                          extract_dailymotion, estimate_bytes, ffmpeg_ready,
-                          normalize_dailymotion, parse_dailymotion_source, parse_master, proxy_manifest,
-                          read_bounded)
+                          extract_dailymotion, estimate_bytes, ffmpeg_ready, dm_poster_url,
+                          normalize_dailymotion, parse_dailymotion_source, parse_master,
+                          proxy_manifest, read_bounded)
 from .rumble import (RUMBLE_API_URL, RumbleError, extract_rumble, normalize_rumble,
                      parse_rumble_source)
 from .metrics import ContainerMetrics, human_size
@@ -352,6 +352,16 @@ async def fetch_terabox(session: aiohttp.ClientSession, url: str,
     return normalize_terabox(await fetch_json_api(session, endpoint, url, 4_000_000))
 
 
+def dailymotion_poster(url: str, known: str = "") -> str:
+    """The poster to use: what the API or the extraction reported, else Dailymotion's own.
+
+    The Worker's metadata sometimes carries no poster, and that is how Dailymotion
+    files arrived with no cover at all. The thumbnail endpoint answers with a
+    redirect to the JPEG, and nothing is sent when it does not exist.
+    """
+    return known or dm_poster_url(url)
+
+
 async def fetch_dailymotion(session: aiohttp.ClientSession, url: str,
                             endpoint: str = DAILYMOTION_API_URL,
                             proxy: str | None = None) -> DailymotionInfo:
@@ -399,7 +409,7 @@ async def fetch_dailymotion(session: aiohttp.ClientSession, url: str,
         formats = parse_master(text, candidate)
         if formats:
             LOG.info("Dailymotion qualities read from the %s playlist", label)
-            return DailymotionInfo(title, duration, poster, formats)
+            return DailymotionInfo(title, duration, dailymotion_poster(url, poster), formats)
         reason = "No downloadable Dailymotion qualities were listed."
     try:
         info = await asyncio.to_thread(extract_dailymotion, url, proxy)
@@ -407,8 +417,9 @@ async def fetch_dailymotion(session: aiohttp.ClientSession, url: str,
         LOG.warning("Dailymotion fallback extraction failed: %s", exc)
         raise DailymotionError(api_error or reason or str(exc)) from exc
     LOG.info("Dailymotion qualities read straight from Dailymotion (Worker playlists refused)")
-    return DailymotionInfo(title or info.title, duration or info.duration, poster or info.poster,
-                           info.formats)
+    return DailymotionInfo(title or info.title, duration or info.duration,
+                           dailymotion_poster(url, poster or info.poster), info.formats,
+                           info.media)
 
 
 async def get_youtube_title(session, url: str, proxy: str | None = None) -> str:
@@ -2235,9 +2246,11 @@ class DownloaderBot:
                     # download keeps exactly the old yt-dlp options.
                     proxy = self.proxy_for(job.user_id, "dailymotion")
                     route = {"proxy": proxy.url} if proxy else {}
-                    path = await asyncio.to_thread(download_dailymotion, fmt.url, tmpdir, on_bytes,
-                                                   stop, watch_url=job.source.url, height=fmt.height,
-                                                   **route)
+                    path = await asyncio.to_thread(
+                        download_dailymotion, fmt.url, tmpdir, on_bytes, stop,
+                        watch_url=job.source.url, height=fmt.height, media=info.media,
+                        protocol=fmt.protocol, format_id=fmt.format_id, duration=info.duration,
+                        title=info.title, **route)
                 except asyncio.CancelledError:
                     stop.set()  # Stops the worker thread at its next progress callback.
                     raise
