@@ -145,8 +145,9 @@ class BotDownloadTests(unittest.IsolatedAsyncioTestCase):
         self.sent.append((os.path.basename(path), os.path.exists(path), kwargs))
         return SimpleNamespace(id=1)
 
-    def fake_download(self, url, out_dir, on_bytes, stop):
+    def fake_download(self, url, out_dir, on_bytes, stop, **kwargs):
         self.tmpdirs.append(out_dir)
+        self.download_kwargs = kwargs
         path = os.path.join(out_dir, "stream.mp4")
         with open(path, "wb") as handle:
             handle.write(b"x" * 1000)
@@ -210,7 +211,7 @@ class BotDownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("need ffmpeg", service.progress.call_args.args[1])
 
     async def test_download_error_reports_status_without_url(self):
-        def refused(url, out_dir, on_bytes, stop):
+        def refused(url, out_dir, on_bytes, stop, **kwargs):
             raise DownloadError("ERROR: unable to download video data: HTTP Error 403: Forbidden "
                                 "https://cdn.example.com/720/index.m3u8?sec=SECRET")
         service = self.make_service(download_side_effect=refused)
@@ -237,7 +238,9 @@ class DailymotionFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def fetch(self, *reads, api=None, api_error=None):
         from ytdown.bot import fetch_dailymotion
         api_mock = AsyncMock(side_effect=api_error) if api_error else AsyncMock(return_value=api or self.API)
+        fallback = MagicMock(side_effect=DailymotionError("no yt-dlp here"))
         with patch("ytdown.bot.fetch_json_api", new=api_mock), \
+             patch("ytdown.bot.extract_dailymotion", new=fallback), \
              patch("ytdown.bot.read_bounded", new=AsyncMock(side_effect=list(reads))) as reader:
             info = await fetch_dailymotion(MagicMock(), WATCH)
         return info, reader
@@ -272,6 +275,179 @@ class DailymotionFallbackTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(aiohttp.ClientResponseError) as caught:
             await read_bounded(session, "https://cdndirector.example.com/m.m3u8", 1000)
         self.assertEqual(caught.exception.status, 302)
+
+
+class FakeYDL:
+    """Stand-in for yt_dlp.YoutubeDL: records options, returns canned info."""
+
+    calls = []
+
+    def __init__(self, options):
+        self.options = options
+        FakeYDL.calls.append(options)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def extract_info(self, url, download=False):
+        raise AssertionError("not configured")
+
+
+def ytdlp_patch(info=None, error=None, on_watch=None):
+    """Patch yt_dlp.YoutubeDL with a handler for a single extraction."""
+    def factory(options):
+        ydl = FakeYDL(options)
+
+        def extract_info(url, download=False):
+            if error is not None and (on_watch is None or not on_watch(url)):
+                raise error
+            if on_watch is not None and on_watch(url) and download:
+                on_watch(url, options)
+            if info is None:
+                raise AssertionError("no info configured")
+            return info
+        ydl.extract_info = extract_info
+        return ydl
+    return factory
+
+
+class DailymotionBypassTests(unittest.IsolatedAsyncioTestCase):
+    """A refused Worker playlist must not end the job: read Dailymotion directly."""
+
+    YTDLP_INFO = {
+        "title": "Straight from Dailymotion",
+        "duration": 99,
+        "thumbnail": "https://s1.dmcdn.net/v/poster.jpg",
+        "formats": [
+            {"protocol": "m3u8_native", "height": 720, "width": 1280, "tbr": 2500.0,
+             "manifest_url": "https://cdn.example.com/720.m3u8?sec=2"},
+            {"protocol": "https", "height": 480, "width": 854, "tbr": 900.0, "ext": "mp4",
+             "url": "https://cdn.example.com/480.mp4"},
+            {"protocol": "https", "height": 360, "width": 640, "tbr": 500.0, "ext": "mp4",
+             "url": "https://cdn.example.com/360.mp4"},
+            {"protocol": "http_dash_segments", "height": 1080, "tbr": 5000.0,
+             "url": "https://cdn.example.com/dash"},
+            {"protocol": "m3u8_native", "vcodec": "none", "height": 480, "tbr": 100.0,
+             "manifest_url": "https://cdn.example.com/audio.m3u8"},
+            {"protocol": "https", "height": None, "tbr": 10.0, "ext": "mp4",
+             "url": "https://cdn.example.com/unknown.mp4"},
+        ],
+    }
+
+    def test_extract_maps_yt_dlp_formats(self):
+        from ytdown.dailymotion import extract_dailymotion
+        FakeYDL.calls = []
+        with patch("yt_dlp.YoutubeDL", new=ytdlp_patch(info=self.YTDLP_INFO)):
+            info = extract_dailymotion(WATCH, proxy="http://1.2.3.4:8080")
+        self.assertEqual([f.label for f in info.formats], ["720p", "480p", "360p"])
+        self.assertEqual(info.formats[0].url, "https://cdn.example.com/720.m3u8?sec=2")
+        self.assertEqual(info.formats[1].url, "https://cdn.example.com/480.mp4")
+        self.assertEqual(info.formats[0].height, 720)
+        self.assertEqual(info.formats[0].bandwidth, 2_500_000)
+        self.assertEqual((info.title, info.duration), ("Straight from Dailymotion", 99))
+        self.assertTrue(info.poster.endswith("poster.jpg"))
+        self.assertEqual(FakeYDL.calls[0]["proxy"], "http://1.2.3.4:8080")
+        self.assertTrue(FakeYDL.calls[0]["noplaylist"])
+
+    def test_extract_reports_a_yt_dlp_failure(self):
+        from ytdown.dailymotion import extract_dailymotion
+        with patch("yt_dlp.YoutubeDL", new=ytdlp_patch(error=DownloadError(
+                "ERROR: [dailymotion] x7tgad0: Unable to download webpage HTTP Error 403"))):
+            with self.assertRaisesRegex(DailymotionError, "Unable to download webpage"):
+                extract_dailymotion(WATCH)
+
+    async def test_fetch_uses_the_bypass_when_both_playlists_are_refused(self):
+        from ytdown.bot import fetch_dailymotion
+        from ytdown.dailymotion import DailymotionInfo
+        api = {"success": True, "title": "API title", "duration": 99, "poster": "",
+               "master_m3u8": "https://cdndirector.example.com/m.m3u8",
+               "proxy_m3u8": "https://worker.example.workers.dev/api/m3u8?url=x"}
+        fresh = DailymotionInfo("Bypass title", 99, "", (FORMAT_720,))
+        refused = aiohttp.ClientResponseError(request_info=MagicMock(), history=(), status=403)
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(return_value=api)), \
+             patch("ytdown.bot.read_bounded", new=AsyncMock(side_effect=[refused, refused])), \
+             patch("ytdown.bot.extract_dailymotion", new=MagicMock(return_value=fresh)) as bypass:
+            info = await fetch_dailymotion(MagicMock(), WATCH, proxy="http://1.2.3.4:8080")
+        self.assertEqual([f.label for f in info.formats], ["720p"])
+        self.assertEqual(info.title, "API title")  # Metadata still comes from the API.
+        self.assertEqual(bypass.call_args.args, (WATCH, "http://1.2.3.4:8080"))
+
+    async def test_fetch_uses_the_bypass_when_the_api_itself_fails(self):
+        from ytdown.bot import fetch_dailymotion
+        from ytdown.dailymotion import DailymotionInfo
+        fresh = DailymotionInfo("Bypass title", 42, "", (FORMAT_720,))
+        failure = aiohttp.ClientResponseError(request_info=MagicMock(), history=(), status=500)
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=failure)), \
+             patch("ytdown.bot.extract_dailymotion", new=MagicMock(return_value=fresh)) as bypass:
+            info = await fetch_dailymotion(MagicMock(), WATCH)
+        self.assertEqual((info.title, info.duration), ("Bypass title", 42))
+        self.assertEqual(bypass.call_args.args, (WATCH, None))
+
+    async def test_fetch_reports_the_api_reason_when_every_route_fails(self):
+        from ytdown.bot import fetch_dailymotion
+        refused = aiohttp.ClientResponseError(request_info=MagicMock(), history=(), status=403)
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=refused)), \
+             patch("ytdown.bot.extract_dailymotion",
+                   new=MagicMock(side_effect=DailymotionError("Dailymotion refused this video"))):
+            with self.assertRaisesRegex(DailymotionError, "HTTP 403"):
+                await fetch_dailymotion(MagicMock(), WATCH)
+
+    def test_quality_selector_prefers_the_exact_height(self):
+        from ytdown.dailymotion import quality_selector
+        self.assertEqual(quality_selector(720), "best[height=720]/best[height<=720]/best")
+        self.assertEqual(quality_selector(0), "best")
+
+    def test_download_retries_from_the_watch_url_when_the_manifest_is_refused(self):
+        from ytdown.dailymotion import download_dailymotion
+        import tempfile, threading
+        out_dir = tempfile.mkdtemp()
+        manifest = "https://cdn.example.com/720.m3u8?sec=expired"
+        written = []
+
+        def on_watch(url, options):
+            with open(os.path.join(out_dir, "stream.mp4"), "wb") as handle:
+                handle.write(b"x" * 100)
+            written.append(url)
+
+        def factory(options):
+            ydl = FakeYDL(options)
+
+            def extract_info(url, download=False):
+                if url == manifest:
+                    raise DownloadError("ERROR: unable to download video data: HTTP Error 403")
+                if url == WATCH and download:
+                    on_watch(url, options)
+                    return {"title": "t"}
+                raise AssertionError(url)
+            ydl.extract_info = extract_info
+            return ydl
+
+        FakeYDL.calls = []
+        with patch("yt_dlp.YoutubeDL", new=factory), \
+             patch("ytdown.dailymotion.ffmpeg_ready", return_value=True):
+            path = download_dailymotion(manifest, out_dir, lambda done, total: None,
+                                        threading.Event(), proxy="http://1.2.3.4:8080",
+                                        watch_url=WATCH, height=720)
+        self.assertTrue(path.endswith("stream.mp4"))
+        self.assertEqual(written, [WATCH])
+        self.assertEqual(FakeYDL.calls[1]["format"], "best[height=720]/best[height<=720]/best")
+        self.assertEqual(FakeYDL.calls[1]["proxy"], "http://1.2.3.4:8080")
+
+    def test_download_without_a_watch_url_keeps_the_plain_error(self):
+        from ytdown.dailymotion import download_dailymotion
+        import tempfile, threading
+        def factory(options):
+            ydl = FakeYDL(options)
+            ydl.extract_info = MagicMock(side_effect=DownloadError("ERROR: 403 Forbidden"))
+            return ydl
+        with patch("yt_dlp.YoutubeDL", new=factory), \
+             patch("ytdown.dailymotion.ffmpeg_ready", return_value=True):
+            with self.assertRaises(DownloadError):
+                download_dailymotion("https://cdn.example.com/x.m3u8", tempfile.mkdtemp(),
+                                     lambda done, total: None, threading.Event())
 
 
 if __name__ == "__main__":

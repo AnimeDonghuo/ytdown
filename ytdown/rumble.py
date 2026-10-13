@@ -5,6 +5,9 @@ from __future__ import annotations
 import re
 from urllib.parse import urlsplit
 
+import yt_dlp
+from yt_dlp.utils import DownloadError
+
 from .core import Video, public_https_url
 
 RUMBLE_API_URL = "https://samra-rumble-api.krishnalucky193.workers.dev/"
@@ -40,6 +43,52 @@ def parse_rumble_source(raw: str) -> str:
         raise RumbleError("Send a Rumble video link: rumble.com/v…-title.html or rumble.com/embed/v… "
                           "(channels, search pages and playlists are not supported).")
     return f"https://{RUMBLE_HOST}{parts.path}"
+
+
+def extract_rumble(url: str, proxy: str | None = None) -> Video:
+    """Read the MP4 qualities from Rumble itself, for when the API is unavailable.
+
+    yt-dlp talks to rumble.com's own player endpoint and returns the same kind
+    of progressive MP4 links the API lists, so the rest of the download path is
+    unchanged. Playlist-style HLS and audio-only entries are skipped: the bot
+    streams a single MP4 per quality.
+    """
+    options = {"quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True,
+               "skip_download": True, "socket_timeout": 30, "retries": 2}
+    if proxy:
+        options["proxy"] = proxy
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except DownloadError as exc:
+        first = str(exc or "").splitlines()[0] if str(exc or "").strip() else "no reason given"
+        raise RumbleError(f"Rumble refused this video: {first[:160]}") from exc
+    except Exception as exc:
+        raise RumbleError(f"Could not read this Rumble video ({type(exc).__name__}).") from exc
+    if not isinstance(info, dict):
+        raise RumbleError("Rumble returned no video information.")
+    streams: dict[str, str] = {}
+    for entry in info.get("formats") or []:
+        if not isinstance(entry, dict):
+            continue
+        height = entry.get("height")
+        if not _height(height):
+            continue
+        if str(entry.get("protocol") or "") not in ("http", "https"):
+            continue
+        if (entry.get("ext") or "") != "mp4" or entry.get("vcodec") == "none":
+            continue
+        if not public_https_url(entry.get("url")):
+            continue
+        streams.setdefault(f"{height}p", entry["url"])
+    if not streams:
+        raise RumbleError("Rumble listed no MP4 downloads for this video.")
+    title = info.get("title").strip() if isinstance(info.get("title"), str) else ""
+    title = title[:200] or "Rumble video"
+    duration = info.get("duration")
+    duration = max(0, int(duration)) if isinstance(duration, (int, float)) else 0
+    thumbnail = info.get("thumbnail") if public_https_url(info.get("thumbnail")) else ""
+    return Video(title, streams, duration, thumbnail)
 
 
 def _height(value: object) -> bool:

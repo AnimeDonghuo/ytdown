@@ -34,16 +34,18 @@ from .core import (AUDIO, VIDEO_QUALITIES, PlaylistEntry, Source, Video, extract
 from .terabox import (TERABOX_API_URL, TeraboxFile, TeraboxListing, normalize_terabox,
                       parse_terabox_source)
 from .dailymotion import (DAILYMOTION_API_URL, MAX_API_BYTES, MAX_MANIFEST_BYTES, DailymotionError,
-                          DailymotionInfo, download_dailymotion, estimate_bytes, ffmpeg_ready,
+                          DailymotionInfo, download_dailymotion,
+                          extract_dailymotion, estimate_bytes, ffmpeg_ready,
                           normalize_dailymotion, parse_dailymotion_source, parse_master, proxy_manifest,
                           read_bounded)
-from .rumble import RUMBLE_API_URL, RumbleError, normalize_rumble, parse_rumble_source
+from .rumble import (RUMBLE_API_URL, RumbleError, extract_rumble, normalize_rumble,
+                     parse_rumble_source)
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg, usable_still
-from .proxy import (CHECK_TARGETS, KNOWN_TARGETS, MAX_PROXIES, MIN_LATENCY_MS, TOO_FAST, CheckResult,
-                    CheckStats, Proxy, ProxyPool, ProxyRouter, parse_proxies, proxy_fault,
-                    resolve_targets, run_checks, short_reason, site_marks, target_for, target_label,
-                    with_url)
+from .proxy import (CHECK_TARGETS, KNOWN_TARGETS, MAX_PROXIES, MIN_LATENCY_MS, SERVICE_KEYS, TOO_FAST,
+                    CheckResult, CheckStats, CheckTarget, Proxy, ProxyPool, ProxyRouter, parse_proxies,
+                    proxy_fault, resolve_targets, run_checks, short_reason, site_marks, target_for,
+                    target_label, with_url)
 
 LOG = logging.getLogger(__name__)
 MODE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion", "rumble": "Rumble"}
@@ -319,17 +321,29 @@ async def fetch_video(session: aiohttp.ClientSession, url: str, api_endpoint: st
     return await fetch_api_with_retries(session, api_endpoint, url, normalize_video)
 
 
-async def fetch_rumble(session: aiohttp.ClientSession, url: str, endpoint: str = RUMBLE_API_URL) -> Video:
+async def fetch_rumble(session: aiohttp.ClientSession, url: str, endpoint: str = RUMBLE_API_URL,
+                        proxy: str | None = None) -> Video:
+    """Rumble API first; when it is down or erroring, read the MP4s from Rumble itself."""
+    reason = ""
     try:
         return await fetch_api_with_retries(session, endpoint, url, normalize_rumble)
     except aiohttp.ClientResponseError as exc:
         LOG.warning("Rumble API answered HTTP %s", exc.status)
-        raise RumbleError(f"The Rumble API answered HTTP {exc.status}. Try again later.") from exc
-    except json.JSONDecodeError as exc:
-        raise RumbleError("The Rumble API returned an unexpected response.") from exc
+        reason = f"The Rumble API answered HTTP {exc.status}."
+    except json.JSONDecodeError:
+        reason = "The Rumble API returned an unexpected response."
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         LOG.warning("Rumble API unreachable: %s", type(exc).__name__)
-        raise RumbleError("Could not reach the Rumble API. Try again later.") from exc
+        reason = "Could not reach the Rumble API."
+    except RumbleError as exc:
+        reason = str(exc)
+    try:
+        video = await asyncio.to_thread(extract_rumble, url, proxy)
+    except RumbleError as exc:
+        LOG.warning("Rumble fallback extraction failed: %s", exc)
+        raise RumbleError(f"{reason} {exc}".strip()) from exc
+    LOG.info("Rumble qualities read straight from Rumble (%s)", reason.rstrip("."))
+    return video
 
 
 async def fetch_terabox(session: aiohttp.ClientSession, url: str,
@@ -338,21 +352,37 @@ async def fetch_terabox(session: aiohttp.ClientSession, url: str,
 
 
 async def fetch_dailymotion(session: aiohttp.ClientSession, url: str,
-                            endpoint: str = DAILYMOTION_API_URL) -> DailymotionInfo:
-    """Worker metadata, then the master playlist: the CDN copy first, the Worker's proxy copy if refused."""
+                            endpoint: str = DAILYMOTION_API_URL,
+                            proxy: str | None = None) -> DailymotionInfo:
+    """Worker metadata and master playlist; straight from Dailymotion when both copies are refused.
+
+    The Worker's playlists are signed for the Worker's own address, so a 403 on
+    either copy says nothing about the video. In that case (and when the API
+    itself is down) yt-dlp reads the qualities from Dailymotion directly, which
+    also mints URLs for the route the download will use.
+    """
+    data: object = None
+    api_error = ""
     try:
         data = await fetch_json_api(session, endpoint, url, MAX_API_BYTES)
     except aiohttp.ClientResponseError as exc:
         LOG.warning("Dailymotion API answered HTTP %s", exc.status)
-        raise DailymotionError(f"The Dailymotion API answered HTTP {exc.status}. Try again later.") from exc
+        api_error = f"The Dailymotion API answered HTTP {exc.status}. Try again later."
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         LOG.warning("Dailymotion API unreachable: %s", type(exc).__name__)
-        raise DailymotionError("Could not reach the Dailymotion API. Try again later.") from exc
-    except json.JSONDecodeError as exc:
-        raise DailymotionError("The Dailymotion API returned an unexpected response.") from exc
-    title, duration, poster, manifest = normalize_dailymotion(data)
-    reason = "No downloadable Dailymotion qualities were listed."
-    for label, candidate in (("CDN", manifest), ("Worker proxy", proxy_manifest(data))):
+        api_error = "Could not reach the Dailymotion API. Try again later."
+    except json.JSONDecodeError:
+        api_error = "The Dailymotion API returned an unexpected response."
+    title = duration = poster = manifest = proxy_copy = ""
+    reason = ""
+    if data is not None:
+        try:
+            title, duration, poster, manifest = normalize_dailymotion(data)
+            proxy_copy = proxy_manifest(data)
+        except DailymotionError as exc:
+            reason = str(exc)
+    reason = reason or "No downloadable Dailymotion qualities were listed."
+    for label, candidate in (("CDN", manifest), ("Worker proxy", proxy_copy)):
         if not candidate:
             continue
         try:
@@ -370,7 +400,14 @@ async def fetch_dailymotion(session: aiohttp.ClientSession, url: str,
             LOG.info("Dailymotion qualities read from the %s playlist", label)
             return DailymotionInfo(title, duration, poster, formats)
         reason = "No downloadable Dailymotion qualities were listed."
-    raise DailymotionError(reason)
+    try:
+        info = await asyncio.to_thread(extract_dailymotion, url, proxy)
+    except DailymotionError as exc:
+        LOG.warning("Dailymotion fallback extraction failed: %s", exc)
+        raise DailymotionError(api_error or reason or str(exc)) from exc
+    LOG.info("Dailymotion qualities read straight from Dailymotion (Worker playlists refused)")
+    return DailymotionInfo(title or info.title, duration or info.duration, poster or info.poster,
+                           info.formats)
 
 
 async def get_youtube_title(session, url: str, proxy: str | None = None) -> str:
@@ -580,8 +617,11 @@ class DownloaderBot:
         self.proxy_min_latency_user: dict[int, int] = {}  # Per-user /proxychk fast override.
         check_url = os.getenv("PROXY_CHECK_URL", "").strip()
         check_url = check_url if public_https_url(check_url) else ""
-        self.proxy_check_targets = resolve_targets(
-            os.getenv("PROXY_CHECK_SITES", "") or os.getenv("PROXY_CHECK_SITE", ""), check_url)
+        self.proxy_check_keys = os.getenv("PROXY_CHECK_SITES", "") or os.getenv("PROXY_CHECK_SITE", "")
+        # Extra URLs added with /proxychk url, applied on top of the site probes.
+        self.proxy_check_urls: list[str] = [check_url] if check_url else []
+        # The sites a check tests; per-user API probes are resolved at check time.
+        self.proxy_check_targets = resolve_targets(self.proxy_check_keys, check_url)
         self.proxy_seed = parse_proxies(os.getenv("PROXY_LIST", ""), MAX_PROXIES)[0]
 
     def user_jobs(self, uid: int) -> list[Job]:
@@ -590,11 +630,63 @@ class DownloaderBot:
     def api_for(self, uid: int, service: str = "youtube") -> str:
         return self.api_overrides.get(uid, {}).get(service, DEFAULT_APIS[service])
 
+    def apis_for(self, uid: int) -> dict[str, str]:
+        """Every service endpoint this user's traffic uses: built-in or their own."""
+        return {service: self.api_for(uid, service) for service in SERVICE_KEYS}
+
+    def api_hosts_for(self, uid: int) -> dict[str, str]:
+        """API host -> service, so pool routing can tell which API a request hits."""
+        hosts: dict[str, str] = {}
+        for service, endpoint in self.apis_for(uid).items():
+            host = (urlsplit(endpoint).hostname or "").lower()
+            if host:
+                hosts[host] = service
+        return hosts
+
     def set_api(self, uid: int, raw: str, service: str = "youtube") -> str:
         endpoint = normalize_api_endpoint(raw)
         self.api_overrides.setdefault(uid, {})[service] = endpoint
         self.awaiting_api.discard(uid)
+        router = self.routers.get(uid)
+        if router is not None:  # Keep site-aware routing on the new host.
+            router.api_hosts = self.api_hosts_for(uid)
         return endpoint
+
+    def refresh_check_targets(self) -> None:
+        """Rebuild the site-level probe list after /proxychk sites or url changes."""
+        self.proxy_check_targets = self.apply_check_urls(resolve_targets(self.proxy_check_keys))
+
+    def apply_check_urls(self, targets: tuple[CheckTarget, ...]) -> tuple[CheckTarget, ...]:
+        """Layer the user's own check URLs on top; a site URL replaces that site's probe."""
+        for url in self.proxy_check_urls:
+            targets = with_url(targets, url)
+        return targets
+
+    def api_side_note(self, count: int, results: list[CheckResult]) -> str:
+        """Explain proxies that got a real HTTP answer from an API that was unusable."""
+        reasons: dict[str, int] = {}
+        for result in results:
+            if result.verdict != "api":
+                continue
+            for site in result.sites:
+                if not site.ok and site.detail:
+                    reasons[site.detail] = reasons.get(site.detail, 0) + 1
+        top = sorted(reasons.items(), key=lambda item: (-item[1], item[0]))[:2]
+        detail = " · ".join(f"{reason} ×{hits}" for reason, hits in top)
+        return (f"⚠️ {count} prox{'y' if count == 1 else 'ies'} reached the API but got no usable "
+                f"answer ({detail}). They stay in the pool instead of being marked dead"
+                + (": that many identical answers usually mean the API itself is failing — check it "
+                   "with /apis and /changeapi." if count > 1 else "."))
+
+    def check_targets_for(self, uid: int) -> tuple[CheckTarget, ...]:
+        """The probes a check runs for this user: their own APIs where they exist.
+
+        Probing the API the bot really calls — not just the site's front page —
+        is what tells a proxy that can *use* the service from one that merely
+        reaches it.
+        """
+        return self.apply_check_urls(
+            resolve_targets(self.proxy_check_keys, apis=self.apis_for(uid)))
 
     # -- proxy pool ------------------------------------------------------
     def pool_for(self, uid: int) -> ProxyPool:
@@ -625,6 +717,7 @@ class DownloaderBot:
                                  headers=self.headers, strict=self.proxy_strict,
                                  on_drop=lambda state, detail: LOG.warning(
                                      "User %s lost proxy %s: %s", uid, state.proxy.label, detail))
+            router.api_hosts = self.api_hosts_for(uid)
             self.routers[uid] = router
         return router
 
@@ -682,10 +775,11 @@ class DownloaderBot:
     def proxy_status_text(self, uid: int) -> str:
         pool = self.pool_for(uid)
         on = self.proxy_enabled(uid)
-        targets = self.proxy_check_targets
+        targets = self.check_targets_for(uid)
         lines = [f"🌐 Proxy mode: {'ON' if on else 'OFF'}",
-                 "Check sites: " + " + ".join(target.label for target in targets)
-                 + " — /proxychk sites youtube,rumble or /proxychk url <https URL> changes this",
+                 "Check sites: " + " + ".join(target_label(target.key) for target in targets)
+                 + " — /proxychk sites youtube,terabox,rumble or /proxychk url <https URL> "
+                   "changes this",
                  self.fast_guard_text(uid),
                  pool.summary()]
         counts = (pool.last_check.sites if pool.last_check
@@ -800,7 +894,7 @@ class DownloaderBot:
         """Check every proxy against every configured site and report what works."""
         pool = self.pool_for(uid)
         added = pool.add(proxies)
-        targets = self.proxy_check_targets
+        targets = self.check_targets_for(uid)
         names = " + ".join(target.label for target in targets)
         min_latency = self.min_latency_for(uid)
         started, finished = time.monotonic(), 0
@@ -811,10 +905,13 @@ class DownloaderBot:
                                    + (f" · under {min_latency} ms fails" if min_latency else "")
                                    + "…")
 
+        api_side = 0
+
         async def on_progress(count: int, total: int, result: CheckResult) -> None:
-            nonlocal next_edit, finished, working
+            nonlocal next_edit, finished, working, api_side
             finished = count
             working += 1 if result.ok else 0
+            api_side += 1 if result.verdict == "api" else 0
             for site in result.sites:
                 if site.ok:
                     site_counts[site.key] = site_counts.get(site.key, 0) + 1
@@ -840,10 +937,12 @@ class DownloaderBot:
         live = [result for result in results if result.ok]
         lines = [f"✅ Checked {len(results)} proxies in {human_eta(time.monotonic() - started)} "
                  f"against {names}",
-                 f"Reachable: {working} · no site reached: {len(results) - working}",
                  "Per site: " + " · ".join(f"{target_label(key)} {value} ok"
                                            for key, value in site_counts.items()),
+                 f"Reachable: {working} · no service answered: {len(results) - working}",
                  pool.summary()]
+        if api_side:
+            lines.append(self.api_side_note(api_side, results))
         if added.overflow:
             lines.append(f"Pool limit is {pool.limit}, so {added.overflow} proxies were not stored.")
         if added.duplicates:
@@ -860,6 +959,10 @@ class DownloaderBot:
                          + (f" (for example {examples})" if examples else "")
                          + ". /proxychk fast <ms> tunes this, /proxychk fast off disables it.")
         lines.extend(notes[:3])
+        if any(target.json for target in targets):
+            lines.append("Checked with each service's own API"
+                         + (" (including your custom endpoints)" if self.api_overrides.get(uid) else "")
+                         + " — only proxies that get a real API answer pass.")
         if live:
             fastest = sorted(live, key=lambda item: item.latency_ms)
             if working <= PROXY_INLINE_LIST:
@@ -906,12 +1009,14 @@ class DownloaderBot:
         host = urlsplit(url).hostname or "custom"
         replaced = next((target for target in self.proxy_check_targets
                          if target.url == url or target.key == (target_for(url) or "")), None)
-        self.proxy_check_targets = with_url(self.proxy_check_targets, url)
+        if url not in self.proxy_check_urls:
+            self.proxy_check_urls = (self.proxy_check_urls + [url])[-3:]  # At most one custom probe.
+        self.refresh_check_targets()
         action = (f"replaces the {replaced.label} probe" if replaced is not None
                   else "is added to the checks")
         await event.respond(f"{url} ({host}) {action}: now testing "
                             + " + ".join(f"{target.label} ({target.url})"
-                                         for target in self.proxy_check_targets)
+                                         for target in self.check_targets_for(event.sender_id))
                             + ". Send /proxychk to test a list, or /proxy → Re-check pool.")
 
     async def proxy_sites_command(self, event, keys: str) -> None:
@@ -919,20 +1024,22 @@ class DownloaderBot:
         known = {target.key for target in KNOWN_TARGETS}  # YouTube stays selectable by name.
         parts = [part for part in re.split(r"[,;\s]+", keys.lower()) if part]
         if parts and all(part in ("default", "all", "reset", "builtin") for part in parts):
-            self.proxy_check_targets = CHECK_TARGETS
+            self.proxy_check_keys = ""
+            self.refresh_check_targets()
             await event.respond("Proxy checks restored to the default "
                                 + " + ".join(target.label for target in CHECK_TARGETS) + ".")
             return
         unknown = [part for part in parts if part not in known]
         if unknown:
-            await event.respond("Unknown site: " + ", ".join(unknown) + ". Use dailymotion, rumble "
-                                "or youtube (for example /proxychk sites rumble,youtube), or "
+            await event.respond("Unknown site: " + ", ".join(unknown) + ". Use dailymotion, rumble, "
+                                "youtube or terabox (for example /proxychk sites rumble,youtube), or "
                                 "/proxychk sites default for Dailymotion + Rumble.")
             return
-        self.proxy_check_targets = resolve_targets(keys)
+        self.proxy_check_keys = keys
+        self.refresh_check_targets()
         await event.respond("Proxy checks will test "
                             + " + ".join(f"{target.label} ({target.url})"
-                                         for target in self.proxy_check_targets)
+                                         for target in self.check_targets_for(event.sender_id))
                             + ". Send /proxychk to test a list, or /proxy → Re-check pool.")
 
     async def proxy_fast_command(self, event, value: str) -> None:
@@ -1321,11 +1428,12 @@ class DownloaderBot:
                     "socks5://user:pass@host:1080\n\n"
                     "Every proxy is tested against " + " + ".join(
                         f"{target.label} ({urlsplit(target.url).hostname})"
-                        for target in self.proxy_check_targets) + ": a proxy that reaches only some "
-                    "sites is still usable for those. Working ones join your pool and dead ones are "
-                    f"marked, with {self.proxy_workers} parallel workers. /proxychk stop cancels. "
-                    "/proxychk sites picks the sites; /proxychk url <https://…> adds your own API "
-                    "host. " + self.fast_guard_text(uid) + ".",
+                        for target in self.check_targets_for(uid)) + ": a proxy that reaches only "
+                    "some sites is still usable for those, and only a real JSON answer from an API "
+                    "counts as a pass. Working ones join your pool and dead ones are marked, with "
+                    f"{self.proxy_workers} parallel workers. /proxychk stop cancels. /proxychk sites "
+                    "picks the sites (youtube, terabox, dailymotion, rumble); /proxychk url "
+                    "<https://…> adds your own API host. " + self.fast_guard_text(uid) + ".",
                     parse_mode=None)
         elif command == "/proxy":
             uid = event.sender_id
@@ -1554,7 +1662,9 @@ class DownloaderBot:
                 notice = await event.respond("Checking Rumble qualities…")
                 endpoint = self.api_for(uid, "rumble")
                 try:
-                    video = await fetch_rumble(self.http_for(uid), source.url, endpoint)
+                    proxy = self.proxy_for(uid, "rumble")
+                    video = await fetch_rumble(self.http_for(uid), source.url, endpoint,
+                                               proxy=proxy.url if proxy else None)
                 except RumbleError as exc:
                     await notice.edit(str(exc))
                     return
@@ -1572,9 +1682,11 @@ class DownloaderBot:
                 return
             if source.kind == "dailymotion":
                 notice = await event.respond("Checking Dailymotion qualities…")
+                proxy = self.proxy_for(uid, "dailymotion")
                 try:
                     info = await fetch_dailymotion(self.http_for(uid), source.url,
-                                                   self.api_for(uid, "dailymotion"))
+                                                   self.api_for(uid, "dailymotion"),
+                                                   proxy=proxy.url if proxy else None)
                 except DailymotionError as exc:
                     await notice.edit(str(exc))
                     return
@@ -2056,10 +2168,11 @@ class DownloaderBot:
                 try:
                     # The pool proxy is passed only when proxy mode is on, so a direct
                     # download keeps exactly the old yt-dlp options.
-                    proxy = self.proxy_for(job.user_id)
+                    proxy = self.proxy_for(job.user_id, "dailymotion")
                     route = {"proxy": proxy.url} if proxy else {}
                     path = await asyncio.to_thread(download_dailymotion, fmt.url, tmpdir, on_bytes,
-                                                   stop, **route)
+                                                   stop, watch_url=job.source.url, height=fmt.height,
+                                                   **route)
                 except asyncio.CancelledError:
                     stop.set()  # Stops the worker thread at its next progress callback.
                     raise

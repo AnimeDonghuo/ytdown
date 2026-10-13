@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import aiohttp
 import yt_dlp
-from yt_dlp.utils import DownloadCancelled
+from yt_dlp.utils import DownloadCancelled, DownloadError
 
 from .core import public_https_url
 
@@ -36,7 +36,7 @@ class DailymotionError(ValueError):
 @dataclass(frozen=True)
 class DMFormat:
     label: str  # "720p"
-    url: str  # HLS variant playlist (public HTTPS)
+    url: str  # HLS variant playlist or direct MP4 (public HTTPS)
     width: int
     height: int
     bandwidth: int  # Peak bits per second from the manifest; 0 if unknown.
@@ -118,6 +118,86 @@ def proxy_manifest(data: object) -> str:
     return value if public_https_url(value) else ""
 
 
+YTDLP_BASE = {
+    "quiet": True,
+    "no_warnings": True,
+    "noprogress": True,
+    "noplaylist": True,
+    "skip_download": True,
+    "socket_timeout": 30,
+    "retries": 2,
+}
+
+
+def ytdlp_options(proxy: str | None = None, **extra) -> dict:
+    """Options shared by every yt-dlp call this module makes."""
+    options = dict(YTDLP_BASE)
+    options.update(extra)
+    if proxy:
+        options["proxy"] = proxy
+    return options
+
+
+def extract_dailymotion(watch_url: str, proxy: str | None = None) -> DailymotionInfo:
+    """Read the qualities straight from Dailymotion with yt-dlp.
+
+    This is the bypass for a refused Worker playlist: the Worker's copy of the
+    master playlist is signed for *its* address, so a 403 there says nothing
+    about the video. yt-dlp asks Dailymotion itself and gets URLs minted for the
+    address the bot will download from (the pool proxy when proxy mode is on).
+    """
+    try:
+        with yt_dlp.YoutubeDL(ytdlp_options(proxy, noplaylist=True)) as ydl:
+            info = ydl.extract_info(watch_url, download=False)
+    except DownloadError as exc:
+        raise DailymotionError(f"Dailymotion refused this video: {ytdlp_reason(exc)}") from exc
+    except Exception as exc:  # ExtractorError, network problems, bad manifest…
+        raise DailymotionError(f"Could not read this Dailymotion video: {short_reason(exc)}") from exc
+    if not isinstance(info, dict):
+        raise DailymotionError("Dailymotion returned no video information.")
+    formats = info.get("formats") or []
+    best: dict[int, DMFormat] = {}
+    for entry in formats:
+        if not isinstance(entry, dict):
+            continue
+        height = entry.get("height")
+        protocol = str(entry.get("protocol") or "")
+        if not isinstance(height, int) or height <= 0:
+            continue
+        if protocol.startswith("m3u8"):
+            url = entry.get("manifest_url") or entry.get("url")
+        elif protocol in ("http", "https") and (entry.get("ext") or "") == "mp4":
+            url = entry.get("url")
+        else:  # DASH or fragmented formats the remux path does not handle.
+            continue
+        if not public_https_url(url):
+            continue
+        bandwidth = int(entry.get("tbr") or 0) * 1000
+        current = best.get(height)
+        if current is None or bandwidth > current.bandwidth:
+            best[height] = DMFormat(f"{height}p", url, int(entry.get("width") or 0), height, bandwidth)
+    if not best:
+        raise DailymotionError("Dailymotion listed no downloadable qualities.")
+    title = str(info.get("title") or "Dailymotion video").strip()[:200] or "Dailymotion video"
+    duration = info.get("duration")
+    duration = max(0, int(duration)) if isinstance(duration, (int, float)) else 0
+    poster = info.get("thumbnail") if public_https_url(info.get("thumbnail")) else ""
+    formats = tuple(best[h] for h in sorted(best, reverse=True))
+    return DailymotionInfo(title, duration, poster, formats)
+
+
+def ytdlp_reason(exc: Exception) -> str:
+    """The first line of a yt-dlp error, short enough for a chat message."""
+    text = str(exc or "").strip()
+    text = text.splitlines()[0] if text else type(exc).__name__
+    return text[:160] or "no reason given"
+
+
+def short_reason(exc: Exception, limit: int = 120) -> str:
+    text = " ".join(str(exc or "").split()) or type(exc).__name__
+    return text[:limit - 1] + "…" if len(text) > limit else text
+
+
 def ffmpeg_ready() -> bool:
     return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
@@ -145,12 +225,16 @@ class DailymotionInfo:
 
 
 def download_dailymotion(manifest_url: str, out_dir: str, on_bytes, stop: threading.Event,
-                        proxy: str | None = None) -> str:
-    """Blocking yt-dlp download of one HLS variant into out_dir; returns the MP4 path.
+                        proxy: str | None = None, watch_url: str = "", height: int = 0) -> str:
+    """Blocking yt-dlp download of one variant into out_dir; returns the MP4 path.
 
     on_bytes(done, total) is called from the worker thread. Setting `stop` aborts the
-    download at the next progress callback. `proxy` routes the HLS requests through the
+    download at the next progress callback. `proxy` routes the requests through the
     caller's pool proxy (yt-dlp understands http/https/socks proxy URLs).
+
+    Provider URLs expire and are often signed for one address, so when the saved
+    ``manifest_url`` is refused and the caller knows the ``watch_url``, yt-dlp is
+    asked for a fresh copy of the same quality instead of failing the job.
     """
     if not ffmpeg_ready():
         raise DailymotionError("Dailymotion downloads need ffmpeg and ffprobe on this host.")
@@ -178,9 +262,36 @@ def download_dailymotion(manifest_url: str, out_dir: str, on_bytes, stop: thread
     }
     if proxy:
         options["proxy"] = proxy
-    with yt_dlp.YoutubeDL(options) as ydl:
-        ydl.extract_info(manifest_url, download=True)
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.extract_info(manifest_url, download=True)
+    except DownloadCancelled:
+        raise
+    except Exception:
+        if not watch_url:
+            raise
+        # Fresh URLs, same proxy: exactly the route a manual retry would take.
+        retry = ytdlp_options(proxy, format=quality_selector(height), outtmpl=options["outtmpl"],
+                              merge_output_format="mp4", noprogress=True, quiet=True,
+                              no_warnings=True, noplaylist=True, retries=3, fragment_retries=3,
+                              socket_timeout=30, concurrent_fragment_downloads=1,
+                              progress_hooks=[hook])
+        try:
+            with yt_dlp.YoutubeDL(retry) as ydl:
+                ydl.extract_info(watch_url, download=True)
+        except DownloadCancelled:
+            raise
+        except Exception as second:
+            raise DailymotionError(
+                f"Could not download this Dailymotion quality: {short_reason(second)}") from second
     mp4 = [path for path in glob.glob(os.path.join(out_dir, "stream.*")) if path.endswith(".mp4")]
     if not mp4:
         raise DailymotionError("The stream could not be converted to MP4.")
     return mp4[0]
+
+
+def quality_selector(height: int) -> str:
+    """yt-dlp format string for one quality, preferring the exact height."""
+    if height <= 0:
+        return "best"
+    return f"best[height={height}]/best[height<={height}]/best"

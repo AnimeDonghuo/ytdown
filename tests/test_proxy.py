@@ -3,8 +3,10 @@ import asyncio
 import io
 import logging
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -714,7 +716,7 @@ class BotProxyCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool.entries["http://5.6.7.8:9090"].sites,
                          {"dailymotion": False, "rumble": False})
         report = notice.edit.call_args_list[-1].args[0]
-        self.assertIn("Reachable: 1 · no site reached: 1", report)
+        self.assertIn("Reachable: 1 · no service answered: 1", report)
         self.assertIn("Per site: Dailymotion 1 ok · Rumble 1 ok", report)
         self.assertIn("1 live · 0 untested · 1 dead", report)
         self.assertIn("bad-line", report)  # Parse problems are reported back.
@@ -1092,16 +1094,17 @@ class SiteProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         sessions = []
 
         def factory(proxy):
-            session = FakeSession(refused if proxy.url == "http://1.2.3.4:8080" else None)
+            # The first pool proxy the router picks is dead; the next one answers.
+            session = FakeSession(refused if not sessions else None)
             sessions.append((proxy.url, session))
             return session
 
         router = self.service.router_for(7)
         router.session_factory = factory
-        pool._cursor = 0
         info = SimpleNamespace(title="T", duration=60, poster=None, formats=())
 
-        async def fetch(session, url, endpoint):
+        async def fetch(session, url, endpoint, proxy=None):
+            self.assertEqual(proxy, "http://1.2.3.4:8080")  # The lookup's own route.
             async with session.get("https://samra-dailymotion.example/api/info") as response:
                 self.assertEqual(response.status, 204)
             return info
@@ -1110,9 +1113,12 @@ class SiteProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
                            notice=SimpleNamespace(edit=AsyncMock()))
         with patch("ytdown.bot.fetch_dailymotion", new=fetch):
             await self.service.on_link(event)
-        self.assertEqual([url for url, _ in sessions],
-                         ["http://1.2.3.4:8080", "http://5.6.7.8:9090"])
-        self.assertEqual(pool.get(parse_proxy_line("1.2.3.4:8080")).fail_count, 1)
+        # Failover: the refused proxy struck out, the next one served the lookup.
+        self.assertEqual(len(sessions), 2)
+        dead, alive = (parse_proxy_line(url.rsplit("//", 1)[-1]) for url, _ in sessions)
+        self.assertEqual(pool.get(dead).fail_count, 1)
+        self.assertEqual(pool.get(alive).fail_count, 0)
+        self.assertEqual(router.direct_fallbacks, 0)  # No direct traffic while a proxy works.
 
     async def test_dailymotion_download_passes_the_pool_proxy_to_yt_dlp(self):
         from ytdown.core import Source
@@ -1139,7 +1145,10 @@ class SiteProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
              patch("ytdown.bot.ffmpeg_ready", return_value=True), \
              patch("ytdown.bot.thumbnail_jpeg", new=AsyncMock(return_value=None)) as thumb:
             await self.service.run_job(job)
-        self.assertEqual(calls, [{"proxy": "http://1.2.3.4:8080"}])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["proxy"], "http://1.2.3.4:8080")  # Same route as the lookup.
+        self.assertEqual(calls[0]["watch_url"], "https://www.dailymotion.com/video/x7tgad0")
+        self.assertEqual(calls[0]["height"], 720)  # Fresh-URL retry hint for the downloader.
         # The poster thumbnail is fetched through the same pool session.
         self.assertIs(thumb.call_args.args[0], self.service.router_for(7))
 
@@ -1167,9 +1176,291 @@ class SiteProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
              patch("ytdown.bot.ffmpeg_ready", return_value=True), \
              patch("ytdown.bot.thumbnail_jpeg", new=AsyncMock(return_value=None)):
             await self.service.run_job(job)
-        self.assertEqual(calls, [{}])
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("proxy", calls[0])  # Direct: exactly the old yt-dlp options.
 
 
 
+class HangingSession:
+    """Session whose requests never answer, for cancellation tests."""
+
+    def __init__(self):
+        self.closed = False
+        self.requests = []
+
+    def get(self, url, **kwargs):
+        self.requests.append(url)
+        return self
+
+    async def __aenter__(self):
+        await asyncio.Event().wait()  # Never answers.
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def close(self):
+        self.closed = True
+
+
+class ApiProbeTests(unittest.TestCase):
+    """Checks must prove a proxy can use the API the bot really calls."""
+
+    APIS = {"youtube": "https://yt.example.com/", "terabox": "https://tb.example.com/",
+            "dailymotion": "https://dm.example.com/api/info", "rumble": "https://ru.example.com/?k=1"}
+
+    def test_default_keys_become_api_probes(self):
+        targets = resolve_targets(apis=self.APIS)
+        self.assertEqual([target.key for target in targets], ["dailymotion", "rumble"])
+        dm, ru = targets
+        self.assertTrue(dm.json and ru.json)
+        self.assertEqual(dm.label, "Dailymotion API")
+        self.assertEqual(dm.short, "DM")
+        self.assertTrue(dm.url.startswith("https://dm.example.com/api/info?url="))
+        self.assertIn("dailymotion.com%2Fvideo%2Fx7tgad0", dm.url)
+        self.assertTrue(ru.url.startswith("https://ru.example.com/?k=1&url="))  # Existing query kept.
+
+    def test_named_services_keep_the_order_the_user_typed(self):
+        targets = resolve_targets("terabox,youtube", apis=self.APIS)
+        self.assertEqual([target.key for target in targets], ["terabox", "youtube"])
+        self.assertTrue(all(target.json for target in targets))
+
+    def test_site_probe_stays_when_no_api_is_known(self):
+        targets = resolve_targets("rumble", apis={})
+        self.assertEqual(targets[0].key, "rumble")
+        self.assertFalse(targets[0].json)
+        self.assertEqual(urlsplit(targets[0].url).path, "/robots.txt")
+
+    def test_unusable_api_endpoint_keeps_the_site_probe(self):
+        for bad in ("", "http://insecure.example.com/", "https://localhost/", "not a url"):
+            targets = resolve_targets("dailymotion", apis={"dailymotion": bad})
+            self.assertFalse(targets[0].json, bad)
+
+    def test_json_answers_pass_and_html_fails(self):
+        target = resolve_targets(apis=self.APIS)[0]
+        self.assertEqual(site_ok(target, 200, b'{"success":true,"title":"x"}'), (True, ""))
+        self.assertTrue(site_ok(target, 500, b'{"success":false}')[0])  # The API did answer.
+        ok, detail = site_ok(target, 200, b"<html><body>login</body></html>")
+        self.assertFalse(ok)
+        self.assertIn("not a JSON API answer", detail)
+        self.assertEqual(site_ok(target, 500, b"<html>worker error</html>"),
+                         (False, "HTTP 500, not a JSON API answer"))
+        self.assertEqual(site_ok(target, 200, b""), (False, "empty reply (HTTP 200)"))
+        self.assertEqual(site_ok(target, 502, b"{}"), (False, "proxy replied HTTP 502"))
+
+    def test_verdict_separates_api_side_from_proxy_side(self):
+        proxy = parse_proxy_line("1.2.3.4:8080")
+        api_fail = CheckResult(proxy, False, 0, "HTTP 500", (
+            SiteResult("dailymotion", "Dailymotion API", False, 0,
+                       "HTTP 500, not a JSON API answer"),))
+        self.assertEqual(api_fail.verdict, "api")
+        proxy_fail = CheckResult(proxy, False, 0, "connection failed", (
+            SiteResult("dailymotion", "Dailymotion API", False, 0, "connection failed"),))
+        self.assertEqual(proxy_fail.verdict, "proxy")
+        mixed = CheckResult(proxy, False, 0, "", (
+            SiteResult("dailymotion", "Dailymotion API", False, 0, "HTTP 500"),
+            SiteResult("rumble", "Rumble API", False, 0, "timeout")))
+        self.assertEqual(mixed.verdict, "proxy")
+        self.assertEqual(CheckResult(proxy, True, 12, "", ()).verdict, "ok")
+
+    def test_broken_api_does_not_empty_the_pool(self):
+        pool = ProxyPool()
+        proxy = parse_proxy_line("1.2.3.4:8080")
+        pool.add([proxy])
+        pool.mark_checked(CheckResult(proxy, True, 30, "", (
+            SiteResult("dailymotion", "Dailymotion API", True, 30, ""),)))
+        self.assertEqual(pool.entries[proxy.url].status, "alive")
+        # Every proxy fails because the API itself answers 500: stay alive, site marked.
+        pool.mark_checked(CheckResult(proxy, False, 0, "HTTP 500", (
+            SiteResult("dailymotion", "Dailymotion API", False, 0,
+                       "HTTP 500, not a JSON API answer"),)))
+        state = pool.entries[proxy.url]
+        self.assertEqual(state.status, "alive")
+        self.assertIs(state.sites["dailymotion"], False)
+        self.assertFalse(state.reaches("dailymotion"))
+        self.assertTrue(state.reaches("rumble"))  # Unknown site: still a candidate.
+        # A proxy-level failure still marks it dead.
+        pool.mark_checked(CheckResult(proxy, False, 0, "timeout", (
+            SiteResult("dailymotion", "Dailymotion API", False, 0, "timeout"),)))
+        self.assertEqual(pool.entries[proxy.url].status, "dead")
+
+    def test_untested_proxy_stays_untested_after_an_api_side_failure(self):
+        pool = ProxyPool()
+        proxy = parse_proxy_line("1.2.3.4:8080")
+        pool.add([proxy])
+        pool.mark_checked(CheckResult(proxy, False, 0, "HTTP 403", (
+            SiteResult("rumble", "Rumble API", False, 0, "HTTP 403, not a JSON API answer"),)))
+        self.assertEqual(pool.entries[proxy.url].status, "untested")
+        self.assertEqual(pool.candidates(site="rumble"), [])  # Not a candidate for Rumble.
+        self.assertEqual(len(pool.candidates()), 1)  # Still usable elsewhere.
+
+
+class ApiHostRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_requests_to_the_users_own_api_prefer_proxies_checked_for_it(self):
+        pool = ProxyPool()
+        good, other = parse_proxy_line("1.2.3.4:8080"), parse_proxy_line("5.6.7.8:9090")
+        pool.add([good, other])
+        pool.entries[good.url] = replace(pool.entries[good.url], status="alive")
+        pool.entries[other.url] = replace(pool.entries[other.url], status="alive",
+                                          sites={"dailymotion": False})
+        direct = FakeSession()
+        router = ProxyRouter(pool, direct, timeout=aiohttp.ClientTimeout(total=5), headers={},
+                             session_factory=session_factory())
+        router.api_hosts = {"dm.example.com": "dailymotion"}
+        self.assertEqual(router.site_for("https://dm.example.com/api/info?url=x"), "dailymotion")
+        self.assertEqual(router.site_for("https://unknown.example.com/x"), None)
+        self.assertEqual(router.site_for("https://www.dailymotion.com/video/x1"), "dailymotion")
+        async with router.get("https://dm.example.com/api/info") as response:
+            self.assertEqual(response.status, 204)
+        self.assertEqual(direct.requests, [])  # The good pooled proxy served it.
+        await router.close()
+
+    async def test_a_cancelled_request_still_closes_its_one_shot_session(self):
+        """The process must never end up with a session nobody can close."""
+        pool = ProxyPool()
+        pool.add([parse_proxy_line("1.2.3.4:8080"), parse_proxy_line("5.6.7.8:9090")])
+        opened = []
+
+        def factory(proxy):
+            session = HangingSession()
+            opened.append(session)
+            return session
+
+        router = ProxyRouter(pool, FakeSession(), timeout=aiohttp.ClientTimeout(total=5),
+                             headers={}, session_factory=factory, cache_size=1)
+        first = asyncio.create_task(self.hang(router, "https://one.example.com/x"))
+        await asyncio.sleep(0.05)  # Fills the single cache slot and keeps it in use.
+        second = asyncio.create_task(self.hang(router, "https://two.example.com/x"))
+        await asyncio.sleep(0.05)  # Cache busy: this request gets a one-shot session.
+        self.assertEqual(len(opened), 2)
+        second.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await second
+        for _ in range(3):  # The close runs on its own task: give it a tick.
+            await asyncio.sleep(0)
+        self.assertTrue(opened[1].closed)  # One-shot session closed despite the cancel.
+        self.assertEqual(router.open_sessions(), 1)  # The cached one is still tracked.
+        first.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        await router.close()
+        self.assertEqual(router.open_sessions(), 0)
+        self.assertTrue(all(session.closed for session in opened))
+
+    @staticmethod
+    async def hang(router, url="https://dm.example.com/api/info"):
+        async with router.get(url):
+            raise AssertionError("the hanging proxy never answers")
+
+    async def test_a_cancelled_check_closes_its_session(self):
+        sessions = []
+
+        def factory(proxy, **kwargs):
+            session = HangingSession()
+            sessions.append(session)
+            return session
+
+        targets = resolve_targets(apis=ApiProbeTests.APIS)
+        task = asyncio.create_task(check_proxy(parse_proxy_line("1.2.3.4:8080"), targets=targets,
+                                              timeout=5, session_factory=factory))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertTrue(sessions)
+        self.assertTrue(all(session.closed for session in sessions))
+
+
+class ApiCheckBotTests(unittest.IsolatedAsyncioTestCase):
+    """The bot must check the APIs it really calls, per service."""
+
+    def setUp(self):
+        self.client = MagicMock()
+        self.client.send_message = AsyncMock(return_value=SimpleNamespace(id=11))
+        self.client.edit_message = AsyncMock()
+        self.service = DownloaderBot(self.client, MagicMock())
+
+    def event(self, text="", *, uid=7, notice=None):
+        message = SimpleNamespace(document=None, attributes=[])
+        return SimpleNamespace(sender_id=uid, raw_text=text, is_private=True, message=message,
+                               client=self.client,
+                               respond=AsyncMock(return_value=notice or SimpleNamespace(
+                                   edit=AsyncMock(), respond=AsyncMock())),
+                               get_input_chat=AsyncMock(return_value="peer"))
+
+    def test_check_targets_use_the_built_in_apis_by_default(self):
+        from ytdown.bot import DEFAULT_APIS
+        targets = self.service.check_targets_for(7)
+        self.assertEqual([target.key for target in targets], ["dailymotion", "rumble"])
+        for target in targets:
+            self.assertTrue(target.json)
+            self.assertTrue(target.url.startswith(DEFAULT_APIS[target.key]))
+            self.assertIn("url=", target.url)
+
+    def test_check_targets_follow_a_custom_api(self):
+        self.service.set_api(7, "https://mine.example.com/dm/api", "dailymotion")
+        dm = next(target for target in self.service.check_targets_for(7) if target.key == "dailymotion")
+        self.assertTrue(dm.url.startswith("https://mine.example.com/dm/api?url="))
+        self.assertEqual(dm.label, "Dailymotion API")
+        # Routing knows the new host belongs to Dailymotion.
+        self.assertEqual(self.service.router_for(7).api_hosts.get("mine.example.com"), "dailymotion")
+        self.service.set_api(7, "https://mine.example.com/dm/api", "dailymotion")  # Again, before use.
+        self.assertEqual(self.service.api_hosts_for(7)["mine.example.com"], "dailymotion")
+
+    async def test_terabox_and_youtube_can_be_checked_on_request(self):
+        event = self.event("/proxychk sites terabox,youtube")
+        await self.service.on_message(event)
+        self.assertEqual([target.key for target in self.service.proxy_check_targets],
+                         ["terabox", "youtube"])
+        targets = self.service.check_targets_for(7)
+        self.assertEqual([target.key for target in targets], ["terabox", "youtube"])
+        self.assertTrue(all(target.json for target in targets))
+        event = self.event("/proxychk sites nope")
+        await self.service.on_message(event)
+        self.assertIn("terabox", event.respond.call_args.args[0])  # The hint lists every site.
+
+    async def test_proxychk_url_adds_a_probe_beside_the_service_apis(self):
+        from ytdown.bot import DEFAULT_APIS
+        event = self.event("/proxychk url https://mine.example.com/dm/api")
+        await self.service.on_message(event)
+        reply = event.respond.call_args.args[0]
+        self.assertIn("is added to the checks", reply)
+        self.assertIn("Dailymotion API (", reply)  # The service APIs stay in the list.
+        targets = self.service.check_targets_for(7)
+        self.assertEqual([target.key for target in targets], ["dailymotion", "rumble", "custom"])
+        self.assertEqual(targets[-1].url, "https://mine.example.com/dm/api")
+        self.assertTrue(targets[0].url.startswith(DEFAULT_APIS["dailymotion"]))
+        # The compact panel keeps site names, and still shows both are covered.
+        self.service.proxy_state[7] = True
+        panel = self.event("/proxy")
+        await self.service.on_message(panel)
+        self.assertIn("Check sites: Dailymotion + Rumble", panel.respond.call_args.args[0])
+
+    async def test_check_report_keeps_proxies_when_the_api_is_the_problem(self):
+        event = self.event("/proxychk")
+        await self.service.on_message(event)
+        notice = SimpleNamespace(edit=AsyncMock(), respond=AsyncMock())
+        event = self.event("1.2.3.4:8080", notice=notice)
+        seen = {}
+
+        async def fake_run(proxies, **kwargs):
+            seen["targets"] = kwargs["targets"]
+            sites = tuple(SiteResult(target.key, target.label, False, 0,
+                                     "HTTP 500, not a JSON API answer")
+                          for target in kwargs["targets"])
+            result = CheckResult(proxies[0], False, 0, "HTTP 500, not a JSON API answer", sites)
+            await kwargs["on_progress"](1, 1, result)
+            return [result]
+
+        with patch("ytdown.bot.run_checks", new=AsyncMock(side_effect=fake_run)):
+            await self.service.on_message(event)
+            await self.service.proxy_checks[7]
+        self.assertTrue(all(target.json for target in seen["targets"]))
+        report = notice.edit.call_args_list[-1].args[0]
+        self.assertIn("reached the API but got no usable answer", report)
+        self.assertIn("Checked with each service's own API", report)
+        # Every proxy failed for an API-side reason: the pool must not be emptied.
+        self.assertEqual(self.service.pool_for(7).entries["http://1.2.3.4:8080"].status, "untested")
 if __name__ == "__main__":
     unittest.main()

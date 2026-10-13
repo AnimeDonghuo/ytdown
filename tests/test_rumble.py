@@ -109,20 +109,39 @@ class RumbleApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1080p", video.streams)
 
     async def test_permanent_status_is_reported_without_retry_storm(self):
-        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=self.status_error(403))) as api:
+        offline = MagicMock(side_effect=RumbleError("Rumble refused this video: unavailable"))
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=self.status_error(403))) as api, \
+             patch("ytdown.bot.extract_rumble", new=offline):
             with self.assertRaisesRegex(RumbleError, "HTTP 403"):
                 await fetch_rumble(MagicMock(), LINK)
         self.assertEqual(api.await_count, 1)
+        self.assertEqual(offline.call_count, 1)  # The API failure also triggers the fallback.
 
     async def test_persistent_server_error_gives_up_with_status(self):
+        offline = MagicMock(side_effect=RumbleError("Rumble refused this video: gone"))
         with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=self.status_error(500))) as api, \
+             patch("ytdown.bot.extract_rumble", new=offline), \
              patch("ytdown.bot.API_RETRY_DELAYS", [0, 0]):
             with self.assertRaisesRegex(RumbleError, "HTTP 500"):
                 await fetch_rumble(MagicMock(), LINK)
         self.assertEqual(api.await_count, 3)
 
+    async def test_api_failure_falls_back_to_yt_dlp_extraction(self):
+        """The Rumble API answering 500 must not fail the job: read Rumble directly."""
+        from ytdown.core import Video
+        fresh = Video("Straight from Rumble", {"720p": "https://hugh.cdn.rumble.cloud/v.mp4"}, 60, "")
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=self.status_error(500))) as api, \
+             patch("ytdown.bot.extract_rumble", new=MagicMock(return_value=fresh)) as fallback, \
+             patch("ytdown.bot.API_RETRY_DELAYS", [0, 0]):
+            video = await fetch_rumble(MagicMock(), LINK, proxy="http://1.2.3.4:8080")
+        self.assertIs(video, fresh)
+        self.assertEqual(api.await_count, 3)
+        self.assertEqual(fallback.call_args.args, (LINK, "http://1.2.3.4:8080"))
+
     async def test_unreachable_api_is_a_friendly_error(self):
+        offline = MagicMock(side_effect=RumbleError("Rumble refused this video: unavailable"))
         with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=aiohttp.ClientConnectionError())), \
+             patch("ytdown.bot.extract_rumble", new=offline), \
              patch("ytdown.bot.API_RETRY_DELAYS", []):
             with self.assertRaisesRegex(RumbleError, "Could not reach the Rumble API"):
                 await fetch_rumble(MagicMock(), LINK)
@@ -214,6 +233,77 @@ class RumbleBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(send.await_count, 2)
         self.assertEqual(send.await_args.args[3], fresh.streams["720p"])
         self.assertIn("Sent 1", self.service.progress.await_args.args[1])
+
+
+class RumbleExtractionTests(unittest.TestCase):
+    """The Rumble API going down must not stop a job: yt-dlp reads Rumble itself."""
+
+    INFO = {
+        "title": "Playing some Fallout 76",
+        "duration": 10821,
+        "thumbnail": "https://hugh.cdn.rumble.cloud/video/s8/1/w/0/9/K/w09Kr.qR4e-small.jpg",
+        "formats": [
+            {"protocol": "https", "ext": "mp4", "height": 720, "width": 1280, "tbr": 2066.0,
+             "url": "https://hugh.cdn.rumble.cloud/video/s8/2/w/0/9/K/w09Kr.gaa.rec.mp4"},
+            {"protocol": "https", "ext": "mp4", "height": 480, "width": 854, "tbr": 1007.0,
+             "url": "https://hugh.cdn.rumble.cloud/video/s8/2/w/0/9/K/w09Kr.caa.rec.mp4"},
+            {"protocol": "m3u8_native", "ext": "mp4", "height": 1080, "tbr": 4000.0,
+             "manifest_url": "https://hugh.cdn.rumble.cloud/hls/1080.m3u8"},
+            {"protocol": "https", "ext": "mp4", "height": 720, "vcodec": "none", "tbr": 128.0,
+             "url": "https://hugh.cdn.rumble.cloud/audio.mp4"},
+            {"protocol": "https", "ext": "mp4", "height": None, "tbr": 10.0,
+             "url": "https://hugh.cdn.rumble.cloud/unknown.mp4"},
+        ],
+    }
+
+    def factory(self, info=None, error=None):
+        calls = []
+
+        class FakeYDL:
+            def __init__(self, options):
+                calls.append(options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extract_info(self, url, download=False):
+                if error is not None:
+                    raise error
+                return info
+
+        return FakeYDL, calls
+
+    def test_maps_mp4_formats_and_skips_hls(self):
+        from ytdown.rumble import extract_rumble
+        fake, calls = self.factory(info=self.INFO)
+        with patch("yt_dlp.YoutubeDL", new=fake):
+            video = extract_rumble(LINK, proxy="http://1.2.3.4:8080")
+        self.assertEqual(sorted(video.streams), ["480p", "720p"])
+        self.assertTrue(video.streams["720p"].endswith("w09Kr.gaa.rec.mp4"))
+        self.assertEqual(video.title, "Playing some Fallout 76")
+        self.assertEqual(video.duration, 10821)
+        self.assertTrue(video.thumbnail.endswith(".jpg"))
+        self.assertEqual(calls[0]["proxy"], "http://1.2.3.4:8080")
+        self.assertTrue(calls[0]["skip_download"])
+
+    def test_reports_a_yt_dlp_failure_as_a_rumble_error(self):
+        from ytdown.rumble import extract_rumble
+        from yt_dlp.utils import DownloadError
+        fake, _ = self.factory(error=DownloadError("ERROR: [Rumble] v4t3sz8: HTTP Error 403"))
+        with patch("yt_dlp.YoutubeDL", new=fake):
+            with self.assertRaisesRegex(RumbleError, "HTTP Error 403"):
+                extract_rumble(LINK)
+
+    def test_refuses_when_only_unplayable_formats_are_listed(self):
+        from ytdown.rumble import extract_rumble
+        fake, _ = self.factory(info={"title": "t", "formats": [
+            {"protocol": "m3u8_native", "height": 720, "manifest_url": "https://x/hls.m3u8"}]})
+        with patch("yt_dlp.YoutubeDL", new=fake):
+            with self.assertRaisesRegex(RumbleError, "no MP4 downloads"):
+                extract_rumble(LINK)
 
 
 if __name__ == "__main__":

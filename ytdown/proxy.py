@@ -15,10 +15,12 @@ import ipaddress
 import logging
 import re
 import time
+import json
+import weakref
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
-from typing import Awaitable, Callable, Iterable
-from urllib.parse import quote, unquote, urlsplit
+from typing import Awaitable, Callable, Iterable, Mapping
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import aiohttp
 
@@ -39,6 +41,9 @@ class CheckTarget:
     ``nocontent`` marks a probe that answers 200/204 with an empty body
     (``generate_204``); the others read a small text file, so an HTML answer
     means something between the proxy and the site intercepted the request.
+    ``json`` marks a probe of the service's own API: only an answer that parses
+    as JSON proves the proxy can actually use that API, so HTML error pages,
+    login walls and forged replies fail no matter which HTTP status they use.
     """
 
     key: str
@@ -48,6 +53,7 @@ class CheckTarget:
     hosts: tuple[str, ...] = ()
     nocontent: bool = False
     lax: bool = False  # User-supplied URL: accept an empty or plain-text answer.
+    json: bool = False  # Probe of a JSON API the bot really calls.
 
 
 # Default checks: Dailymotion and Rumble only. YouTube stays available through
@@ -57,12 +63,26 @@ DAILYMOTION_TARGET = CheckTarget("dailymotion", "Dailymotion", "DM",
                                  hosts=("dailymotion.com", "dmcdn.net", "dm-event.net"))
 RUMBLE_TARGET = CheckTarget("rumble", "Rumble", "RU", "https://rumble.com/robots.txt",
                             hosts=("rumble.com",))
+# Terabox is selectable but not checked by default; its own probe becomes the
+# Terabox API when the bot knows which endpoint this user's links go through.
+TERABOX_TARGET = CheckTarget("terabox", "Terabox", "TB", "https://www.terabox.com/robots.txt",
+                             hosts=("terabox.com", "1024terabox.com", "teraboxapp.com",
+                                    "teraboxlink.com"))
 YOUTUBE_TARGET = CheckTarget("youtube", "YouTube", "YT", CHECK_URL, nocontent=True,
                              hosts=("youtube.com", "youtu.be", "ytimg.com", "googlevideo.com",
                                     "youtube-nocookie.com", "ggpht.com"))
 CHECK_TARGETS = (DAILYMOTION_TARGET, RUMBLE_TARGET)
 # Every site a check can be pointed at, not just the selected ones.
-KNOWN_TARGETS = (DAILYMOTION_TARGET, RUMBLE_TARGET, YOUTUBE_TARGET)
+KNOWN_TARGETS = (DAILYMOTION_TARGET, RUMBLE_TARGET, YOUTUBE_TARGET, TERABOX_TARGET)
+# A stable public link per service, so the API probe makes the provider do real
+# work instead of answering a bare request with a generic error page.
+API_PROBES = {
+    "youtube": "https://www.youtube.com/watch?v=3SY1i5CB03Q",
+    "terabox": "https://www.terabox.com/s/12345",
+    "dailymotion": "https://www.dailymotion.com/video/x7tgad0",
+    "rumble": "https://rumble.com/v4t3sz8-playing-some-fallout-76-sleep-token-day.html",
+}
+SERVICE_KEYS = ("youtube", "terabox", "dailymotion", "rumble")
 PROXY_ATTEMPTS = 3  # Proxies tried for one request before the direct fallback.
 RETRY_STATUSES = frozenset({407, 502, 503, 504})  # Proxy-level HTTP errors, not the site's.
 MIN_LATENCY_MS = 20  # Replies faster than this mean no real round trip: auto-fail.
@@ -317,6 +337,21 @@ class CheckResult:
     def marks(self) -> dict[str, bool]:
         return {site.key: site.ok for site in self.sites}
 
+    @property
+    def verdict(self) -> str:
+        """``ok``, ``api`` (the API answered but not usable) or ``proxy`` (no answer).
+
+        A check must not throw away a working proxy because the service's API is
+        having a bad day, so an answer that carries a real HTTP status is kept
+        apart from a proxy that never got one.
+        """
+        if self.ok:
+            return "ok"
+        details = [site.detail for site in self.sites if site.detail]
+        if details and all(API_SIDE.fullmatch(detail) for detail in details):
+            return "api"
+        return "proxy"
+
     def site_line(self) -> str:
         return " · ".join(f"{site.label} {'ok' if site.ok else site.detail or 'failed'}"
                           for site in self.sites)
@@ -331,6 +366,9 @@ class CheckStats:
     working: int  # Proxies that reached at least one site.
     sites: dict[str, int] = field(default_factory=dict)  # target key -> working proxies
 
+
+# "HTTP 500", "HTTP 403, not a JSON API answer": the API answered, badly.
+API_SIDE = re.compile(r"HTTP \d{3}(?:, .*)?")
 
 # Wording yt-dlp uses when the host/proxy, not the video, is the problem.
 NETWORK_HINTS = ("unable to download webpage", "timed out", "timeout", "connection", "connect",
@@ -442,15 +480,27 @@ class ProxyPool:
         return None
 
     def mark_checked(self, result: CheckResult) -> None:
-        """Apply a health check: per-site results, alive/dead status and latency."""
+        """Apply a health check: per-site results, alive/dead status and latency.
+
+        A proxy that got no usable answer because the *service* answered badly
+        (``verdict == "api"``, e.g. HTTP 500 from the provider's own API) keeps
+        the status it had: only a proxy-level failure marks one dead, so a
+        broken API cannot empty the pool. Its per-site marks are still recorded,
+        so routing for that site prefers proxies that did work.
+        """
         state = self.entries.get(result.proxy.url)
         if state is None:
             return
         sites = dict(state.sites)
         sites.update(result.marks())
+        if result.ok:
+            status = "alive"
+        elif result.verdict == "api":
+            status = state.status
+        else:
+            status = "dead"
         self.entries[result.proxy.url] = ProxyState(
-            result.proxy, "alive" if result.ok else "dead",
-            state.ok_count + (1 if result.ok else 0), 0,
+            result.proxy, status, state.ok_count + (1 if result.ok else 0), 0,
             result.latency_ms, result.detail, time.monotonic(), sites)
 
     def summary(self) -> str:
@@ -465,18 +515,50 @@ class ProxyPool:
         return line
 
 
-def resolve_targets(keys: str = "", url: str = "") -> tuple[CheckTarget, ...]:
-    """Pick which sites to check; an empty ``keys`` keeps the Dailymotion + Rumble default."""
+def resolve_targets(keys: str = "", url: str = "", apis: Mapping[str, str] | None = None
+                    ) -> tuple[CheckTarget, ...]:
+    """Pick which sites to check; an empty ``keys`` keeps the Dailymotion + Rumble default.
+
+    ``apis`` maps a service to the API endpoint the bot uses for it (built-in or
+    the user's own): each named service is then probed through *that* API, so a
+    proxy only passes when it can really use the API rather than fetch a page.
+    """
     parts = [piece.lower() for piece in re.split(r"[,;\s]+", keys or "") if piece]
-    if not parts:
-        return with_url(CHECK_TARGETS, url)
-    # Keep the order the user typed, ignoring names we do not know.
     chosen: dict[str, CheckTarget] = {}
-    for part in parts:
-        target = next((item for item in KNOWN_TARGETS if item.key == part), None)
-        if target is not None and target.key not in chosen:
-            chosen[target.key] = target
-    return with_url(tuple(chosen.values()) or CHECK_TARGETS, url)
+    if parts:
+        # Keep the order the user typed, ignoring names we do not know.
+        for part in parts:
+            target = next((item for item in KNOWN_TARGETS if item.key == part), None)
+            if target is not None and target.key not in chosen:
+                chosen[target.key] = target
+    if not chosen:
+        chosen = {target.key: target for target in CHECK_TARGETS}
+    targets = tuple(api_target(target, (apis or {}).get(target.key, "")) for target in chosen.values())
+    return with_url(targets, url)
+
+
+def api_probe_url(endpoint: str, key: str) -> str:
+    """The API endpoint with a real lookup attached, e.g. ...?url=<video link>."""
+    probe = API_PROBES.get(key)
+    if not probe:
+        return endpoint
+    return f"{endpoint}{'&' if '?' in endpoint else '?'}{urlencode({'url': probe})}"
+
+
+def api_target(target: CheckTarget, endpoint: str) -> CheckTarget:
+    """Turn a site probe into an API probe for this service, or keep it as it is."""
+    if not public_api_url(endpoint):
+        return target
+    return replace(target, label=f"{target.label} API", url=api_probe_url(endpoint, target.key),
+                   json=True, nocontent=False, lax=False)
+
+
+def public_api_url(url: object) -> bool:
+    """True for a public HTTPS endpoint we may hand to a check."""
+    if not isinstance(url, str) or not url:
+        return False
+    parts = urlsplit(url)
+    return parts.scheme == "https" and bool(parts.hostname) and "." in (parts.hostname or "")
 
 
 def with_url(targets, url: str) -> tuple[CheckTarget, ...]:
@@ -581,14 +663,33 @@ def request_kwargs(proxy: Proxy) -> dict:
     return {} if proxy.socks else {"proxy": proxy.url}
 
 
+def looks_like_json(body: bytes) -> bool:
+    """True when the body is a JSON object/array, the shape these APIs answer with."""
+    stripped = body.lstrip(b" \t\r\n")
+    if not stripped[:1] in (b"{", b"["):
+        return False
+    try:
+        json.loads(stripped.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return True
+
+
 def site_ok(target: CheckTarget, status: int, body: bytes) -> tuple[bool, str]:
     """Decide whether an HTTP answer proves this proxy reached this site.
 
     A short, plain-text answer counts as site content; HTML is how captive
-    portals and login walls reply, so it never passes.
+    portals and login walls reply, so it never passes. An API probe is stricter:
+    only a JSON answer counts, whatever the status code says.
     """
     if status in RETRY_STATUSES:
         return False, f"proxy replied HTTP {status}"
+    if target.json:
+        if looks_like_json(body):
+            return True, ""  # The API itself answered, even if it reported an error.
+        if not body:
+            return False, f"empty reply (HTTP {status})"
+        return False, f"HTTP {status}, not a JSON API answer"
     if status in (301, 302, 303, 307, 308):
         return True, ""  # The site answered with a redirect.
     if status == 404:
@@ -654,19 +755,56 @@ async def check_proxy(proxy: Proxy, *, targets: tuple[CheckTarget, ...] = CHECK_
         results = [SiteResult(target.key, target.label, False, 0, reason) for target in chosen]
     else:
         try:
-            async with session:
-                for target in chosen:
-                    results.append(await probe_site(session, proxy, target, timeout,
-                                                    min_latency_ms))
+            for target in chosen:
+                results.append(await probe_site(session, proxy, target, timeout, min_latency_ms))
         except CONNECTION_ERRORS as exc:
             results.extend(SiteResult(target.key, target.label, False, 0, describe_error(exc))
                            for target in chosen[len(results):])
+        finally:
+            # A cancelled check must still close its session, or the process
+            # later reports an unclosed client session.
+            await close_session(session)
     answered = [site for site in results if site.ok]
     detail = next((site.detail for site in results if not site.ok and site.detail), "")
     return CheckResult(proxy, bool(answered),
                        min((site.latency_ms for site in answered), default=0),
                        detail or ("" if answered else "no site answered"),
                        tuple(results))
+
+
+_CLOSERS: set[asyncio.Task] = set()  # Keeps background closes alive until they finish.
+
+
+async def close_session(session: aiohttp.ClientSession) -> None:
+    """Close a session even when the calling task is being cancelled.
+
+    A cancelled task cannot await anything, so a plain ``await session.close()``
+    in a ``finally`` can be skipped entirely — which is how aiohttp sessions end
+    up being garbage-collected open ("Unclosed client session"). The close runs
+    in its own task behind a shield, so cancelling the caller cannot stop it.
+    """
+    try:
+        await asyncio.shield(_close_quietly(session))
+    except asyncio.CancelledError:  # The close itself keeps running.
+        raise
+
+
+async def _close_quietly(session: aiohttp.ClientSession) -> None:
+    try:
+        await session.close()
+    except Exception:  # pragma: no cover - closing must never raise.
+        LOG.info("Could not close a proxy session", exc_info=True)
+
+
+def close_soon(session: aiohttp.ClientSession) -> None:
+    """Schedule a close from synchronous code (leases released while cancelled)."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:  # pragma: no cover - no loop, nothing to close on.
+        return
+    task = loop.create_task(_close_quietly(session))
+    _CLOSERS.add(task)
+    task.add_done_callback(_CLOSERS.discard)
 
 
 @dataclass
@@ -695,8 +833,9 @@ class RoutedRequest:
     async def __aenter__(self):
         router = self.router
         last_error: BaseException | None = None
-        # Skip proxies already known to be blocked for this specific site.
-        site = target_for(self.url)
+        # Skip proxies already known to be blocked for this specific site,
+        # including the user's own API hosts (see ProxyRouter.site_for).
+        site = router.site_for(self.url)
         for state in router.pool.candidates(site=site):
             lease = None
             started = time.monotonic()
@@ -712,21 +851,25 @@ class RoutedRequest:
                 cm = lease.session.get(self.url, **request_kwargs(state.proxy), **self.kwargs)
                 response = await cm.__aenter__()
             except CONNECTION_ERRORS as exc:
-                await router.release(lease)
+                router.release(lease)
                 detail = describe_error(exc)
                 last_error = exc
                 router.note_failure(state, detail)
                 continue
             except BaseException:
-                await router.release(lease)
+                router.release(lease)
                 raise
             if response.status in RETRY_STATUSES:
-                # A proxy-level error page, not the site's own answer.
+                # A proxy-level error page, not the site's own answer. Closing the
+                # response first keeps the connection from being reused.
                 detail = f"proxy replied HTTP {response.status}"
                 last_error = aiohttp.ClientResponseError(response.request_info, response.history,
                                                          status=response.status, message=detail)
-                await cm.__aexit__(None, None, None)
-                await router.release(lease)
+                try:
+                    await cm.__aexit__(None, None, None)
+                except BaseException:
+                    pass
+                router.release(lease)
                 router.note_failure(state, detail)
                 continue
             router.pool.record_success(state.proxy, int((time.monotonic() - started) * 1000))
@@ -737,13 +880,17 @@ class RoutedRequest:
         return await fallback.__aenter__()
 
     async def __aexit__(self, exc_type, exc, traceback) -> None:
+        lease, self._lease = self._lease, None
+        cm, self._cm = self._cm, None
         try:
-            if self._cm is not None:
-                await self._cm.__aexit__(exc_type, exc, traceback)
-        finally:
-            if self._lease is not None:
-                lease, self._lease = self._lease, None
-                await self.router.release(lease)
+            if cm is not None:
+                await cm.__aexit__(exc_type, exc, traceback)
+        except BaseException:
+            if lease is not None:  # Never leave a temporary session open.
+                self.router.release(lease)
+            raise
+        if lease is not None:
+            self.router.release(lease)  # Synchronous: a cancelled task cannot skip it.
 
 
 class ProxyRouter:
@@ -771,8 +918,29 @@ class ProxyRouter:
             lambda proxy: make_session(proxy, timeout=timeout, headers=headers))
         self.dropped: deque[str] = deque(maxlen=5)
         self.direct_fallbacks = 0
+        # API host -> service key, so a request to the user's own API endpoint
+        # prefers proxies the check proved for that service.
+        self.api_hosts: dict[str, str] = {}
         self._sessions: "OrderedDict[str, _CacheEntry]" = OrderedDict()
+        self._open: "weakref.WeakSet[aiohttp.ClientSession]" = weakref.WeakSet()
         self._lock = asyncio.Lock()
+
+    def site_for(self, url: str) -> str | None:
+        """Which service a URL belongs to, for known sites and configured APIs."""
+        site = target_for(url)
+        if site is not None:
+            return site
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        if not host:
+            return None
+        for known, key in self.api_hosts.items():
+            if host == known or host.endswith("." + known):
+                return key
+        return None
+
+    def open_sessions(self) -> int:
+        """Routed sessions that are still open (for status and tests)."""
+        return sum(1 for session in self._open if not session.closed)
 
     # -- request routing -------------------------------------------------
     def get(self, url: str, **kwargs) -> RoutedRequest:
@@ -830,39 +998,42 @@ class ProxyRouter:
                 return _Lease(entry.session, proxy.url)
             if len(self._sessions) >= self.cache_size:
                 idle = next((key for key, item in self._sessions.items() if not item.uses), None)
-                if idle is None:
-                    return _Lease(self.session_factory(proxy), temporary=True)
+                if idle is None:  # Every cached proxy is busy: use a one-shot session.
+                    session = self.session_factory(proxy)
+                    self._open.add(session)
+                    return _Lease(session, temporary=True)
                 evicted = self._sessions.pop(idle)
             session = self.session_factory(proxy)
+            self._open.add(session)
             self._sessions[proxy.url] = _CacheEntry(session, 1)
             lease = _Lease(session, proxy.url)
         if evicted is not None:
-            await self._close(evicted.session)
+            await close_session(evicted.session)
         return lease
 
-    async def release(self, lease: _Lease) -> None:
+    def release(self, lease: _Lease) -> None:
+        """Return a lease. Synchronous on purpose: it must also run while the
+        calling task is being cancelled, when awaiting is not possible."""
         if lease.temporary:
-            await self._close(lease.session)
+            close_soon(lease.session)
             return
-        async with self._lock:
-            entry = self._sessions.get(lease.key)
-            if entry is not None:
-                entry.uses = max(0, entry.uses - 1)
-                self._sessions.move_to_end(lease.key)
+        entry = self._sessions.get(lease.key)
+        if entry is not None:
+            entry.uses = max(0, entry.uses - 1)
+            self._sessions.move_to_end(lease.key)
 
     async def close(self) -> None:
+        """Close every routed session, cached or otherwise.
+
+        Tracking every session the router created means a lease that was dropped
+        by a cancelled request is still closed here instead of leaking.
+        """
         async with self._lock:
             sessions = [entry.session for entry in self._sessions.values()]
             self._sessions.clear()
+            sessions.extend(session for session in self._open if session not in sessions)
         for session in sessions:
-            await self._close(session)
-
-    @staticmethod
-    async def _close(session: aiohttp.ClientSession) -> None:
-        try:
-            await session.close()
-        except Exception:  # pragma: no cover - closing must never raise.
-            LOG.info("Could not close a proxy session", exc_info=True)
+            await close_session(session)
 
     # -- reporting -------------------------------------------------------
     def describe(self) -> str:
@@ -882,6 +1053,16 @@ class ProxyRouter:
         if self.direct_fallbacks:
             text += f" · {self.direct_fallbacks} direct fallback(s)"
         return text
+
+
+def check_verdict(results: Iterable[CheckResult]) -> str:
+    """``api`` when nothing failed for a proxy-level reason, else ``mixed``/``proxy``."""
+    verdicts = {result.verdict for result in results}
+    if verdicts == {"api"}:
+        return "api"
+    if verdicts == {"proxy"}:
+        return "proxy"
+    return "mixed"
 
 
 async def run_checks(proxies: list[Proxy], *, targets: tuple[CheckTarget, ...] = CHECK_TARGETS,
