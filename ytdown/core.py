@@ -35,19 +35,22 @@ class PlaylistEntry:
     position: int = 0  # Original playlist index, including skipped/private entries.
 
 
-def _playlist_options(**overrides):
-    return {
+def _playlist_options(proxy: str | None = None, **overrides):
+    options = {
         "extract_flat": "in_playlist", "skip_download": True, "quiet": True,
         "no_warnings": True, "ignoreerrors": True,
         "socket_timeout": 20, "retries": 1, "extractor_retries": 1,
         **overrides,
     }
+    if proxy:  # yt-dlp talks to YouTube itself; route it through the user's proxy.
+        options["proxy"] = proxy
+    return options
 
 
-def playlist_count(url: str, max_scan: int = 5000) -> int:
+def playlist_count(url: str, max_scan: int = 5000, proxy: str | None = None) -> int:
     """Count public playlist entries without resolving/downloading video formats."""
     try:
-        with yt_dlp.YoutubeDL(_playlist_options(lazy_playlist=True)) as ydl:
+        with yt_dlp.YoutubeDL(_playlist_options(proxy, lazy_playlist=True)) as ydl:
             info = ydl.extract_info(url, download=False)
             if not info:
                 raise ValueError("Could not read this public playlist.")
@@ -174,27 +177,30 @@ def normalize_video(payload: object) -> Video:
     return Video(title, streams, duration, thumbnail if public_https_url(thumbnail) else "")
 
 
-def extract_title(url: str) -> str:
+def extract_title(url: str, proxy: str | None = None) -> str:
     """Backup YouTube metadata lookup if oEmbed is unavailable; run in a thread."""
     opts = {
         "skip_download": True, "noplaylist": True, "quiet": True, "no_warnings": True,
         "socket_timeout": 10, "retries": 0, "extractor_retries": 0,
     }
+    if proxy:
+        opts["proxy"] = proxy
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     return youtube_title(info.get("title") if info else None, url.rsplit("=", 1)[-1])
 
 
-def extract_playlist(url: str, limit: int) -> list[PlaylistEntry]:
+def extract_playlist(url: str, limit: int, proxy: str | None = None) -> list[PlaylistEntry]:
     """Compatibility helper: first N flat playlist entries."""
-    return _extract_playlist(url, _playlist_options(playlistend=limit), limit)
+    return _extract_playlist(url, _playlist_options(proxy, playlistend=limit), limit)
 
 
-def extract_playlist_range(url: str, start: int, end: int) -> list[PlaylistEntry]:
+def extract_playlist_range(url: str, start: int, end: int,
+                           proxy: str | None = None) -> list[PlaylistEntry]:
     """Fetch only an inclusive 1-indexed range (not all preceding formats)."""
     if start < 1 or end < start or end - start + 1 > 150:
         raise ValueError("Invalid playlist range (maximum 150 videos per job).")
-    return _extract_playlist(url, _playlist_options(playliststart=start, playlistend=end),
+    return _extract_playlist(url, _playlist_options(proxy, playliststart=start, playlistend=end),
                              end - start + 1, unique=False)
 
 

@@ -32,6 +32,8 @@ from .terabox import (TERABOX_API_URL, TeraboxFile, TeraboxListing, normalize_te
                       parse_terabox_source)
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg
+from .proxy import (CHECK_URL, MAX_PROXIES, CheckResult, Proxy, ProxyPool, ProxyRouter,
+                    parse_proxies, proxy_fault, run_checks, short_reason)
 
 LOG = logging.getLogger(__name__)
 API_URL = "https://samra-youtube-api.antideploy.com/"
@@ -50,6 +52,11 @@ MAX_RANGE_VIDEOS = 150
 MAX_DISCOVER = 5000
 MAX_DASHBOARDS = 100
 MAX_COMPLETED_USERS = 200
+PROXY_POOL_MAX = 5000  # Proxies kept per user (from /proxychk or PROXY_LIST).
+PROXY_CHECK_MAX = 5000  # Proxies checked per /proxychk message or file.
+PROXY_FILE_MAX = 2 * 1024 * 1024  # Uploaded proxy lists: bound the download.
+PROXY_INLINE_LIST = 20  # More working proxies than this are sent as a .txt file.
+PROXY_PROGRESS_SECONDS = 4  # Progress edits during a long pool check.
 
 
 class PublicResolver(aiohttp.abc.AbstractResolver):
@@ -74,6 +81,13 @@ def env_int(name: str, default: int, low: int, high: int) -> int:
         return max(low, min(high, int(os.getenv(name, str(default)))))
     except ValueError:
         return default
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 class FileTooLarge(Exception):
@@ -239,7 +253,7 @@ async def fetch_terabox(session: aiohttp.ClientSession, url: str) -> TeraboxList
     return normalize_terabox(await fetch_json_api(session, TERABOX_API_URL, url, 4_000_000))
 
 
-async def get_youtube_title(session: aiohttp.ClientSession, url: str) -> str:
+async def get_youtube_title(session, url: str, proxy: str | None = None) -> str:
     """YouTube title first; caller uses the API title if metadata is unavailable."""
     video_id = url.rsplit("=", 1)[-1]
     try:
@@ -254,7 +268,7 @@ async def get_youtube_title(session: aiohttp.ClientSession, url: str) -> str:
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, AttributeError) as exc:
         LOG.info("YouTube oEmbed lookup failed for %s: %s", video_id, exc)
     try:
-        return await asyncio.wait_for(asyncio.to_thread(extract_title, url), timeout=35) or ""
+        return await asyncio.wait_for(asyncio.to_thread(extract_title, url, proxy), timeout=35) or ""
     except Exception as exc:
         LOG.warning("YouTube metadata lookup failed for %s: %s", video_id, exc)
     return ""
@@ -404,9 +418,12 @@ Pipelines bounded saveBigFilePart/saveFilePart requests from the HTTP stream,
 
 
 class DownloaderBot:
-    def __init__(self, client: TelegramClient, session: aiohttp.ClientSession):
+    def __init__(self, client: TelegramClient, session: aiohttp.ClientSession, *,
+                 timeout: aiohttp.ClientTimeout | None = None, headers: dict | None = None):
         self.client = client
         self.http = session
+        self.timeout = timeout or aiohttp.ClientTimeout(total=240, connect=20)
+        self.headers = headers or {"User-Agent": "ytdown-telegram-bot/1.0"}
         self.selections: dict[int, Selection] = {}
         self.lookups: dict[int, asyncio.Task] = {}
         self.jobs: dict[str, Job] = {}
@@ -425,6 +442,23 @@ class DownloaderBot:
         self.playlist_limit = env_int("MAX_RANGE_VIDEOS", MAX_RANGE_VIDEOS, 1, MAX_RANGE_VIDEOS)
         self.in_flight = env_int("UPLOAD_IN_FLIGHT", 2, 1, 3)
         self.metrics = ContainerMetrics()
+        # Proxy pools are per user: each user brings (and checks) their own list.
+        self.pools: dict[int, ProxyPool] = {}
+        self.routers: dict[int, ProxyRouter] = {}
+        self.proxy_state: dict[int, bool] = {}
+        self.proxy_tokens: dict[int, str] = {}
+        self.awaiting_proxy: set[int] = set()
+        self.proxy_checks: dict[int, asyncio.Task] = {}
+        self.proxy_default_on = env_flag("PROXY_ENABLED", False)
+        self.proxy_strict = env_flag("PROXY_STRICT", False)
+        self.proxy_pool_max = env_int("PROXY_POOL_MAX", PROXY_POOL_MAX, 1, MAX_PROXIES)
+        self.proxy_check_max = env_int("PROXY_CHECK_MAX", PROXY_CHECK_MAX, 1, MAX_PROXIES)
+        self.proxy_workers = env_int("PROXY_CHECK_WORKERS", 24, 1, 100)
+        self.proxy_timeout = float(env_int("PROXY_CHECK_TIMEOUT", 8, 2, 60))
+        self.proxy_fail_limit = env_int("PROXY_FAIL_LIMIT", 2, 1, 10)
+        check_url = os.getenv("PROXY_CHECK_URL", "").strip()
+        self.proxy_check_url = check_url if public_https_url(check_url) else CHECK_URL
+        self.proxy_seed = parse_proxies(os.getenv("PROXY_LIST", ""), MAX_PROXIES)[0]
 
     def user_jobs(self, uid: int) -> list[Job]:
         return [job for job in self.jobs.values() if job.user_id == uid]
@@ -438,9 +472,307 @@ class DownloaderBot:
         self.awaiting_api.discard(uid)
         return endpoint
 
+    # -- proxy pool ------------------------------------------------------
+    def pool_for(self, uid: int) -> ProxyPool:
+        """This user's pool, seeded once from the PROXY_LIST environment value."""
+        pool = self.pools.get(uid)
+        if pool is None:
+            pool = ProxyPool(self.proxy_pool_max, self.proxy_fail_limit)
+            if self.proxy_seed:
+                pool.add(self.proxy_seed)
+            self.pools[uid] = pool
+        return pool
+
+    def proxy_enabled(self, uid: int) -> bool:
+        return self.proxy_state.get(uid, self.proxy_default_on)
+
+    def router_for(self, uid: int) -> ProxyRouter:
+        router = self.routers.get(uid)
+        if router is None:
+            router = ProxyRouter(self.pool_for(uid), self.http, timeout=self.timeout,
+                                 headers=self.headers, strict=self.proxy_strict,
+                                 on_drop=lambda state, detail: LOG.warning(
+                                     "User %s lost proxy %s: %s", uid, state.proxy.label, detail))
+            self.routers[uid] = router
+        return router
+
+    def http_for(self, uid: int):
+        """Session used for this user's provider traffic (the router when proxy mode is on)."""
+        return self.router_for(uid) if self.proxy_enabled(uid) else self.http
+
+    def proxy_for(self, uid: int) -> Proxy | None:
+        """One live proxy for callers that need a URL (yt-dlp), or None for direct."""
+        if not self.proxy_enabled(uid):
+            return None
+        return self.router_for(uid).next_proxy()
+
+    async def youtube_task(self, uid: int, func, *args):
+        """Run a blocking yt-dlp helper, moving on when its proxy is unusable."""
+        for attempt in range(3):
+            proxy = self.proxy_for(uid)
+            try:
+                return await asyncio.to_thread(func, *args, proxy=proxy.url if proxy else None)
+            except Exception as exc:
+                router = self.routers.get(uid)
+                if proxy is None or router is None or attempt == 2 or not proxy_fault(exc):
+                    raise
+                dropped = router.note_failure_url(proxy.url, short_reason(exc))
+                LOG.warning("%s failed through %s: %s%s", getattr(func, "__name__", "yt-dlp"),
+                            proxy.label, short_reason(exc),
+                            " (proxy removed)" if dropped else "")
+        raise ValueError("The link provider could not be reached.")
+
+    async def close_router(self, uid: int) -> None:
+        router = self.routers.pop(uid, None)
+        if router is not None:
+            await router.close()
+
+    async def close(self) -> None:
+        """Cancel proxy checks and release every routed session."""
+        checks = [task for task in self.proxy_checks.values() if task]
+        for task in checks:
+            task.cancel()
+        await asyncio.gather(*checks, return_exceptions=True)
+        self.proxy_checks.clear()
+        for router in list(self.routers.values()):
+            await router.close()
+        self.routers.clear()
+
+    def proxy_line(self, uid: int) -> str:
+        if not self.proxy_enabled(uid):
+            return ""
+        return f"\n🌐 Proxy: {self.router_for(uid).describe()}"
+
+    def proxy_status_text(self, uid: int) -> str:
+        pool = self.pool_for(uid)
+        on = self.proxy_enabled(uid)
+        lines = [f"🌐 Proxy mode: {'ON' if on else 'OFF'}", pool.summary()]
+        if on:
+            router = self.router_for(uid)
+            lines.append(f"Route: {router.describe()}")
+            live = sorted(pool.live(), key=lambda state: state.latency_ms or 10 ** 6)[:10]
+            if live:
+                lines.append("Live now: " + ", ".join(
+                    f"{state.proxy.label}" + (f" ({state.latency_ms} ms)" if state.latency_ms else "")
+                    for state in live) + (f" … +{len(pool.live()) - len(live)} more"
+                                          if len(pool.live()) > len(live) else ""))
+            if router.dropped:
+                lines.append("Recently removed: " + "; ".join(list(router.dropped)[-3:]))
+            lines.append("Fallback: " + ("none (strict: requests fail without a proxy)"
+                                         if self.proxy_strict else
+                                         "a direct connection when no proxy is usable"))
+        else:
+            lines.append("Requests go direct while proxy mode is off.")
+        lines.append("Re-check or add proxies with /proxychk.")
+        return "\n".join(lines)
+
+    def proxy_buttons(self, uid: int):
+        token = self.proxy_tokens[uid]
+        on = self.proxy_enabled(uid)
+        return [[Button.inline(("✅ " if on else "▫️ ") + "ON", data=f"p:{token}:on".encode()),
+                 Button.inline(("✅ " if not on else "▫️ ") + "OFF", data=f"p:{token}:off".encode())],
+                [Button.inline("🔄 Re-check pool", data=f"p:{token}:recheck".encode()),
+                 Button.inline("📊 Pool status", data=f"p:{token}:status".encode())],
+                [Button.inline("🧹 Remove dead", data=f"p:{token}:purge".encode()),
+                 Button.inline("🗑 Clear pool", data=f"p:{token}:clear".encode())]]
+
+    async def show_proxy_panel(self, event) -> None:
+        uid = event.sender_id
+        self.proxy_tokens[uid] = secrets.token_hex(4)
+        await event.respond(self.proxy_status_text(uid), parse_mode=None,
+                            buttons=self.proxy_buttons(uid))
+
+    async def edit_proxy_panel(self, event, uid: int, text: str) -> None:
+        try:
+            await event.edit(text, parse_mode=None, buttons=self.proxy_buttons(uid))
+        except Exception:
+            LOG.warning("Could not update the proxy panel", exc_info=True)
+
+    async def proxy_action(self, event, uid: int, action: str) -> None:
+        if action == "on":
+            self.proxy_state[uid] = True
+            pool = self.pool_for(uid)
+            await event.answer("Proxy mode is ON")
+            notice = "" if len(pool) else "\nThe pool is empty — add proxies with /proxychk."
+            await self.edit_proxy_panel(event, uid, self.proxy_status_text(uid) + notice)
+        elif action == "off":
+            self.proxy_state[uid] = False
+            await self.close_router(uid)
+            await event.answer("Proxy mode is OFF")
+            await self.edit_proxy_panel(event, uid, self.proxy_status_text(uid))
+        elif action == "status":
+            await event.answer()
+            await self.edit_proxy_panel(event, uid, self.proxy_status_text(uid))
+        elif action == "purge":
+            removed = self.pool_for(uid).purge_dead()
+            await event.answer(f"Removed {removed} dead proxies")
+            await self.edit_proxy_panel(event, uid, self.proxy_status_text(uid))
+        elif action == "clear":
+            count = len(self.pool_for(uid))
+            self.pool_for(uid).clear()
+            self.proxy_state[uid] = False
+            await self.close_router(uid)
+            await event.answer(f"Cleared {count} proxies")
+            await self.edit_proxy_panel(event, uid, self.proxy_status_text(uid))
+        elif action == "recheck":
+            if uid in self.proxy_checks:
+                await event.answer("A proxy check is already running.", alert=True)
+                return
+            proxies = [state.proxy for state in self.pool_for(uid).entries.values()]
+            if not proxies:
+                await event.answer("The pool is empty. Use /proxychk to add proxies.", alert=True)
+                return
+            await event.answer(f"Checking {len(proxies)} proxies…")
+            self.start_proxy_check(uid, proxies,
+                                   edit=lambda text: self.edit_proxy_panel(event, uid, text))
+        else:
+            await event.answer("Unknown proxy action.", alert=True)
+
+    async def edit_text(self, edit, text: str) -> None:
+        """Progress edits are best-effort: a Telegram hiccup must not stop a check."""
+        try:
+            await edit(text)
+        except Exception:
+            LOG.warning("Could not edit a proxy progress message", exc_info=True)
+
+    def start_proxy_check(self, uid: int, proxies: list[Proxy], *, edit, notice=None,
+                          notes: list[str] | None = None) -> None:
+        task = asyncio.create_task(self.run_proxy_check(uid, proxies, edit=edit, notice=notice,
+                                                        notes=notes or []))
+        self.proxy_checks[uid] = task
+
+        def finished(done: asyncio.Task) -> None:
+            if self.proxy_checks.get(uid) is done:
+                self.proxy_checks.pop(uid, None)
+            if not done.cancelled() and done.exception() is not None:
+                LOG.error("Proxy check failed", exc_info=done.exception())
+
+        task.add_done_callback(finished)
+
+    async def run_proxy_check(self, uid: int, proxies: list[Proxy], *, edit, notice=None,
+                              notes: list[str]) -> None:
+        """Check every proxy with bounded concurrency and report what still works."""
+        pool = self.pool_for(uid)
+        added = pool.add(proxies)
+        started, finished = time.monotonic(), 0
+        working = 0
+        next_edit = started
+        host = urlsplit(self.proxy_check_url).hostname or "the test URL"
+        await self.edit_text(edit, f"🔎 Checking {len(proxies)} proxies against {host}…")
+
+        async def on_progress(count: int, total: int, result: CheckResult) -> None:
+            nonlocal next_edit, finished, working
+            finished = count
+            working += 1 if result.ok else 0
+            pool.mark_checked(result)  # Saved as it goes, so /cancel keeps the results.
+            now = time.monotonic()
+            if now >= next_edit or count == total:
+                next_edit = now + PROXY_PROGRESS_SECONDS
+                await self.edit_text(edit, f"🔎 Checking {total} proxies against {host}… "
+                                           f"{count}/{total} done · {working} working")
+
+        try:
+            results = await run_checks(proxies, url=self.proxy_check_url, timeout=self.proxy_timeout,
+                                       workers=self.proxy_workers, on_progress=on_progress)
+        except asyncio.CancelledError:
+            pool.last_check = (time.monotonic(), working, finished)
+            await self.edit_text(edit, f"Proxy check cancelled after {finished}/{len(proxies)} "
+                                       f"({working} working).\n" + pool.summary())
+            raise
+        pool.last_check = (time.monotonic(), working, len(results))
+        live = [result for result in results if result.ok]
+        lines = [f"✅ Checked {len(results)} proxies in {human_eta(time.monotonic() - started)}",
+                 f"Working: {working} · dead: {len(results) - working}",
+                 pool.summary()]
+        if added.overflow:
+            lines.append(f"Pool limit is {pool.limit}, so {added.overflow} proxies were not stored.")
+        if added.duplicates:
+            lines.append(f"{added.duplicates} were already in the pool.")
+        lines.extend(notes[:3])
+        if live:
+            fastest = sorted(live, key=lambda item: item.latency_ms)
+            if working <= PROXY_INLINE_LIST:
+                lines.append("Working proxies:")
+                lines.extend(f"• {item.proxy.label} ({item.latency_ms} ms)" for item in fastest)
+            else:
+                lines.append("Fastest: " + ", ".join(f"{item.proxy.label} ({item.latency_ms} ms)"
+                                                     for item in fastest[:5]))
+        else:
+            lines.append("None of these could reach the site; they are kept as dead in the pool.")
+        lines.append("Proxy mode is " + ("ON." if self.proxy_enabled(uid)
+                                         else "OFF — turn it on with /proxy."))
+        await self.edit_text(edit, "\n".join(lines))
+        if notice is not None and live:
+            await self.send_proxy_list(notice, [result.proxy.url for result in live])
+        LOG.info("Proxy check for user %s: %d/%d working (%d stored, %d duplicates)",
+                 uid, working, len(results), added.added, added.duplicates)
+
+    async def send_proxy_list(self, notice, urls: list[str]) -> None:
+        """Hand back the working list so a large pool can be reused after a restart."""
+        if len(urls) <= PROXY_INLINE_LIST:
+            return
+        buffer = io.BytesIO(("\n".join(urls) + "\n").encode())
+        buffer.name = "working_proxies.txt"
+        try:
+            await notice.respond(file=buffer)
+        except Exception:
+            LOG.warning("Could not send the working proxy list", exc_info=True)
+
+    async def on_proxy_text(self, event, text: str) -> None:
+        uid = event.sender_id
+        if uid in self.proxy_checks:
+            await event.respond("A proxy check is already running. Wait for it, or stop it with "
+                                "/proxychk stop.")
+            return
+        proxies, errors = parse_proxies(text, self.proxy_check_max)
+        if not proxies:
+            detail = f"\nFirst problem: {errors[0]}" if errors else ""
+            await event.respond("No usable proxies found. Send lines such as host:port or "
+                                "user:pass@host:port." + detail)
+            return
+        notice = await event.respond(f"Checking {len(proxies)} proxies… Large lists take a while; "
+                                     "/proxychk stop cancels.")
+        self.start_proxy_check(uid, proxies, edit=lambda body: notice.edit(body),
+                               notice=notice, notes=errors)
+
+    async def on_proxy_file(self, event) -> None:
+        message = getattr(event, "message", None)
+        document = getattr(message, "document", None)
+        if document is None:
+            await event.respond("Send the proxies as text or as a .txt file.")
+            return
+        size = getattr(document, "size", 0) or 0
+        name = ""
+        for attribute in getattr(document, "attributes", None) or []:
+            name = getattr(attribute, "file_name", None) or name
+        suffix = Path(name).suffix.lower()
+        mime = (getattr(document, "mime_type", "") or "").lower()
+        if suffix not in (".txt", ".csv", ".list", ".text", ".conf", ".json", ".proxies") \
+                and not mime.startswith("text/"):
+            await event.respond("Send the proxy list as a .txt or .csv file (got "
+                                f"{suffix or mime or 'an unknown file'}).")
+            return
+        if size > PROXY_FILE_MAX:
+            await event.respond(f"That file is too large ({human_size(size)}); keep proxy lists "
+                                f"under {human_size(PROXY_FILE_MAX)}.")
+            return
+        buffer = io.BytesIO()
+        try:
+            data = await event.client.download_media(message, file=buffer)
+        except (RPCError, OSError, ValueError) as exc:
+            LOG.warning("Could not read a proxy file: %s", type(exc).__name__)
+            await event.respond("Could not read that file. Try pasting the proxies instead.")
+            return
+        payload = data.getvalue() if hasattr(data, "getvalue") else bytes(data or b"")
+        if len(payload) > PROXY_FILE_MAX:
+            await event.respond("That file is too large; keep proxy lists under "
+                                f"{human_size(PROXY_FILE_MAX)}.")
+            return
+        await self.on_proxy_text(event, payload.decode("utf-8", errors="replace"))
+
     def register(self) -> None:
         self.client.add_event_handler(self.on_message, events.NewMessage(incoming=True))
-        self.client.add_event_handler(self.callback, events.CallbackQuery(pattern=rb"^(s|j|m|d):"))
+        self.client.add_event_handler(self.callback, events.CallbackQuery(pattern=rb"^(s|j|m|d|p):"))
 
     def job_buttons(self, job: Job):
         if job.state == "finished":
@@ -496,7 +828,8 @@ class DownloaderBot:
         if uid in self.lookups:
             body += "\n\n🔎 Looking up a link…"
         body += (f"\n\n📊 {self.metrics.describe()}\n"
-                 f"Active/queued: {len(active)} · tap a /cancel_JOBID command to stop it")
+                 f"Active/queued: {len(active)} · tap a /cancel_JOBID command to stop it"
+                 + self.proxy_line(uid))
         # Leave room for UTF-16 surrogate pairs (Telegram's 4,096-unit limit).
         return body if len(body) <= 3600 else body[:3500] + "\n… use /cancel for job IDs."
 
@@ -610,6 +943,8 @@ class DownloaderBot:
                 "/cancel — list jobs; /cancel_<job-id> stops one with a tappable command\n"
                 "/apis — numbered API list; /apis remove 3 resets a custom API\n"
                 "/changeapi — set your YouTube API; /changeapi reset restores default\n"
+                "/proxychk — paste or upload a proxy list; the bot checks which work\n"
+                "/proxy — proxy mode ON/OFF, pool status, re-check or clear the pool\n"
                 "/limits — size and queue limits\n/help — these instructions\n\n"
                 "Only download media you have permission to use.")
         elif command == "/limits":
@@ -619,11 +954,14 @@ class DownloaderBot:
                 f"Terabox folders: up to 500 listed files. One job at a time, "
                 f"{self.in_flight} concurrent upload parts; up to {MAX_WAITING} waiting jobs. "
                 "Files with neither Content-Length nor API size are limited to 64 MiB. "
+                f"Proxy pool: up to {self.proxy_pool_max} stored, {self.proxy_check_max} checked per "
+                f"/proxychk, {self.proxy_workers} parallel checks. "
                 "Jobs/selections are not restored after a restart.")
         elif command == "/change":
             uid = event.sender_id
-            # A pending /changeapi prompt must never capture the next media URL.
+            # A pending /changeapi or /proxychk prompt must never capture the next URL.
             self.awaiting_api.discard(uid)
+            self.awaiting_proxy.discard(uid)
             token = secrets.token_hex(4)
             self.mode_tokens[uid] = token
             active = self.modes.get(uid, "youtube")
@@ -641,6 +979,7 @@ class DownloaderBot:
             elif arg.lower() == "show":
                 await event.respond("Custom API active." if uid in self.api_overrides else "Using the built-in API.")
             elif not arg:
+                self.awaiting_proxy.discard(uid)
                 self.awaiting_api.add(uid)
                 await event.respond("Send your public HTTPS API URL now (for example https://example.com/?url=). "
                                     "Use /changeapi reset to restore the default, or /cancel to stop.")
@@ -653,6 +992,56 @@ class DownloaderBot:
                     await event.respond("Custom API saved for your future links. /changeapi reset restores the default.")
         elif command in ("/status", "/queue"):
             await self.show_dashboard(event)
+        elif command == "/proxychk":
+            uid = event.sender_id
+            argument = text.partition(" ")[2].strip().lower()
+            if argument in ("stop", "cancel", "off"):
+                task = self.proxy_checks.get(uid)
+                if task:
+                    task.cancel()
+                    await event.respond("Proxy check cancellation requested.")
+                else:
+                    await event.respond("No proxy check is running.")
+            else:
+                self.awaiting_api.discard(uid)
+                self.awaiting_proxy.add(uid)
+                await event.respond(
+                    "Send the proxies to check:\n"
+                    "• paste them here (one per line)\n"
+                    f"• or send a .txt/.csv file for large lists (up to {self.proxy_check_max:,} "
+                    f"proxies, {human_size(PROXY_FILE_MAX)} max)\n\n"
+                    "Accepted forms: host:port · host:port:user:pass · user:pass@host:port · "
+                    "socks5://user:pass@host:1080\n\n"
+                    f"Each proxy is tested against {urlsplit(self.proxy_check_url).hostname} with "
+                    f"{self.proxy_workers} parallel workers. Working ones join your pool; dead ones "
+                    "are marked so you can see what is still alive. /proxychk stop cancels.",
+                    parse_mode=None)
+        elif command == "/proxy":
+            uid = event.sender_id
+            argument = text.partition(" ")[2].strip().lower()
+            self.awaiting_proxy.discard(uid)
+            if argument in ("on", "off"):
+                self.proxy_state[uid] = argument == "on"
+                if argument == "off":
+                    await self.close_router(uid)
+                else:
+                    self.pool_for(uid)
+                await event.respond(f"Proxy mode is {argument.upper()}.\n"
+                                    f"{self.pool_for(uid).summary()}"
+                                    + ("" if len(self.pool_for(uid)) else
+                                       "\nThe pool is empty — add proxies with /proxychk."),
+                                    parse_mode=None)
+            elif argument in ("clear", "reset", "offline"):
+                count = len(self.pool_for(uid))
+                self.pool_for(uid).clear()
+                self.proxy_state[uid] = False
+                await self.close_router(uid)
+                await event.respond(f"Cleared {count} proxies and turned proxy mode off.")
+            elif argument in ("", "status", "pool", "list"):
+                await self.show_proxy_panel(event)
+            else:
+                await event.respond("Use /proxy for the ON/OFF panel, /proxy on|off, "
+                                    "/proxy clear, or /proxychk to add proxies.")
         elif command == "/apis":
             uid = event.sender_id
             arg = text.split(maxsplit=2)
@@ -682,7 +1071,14 @@ class DownloaderBot:
                 return
             target = command[8:] if command.startswith("/cancel_") else text.partition(" ")[2].strip()
             owned = self.user_jobs(uid)
-            if target == "lookup" and uid in self.lookups:
+            if target == "proxy":
+                task = self.proxy_checks.get(uid)
+                if not task:
+                    await event.respond("No proxy check is running.")
+                else:
+                    task.cancel()
+                    await event.respond("Proxy check cancellation requested.")
+            elif target == "lookup" and uid in self.lookups:
                 self.lookups[uid].cancel()
                 await event.respond("Link lookup cancellation requested.")
             elif target:
@@ -699,6 +1095,8 @@ class DownloaderBot:
                                  f"[{', '.join(job.selected)}] — /cancel_{job.token}")
                 if uid in self.lookups:
                     lines.append("/cancel lookup — stop the current link lookup")
+                if uid in self.proxy_checks:
+                    lines.append("/cancel proxy — stop the running proxy check")
                 status = "\n".join(lines)
                 await event.respond(status, parse_mode=None, formatting_entities=cancel_entities(status))
             else:
@@ -708,14 +1106,23 @@ class DownloaderBot:
                 selection = self.selections.pop(uid, None)
                 range_request = self.pending_ranges.pop(uid, None)
                 pending_api = uid in self.awaiting_api
+                pending_proxy = uid in self.awaiting_proxy
                 self.awaiting_api.discard(uid)
+                self.awaiting_proxy.discard(uid)
                 await event.respond("Lookup cancellation requested." if task else
-                                    "Selection cleared." if selection or range_request or pending_api else
-                                    "Nothing to cancel.")
+                                    "Selection cleared." if selection or range_request or pending_api
+                                    or pending_proxy else "Nothing to cancel.")
         elif command:
             await event.respond("Unknown command. Send /help for instructions.")
         else:
-            if event.sender_id in self.awaiting_api:
+            document = getattr(getattr(event, "message", None), "document", None)
+            if event.sender_id in self.awaiting_proxy and (document is not None or not is_media_link(text)):
+                self.awaiting_proxy.discard(event.sender_id)
+                if document is not None:
+                    await self.on_proxy_file(event)
+                else:
+                    await self.on_proxy_text(event, text)
+            elif event.sender_id in self.awaiting_api:
                 if is_media_link(text):
                     self.awaiting_api.discard(event.sender_id)
                     self.pending_ranges.pop(event.sender_id, None)
@@ -805,7 +1212,13 @@ class DownloaderBot:
             source = (Source("terabox", parse_terabox_source(event.raw_text)) if mode == "terabox"
                       else parse_source(event.raw_text))
         except ValueError as exc:
-            await event.respond(str(exc))
+            # A pasted proxy list is the most common mistake here; point at /proxychk.
+            proxies, _ = parse_proxies(event.raw_text or "", 10)
+            if len(proxies) >= 2:
+                await event.respond("That looks like a proxy list. Send /proxychk to test it "
+                                    "and add it to your pool, then /proxy to switch it on.")
+            else:
+                await event.respond(str(exc))
             return
         self.selections.pop(uid, None)
         self.pending_ranges.pop(uid, None)
@@ -819,7 +1232,7 @@ class DownloaderBot:
             if source.kind == "playlist":
                 notice = await event.respond("Counting playlist videos (flat discovery, no downloads)…")
                 count = await asyncio.wait_for(
-                    asyncio.to_thread(playlist_count, source.url, MAX_DISCOVER), timeout=180)
+                    self.youtube_task(uid, playlist_count, source.url, MAX_DISCOVER), timeout=180)
                 if self.modes.get(uid, "youtube") != mode:
                     await notice.edit("Mode changed. Send your link again.")
                     return
@@ -829,7 +1242,7 @@ class DownloaderBot:
                 return
             if source.kind == "terabox":
                 notice = await event.respond("Checking Terabox files and available qualities…")
-                listing = await fetch_terabox(self.http, source.url)
+                listing = await fetch_terabox(self.http_for(uid), source.url)
                 if self.modes.get(uid, "youtube") != mode:
                     await notice.edit("Mode changed. Send your link again.")
                     return
@@ -854,10 +1267,13 @@ class DownloaderBot:
                                       "Choose a format, then Done:", buttons=self.keyboard(selection))
                 return
             notice = await event.respond("Checking available qualities… This API may take 1–2 minutes. /cancel to stop.")
-            title_task = asyncio.create_task(get_youtube_title(self.http, source.url))
+            http = self.http_for(uid)
+            proxy = self.proxy_for(uid)
+            title_task = asyncio.create_task(
+                get_youtube_title(http, source.url, proxy.url if proxy else None))
             try:
                 endpoint = self.api_for(uid)
-                video = await fetch_video(self.http, source.url, endpoint)
+                video = await fetch_video(http, source.url, endpoint)
                 video = replace(video, title=choose_title(await title_task, video.title, source.url))
             finally:
                 if not title_task.done():
@@ -912,6 +1328,14 @@ class DownloaderBot:
                 dashboard.last_manual = now
                 await event.answer("Refreshing now")
                 await self.render_dashboard(uid, force=True)
+            return
+        if parts[0] == "p":
+            # The token ties the buttons to the panel this user opened last.
+            if (not event.is_private or len(parts) != 3 or self.proxy_tokens.get(uid) != parts[1]
+                    or parts[2] not in ("on", "off", "status", "recheck", "purge", "clear")):
+                await event.answer("Proxy panel expired. Send /proxy again.", alert=True)
+                return
+            await self.proxy_action(event, uid, parts[2])
             return
         if parts[0] == "m":
             if (not event.is_private or len(parts) != 3 or self.mode_tokens.get(uid) != parts[1]
@@ -1071,7 +1495,7 @@ class DownloaderBot:
     async def fresh_terabox_file(self, job: Job, item: TeraboxFile) -> TeraboxFile:
         listing = job.listing
         if listing and listing.expires_at and listing.expires_at <= time.time() + 120:
-            listing = await fetch_terabox(self.http, job.source.url)
+            listing = await fetch_terabox(self.http_for(job.user_id), job.source.url)
             job.listing = listing
             if listing.expires_at and listing.expires_at <= time.time():
                 raise ValueError("Terabox API returned expired download links.")
@@ -1101,8 +1525,8 @@ class DownloaderBot:
                 if job.source.kind == "playlist":
                     await self.progress(job, f"Reading playlist entries {job.start}-{job.end}…")
                     entries = await asyncio.wait_for(
-                        asyncio.to_thread(extract_playlist_range, job.source.url, job.start, job.end),
-                        timeout=180)
+                        self.youtube_task(job.user_id, extract_playlist_range, job.source.url,
+                                          job.start, job.end), timeout=180)
                 elif job.source.kind.startswith("terabox"):
                     initial_listing = job.listing
                     entries = list(initial_listing.files[job.start - 1:job.end]) if initial_listing else []
@@ -1151,9 +1575,13 @@ class DownloaderBot:
                                 failed += 1
                         continue
                     await self.progress(job, f"Checking formats (API may take 1–2 minutes). Sent {sent} so far.")
+                    http = self.http_for(job.user_id)
+                    proxy_url = self.proxy_for(job.user_id)
                     try:
-                        video = job.video if job.video else await fetch_video(self.http, entry.url, job.api_endpoint)
-                        youtube_name = entry.title or await get_youtube_title(self.http, entry.url)
+                        video = job.video if job.video else await fetch_video(http, entry.url, job.api_endpoint)
+                        youtube_name = (entry.title
+                                        or await get_youtube_title(http, entry.url,
+                                                                   proxy_url and proxy_url.url))
                         video = replace(video, title=choose_title(youtube_name, video.title, entry.url))
                         job.title = video.title
                     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
@@ -1219,7 +1647,7 @@ class DownloaderBot:
                     urls.append(candidate)
         thumb = None
         for image_url in urls:
-            thumb = await thumbnail_jpeg(self.http, image_url)
+            thumb = await thumbnail_jpeg(self.http_for(job.user_id), image_url)
             if thumb:
                 LOG.info("Prepared %s thumbnail from %s (%d bytes, %dx%d)",
                          job.source.kind, urlsplit(image_url).hostname,
@@ -1261,7 +1689,8 @@ class DownloaderBot:
         probe = MediaProbe(suffix) if video_file else None
         thumb_task = asyncio.create_task(self.video_thumbnail(job, video)) if probe else None
         try:
-            uploaded = await upload_stream(self.client, self.http, url, filename, self.max_bytes,
+            uploaded = await upload_stream(self.client, self.http_for(job.user_id), url, filename,
+                                           self.max_bytes,
                                            on_total=on_total, on_download=on_download,
                                            on_upload=on_upload, on_flood=on_flood,
                                            on_data=probe.add if probe else None,
@@ -1348,9 +1777,10 @@ async def serve(token: str, api_id: int, api_hash: str) -> None:
     client = TelegramClient(MemorySession(), api_id, api_hash, receive_updates=True)
     timeout = aiohttp.ClientTimeout(total=240, connect=20)
     connector = aiohttp.TCPConnector(resolver=PublicResolver())
+    headers = {"User-Agent": "ytdown-telegram-bot/1.0"}
     async with aiohttp.ClientSession(timeout=timeout, connector=connector,
-                                     headers={"User-Agent": "ytdown-telegram-bot/1.0"}) as http:
-        service = DownloaderBot(client, http)
+                                     headers=headers) as http:
+        service = DownloaderBot(client, http, timeout=timeout, headers=headers)
         service.register()
         health = web.Application()
         health.router.add_get("/healthz", lambda request: web.json_response(
@@ -1376,6 +1806,7 @@ async def serve(token: str, api_id: int, api_hash: str) -> None:
                 task.cancel()
             await asyncio.gather(*list(service.lookups.values()),
                                  *(j.task for j in service.jobs.values() if j.task), return_exceptions=True)
+            await service.close()
             await client.disconnect()
             await runner.cleanup()
 
