@@ -37,16 +37,19 @@ from .dailymotion import (DAILYMOTION_API_URL, MAX_API_BYTES, MAX_MANIFEST_BYTES
                           DailymotionInfo, download_dailymotion, estimate_bytes, ffmpeg_ready,
                           normalize_dailymotion, parse_dailymotion_source, parse_master, proxy_manifest,
                           read_bounded)
+from .rumble import RUMBLE_API_URL, RumbleError, normalize_rumble, parse_rumble_source
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg, usable_still
 
 LOG = logging.getLogger(__name__)
-MODE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion"}
+MODE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion", "rumble": "Rumble"}
 API_URL = "https://samra-youtube-api.antideploy.com/"
-DEFAULT_APIS = {"youtube": API_URL, "terabox": TERABOX_API_URL, "dailymotion": DAILYMOTION_API_URL}
-SERVICE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion"}
+DEFAULT_APIS = {"youtube": API_URL, "terabox": TERABOX_API_URL, "dailymotion": DAILYMOTION_API_URL,
+                "rumble": RUMBLE_API_URL}
+SERVICE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion", "rumble": "Rumble"}
 SERVICE_KEYWORDS = {"yt": "youtube", "youtube": "youtube", "tera": "terabox", "terabox": "terabox",
-                    "daily": "dailymotion", "dailymotion": "dailymotion", "dm": "dailymotion"}
+                    "daily": "dailymotion", "dailymotion": "dailymotion", "dm": "dailymotion",
+                    "rumble": "rumble", "rum": "rumble"}
 RESET_WORDS = ("reset", "remove", "default")
 MAX_WAITING = 4
 MAX_SELECTIONS = 100
@@ -226,7 +229,7 @@ class Job:
 
 def is_media_link(raw: str) -> bool:
     """Keep media links out of a pending /changeapi URL prompt."""
-    for parser in (parse_source, parse_terabox_source, parse_dailymotion_source):
+    for parser in (parse_source, parse_terabox_source, parse_dailymotion_source, parse_rumble_source):
         try:
             parser(raw)
             return True
@@ -241,8 +244,11 @@ def normalize_api_endpoint(raw: str) -> str:
     if len(raw) > 500 or not public_https_url(raw):
         raise ValueError("API must be a public HTTPS URL (no localhost or private IP).")
     parts = urlsplit(raw)
-    if parts.hostname.lower().endswith(("youtube.com", "youtu.be")):
+    host = parts.hostname.lower()
+    if host.endswith(("youtube.com", "youtu.be")):
         raise ValueError("Send an API endpoint, not a YouTube video link.")
+    if host.endswith("rumble.com"):
+        raise ValueError("Send an API endpoint, not a Rumble video link.")
     params = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k.lower() != "url"]
     return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", urlencode(params), ""))
 
@@ -272,11 +278,11 @@ async def fetch_json_api(session: aiohttp.ClientSession, api_endpoint: str, url:
     raise ValueError("Too many API redirects.")
 
 
-async def fetch_video(session: aiohttp.ClientSession, url: str, api_endpoint: str = API_URL) -> Video:
-    """YouTube link lookup. Quick transient API failures (rate limits, 5xx, non-JSON pages) are retried."""
+async def fetch_api_with_retries(session: aiohttp.ClientSession, api_endpoint: str, url: str, normalize):
+    """Quick transient API failures (rate limits, 5xx, non-JSON pages, dropped connections) are retried."""
     for attempt in range(len(API_RETRY_DELAYS) + 1):
         try:
-            return normalize_video(await fetch_json_api(session, api_endpoint, url))
+            return normalize(await fetch_json_api(session, api_endpoint, url))
         except aiohttp.ClientResponseError as exc:
             transient, error = exc.status in (408, 425, 429) or exc.status >= 500, exc
             reason = f"HTTP {exc.status}"
@@ -289,6 +295,24 @@ async def fetch_video(session: aiohttp.ClientSession, url: str, api_endpoint: st
         LOG.info("Link API attempt %d failed (%s); retrying in %ss", attempt + 1, reason,
                  API_RETRY_DELAYS[attempt])
         await asyncio.sleep(API_RETRY_DELAYS[attempt])
+
+
+async def fetch_video(session: aiohttp.ClientSession, url: str, api_endpoint: str = API_URL) -> Video:
+    """YouTube link lookup. Quick transient API failures (rate limits, 5xx, non-JSON pages) are retried."""
+    return await fetch_api_with_retries(session, api_endpoint, url, normalize_video)
+
+
+async def fetch_rumble(session: aiohttp.ClientSession, url: str, endpoint: str = RUMBLE_API_URL) -> Video:
+    try:
+        return await fetch_api_with_retries(session, endpoint, url, normalize_rumble)
+    except aiohttp.ClientResponseError as exc:
+        LOG.warning("Rumble API answered HTTP %s", exc.status)
+        raise RumbleError(f"The Rumble API answered HTTP {exc.status}. Try again later.") from exc
+    except json.JSONDecodeError as exc:
+        raise RumbleError("The Rumble API returned an unexpected response.") from exc
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        LOG.warning("Rumble API unreachable: %s", type(exc).__name__)
+        raise RumbleError("Could not reach the Rumble API. Try again later.") from exc
 
 
 async def fetch_terabox(session: aiohttp.ClientSession, url: str,
@@ -573,11 +597,12 @@ class DownloaderBot:
         waiting = [j for j in self.jobs.values() if j.state == "queued"]
         item = f"{job.item_index}/{job.item_total}" if job.item_total else "—"
         # Terabox status lines keep their original format; YouTube titles get subtitle tags.
-        youtube = job.source.kind in ("video", "playlist")
+        youtube = job.source.kind in ("video", "playlist", "rumble")
         clean, tag = split_subtitle_tag(job.title) if youtube else (job.title, "")
         title = clean[:95] or ("Playlist" if job.source.kind == "playlist" else
                                "Terabox files" if job.source.kind.startswith("terabox") else
-                               "Dailymotion video" if job.source.kind == "dailymotion" else "YouTube video")
+                               "Dailymotion video" if job.source.kind == "dailymotion" else
+                               "Rumble video" if job.source.kind == "rumble" else "YouTube video")
         quality = (f" [{'MP3' if youtube and job.quality == AUDIO else job.quality}]" if job.quality else "") + (
             f" {tag}" if tag else "")
         status = (f"Telegram rate limit: waiting {human_eta(job.rate_limit_until - now)}"
@@ -763,16 +788,16 @@ class DownloaderBot:
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
         if command in ("/start", "/help"):
             await event.respond(
-                "Choose YouTube, Terabox or Dailymotion with /change, then send a link for that service. "
+                "Choose YouTube, Terabox, Dailymotion or Rumble with /change, then send a link for that service. "
                 "Pick one or several available qualities and tap Done. Playlists/folders first show "
                 "their file count; send a range such as 1-29 or 200-300, then select qualities. "
                 "Send another link while a job runs to queue it. Transfers stay sequential.\n\n"
                 "A watch link containing list= is treated as a playlist; remove it for just one video.\n\n"
-                "/change — YouTube / Terabox / Dailymotion buttons\n"
+                "/change — YouTube / Terabox / Dailymotion / Rumble buttons\n"
                 "/status or /queue — one live status for running and queued jobs\n"
                 "/cancel — list jobs; /cancel_<job-id> stops one with a tappable command\n"
                 "/apis — numbered API list; /apis remove 3 resets a custom API\n"
-                "/changeapi yt|tera|daily <URL> — set your own API for one service; /changeapi reset restores all\n"
+                "/changeapi yt|tera|daily|rumble <URL> — set your own API for one service; /changeapi reset restores all\n"
                 "/limits — size and queue limits\n/help — these instructions\n\n"
                 "Only download media you have permission to use.")
         elif command == "/limits":
@@ -794,7 +819,8 @@ class DownloaderBot:
                                 "Choose a service for future links:",
                                 buttons=[[Button.inline("▶️ YouTube", data=f"m:{token}:youtube".encode()),
                                           Button.inline("📁 Terabox", data=f"m:{token}:terabox".encode())],
-                                         [Button.inline("🎞 Dailymotion", data=f"m:{token}:dailymotion".encode())]])
+                                         [Button.inline("🎞 Dailymotion", data=f"m:{token}:dailymotion".encode()),
+                                           Button.inline("🟣 Rumble", data=f"m:{token}:rumble".encode())]])
         elif command == "/changeapi":
             await self.handle_changeapi(event, text)
         elif command in ("/status", "/queue"):
@@ -810,12 +836,12 @@ class DownloaderBot:
                 else:
                     await event.respond(f"No custom {SERVICE_LABELS[service]} API to remove.")
             elif len(arg) > 1:
-                await event.respond("Use /apis to list the APIs, or /apis remove yt|tera|daily to restore one "
+                await event.respond("Use /apis to list the APIs, or /apis remove yt|tera|daily|rumble to restore one "
                                     "built-in API.")
             else:
                 await event.respond("\n".join(["Configured APIs (for your account):", *self.api_lines(uid),
-                                                "Change with /changeapi yt|tera|daily <URL>; restore with "
-                                                "/changeapi yt|tera|daily reset."]), parse_mode=None)
+                                                "Change with /changeapi yt|tera|daily|rumble <URL>; restore with "
+                                                "/changeapi yt|tera|daily|rumble reset."]), parse_mode=None)
         elif command == "/cancel" or command.startswith("/cancel_"):
             uid = event.sender_id
             if command.startswith("/cancel_") and not re.fullmatch(r"/cancel_[a-f0-9]{8}", command):
@@ -947,6 +973,7 @@ class DownloaderBot:
         try:
             source = (Source("terabox", parse_terabox_source(event.raw_text)) if mode == "terabox"
                       else Source("dailymotion", parse_dailymotion_source(event.raw_text)) if mode == "dailymotion"
+                      else Source("rumble", parse_rumble_source(event.raw_text)) if mode == "rumble"
                       else parse_source(event.raw_text))
         except ValueError as exc:
             await event.respond(str(exc))
@@ -970,6 +997,26 @@ class DownloaderBot:
                 self.pending_ranges[uid] = RangeRequest(source, peer, count, self.api_for(uid))
                 await notice.edit(f"Playlist reports {count} videos. Send an inclusive range like 1-29 or "
                                   f"200-300 (within 1-{count}, up to {self.playlist_limit} per job).")
+                return
+            if source.kind == "rumble":
+                notice = await event.respond("Checking Rumble qualities…")
+                endpoint = self.api_for(uid, "rumble")
+                try:
+                    video = await fetch_rumble(self.http, source.url, endpoint)
+                except RumbleError as exc:
+                    await notice.edit(str(exc))
+                    return
+                if self.modes.get(uid, "youtube") != mode:
+                    await notice.edit("Mode changed. Send your link again.")
+                    return
+                if len(self.selections) >= MAX_SELECTIONS:
+                    await notice.edit("Too many open selections right now. Try again later.")
+                    return
+                choices = tuple(sorted(video.streams, key=lambda q: int(q[:-1])))
+                selection = Selection(secrets.token_hex(4), source, choices, peer, video, api_endpoint=endpoint)
+                self.selections[uid] = selection
+                await notice.edit(f"{video.title}\nChoose one or more available formats, then tap Done:",
+                                  buttons=self.keyboard(selection))
                 return
             if source.kind == "dailymotion":
                 notice = await event.respond("Checking Dailymotion qualities…")
@@ -1275,6 +1322,8 @@ class DownloaderBot:
                 if not entries:
                     raise ValueError("No available entries in this range.")
                 job.item_total = job.end if job.source.kind in ("playlist", "terabox-folder") else len(entries)
+                # Rumble has its own API response shape; both the first lookup and refreshes must use it.
+                lookup = fetch_rumble if job.source.kind == "rumble" else fetch_video
                 for offset, entry in enumerate(entries):
                     if job.source.kind == "playlist":
                         index = entry.position or job.start + offset
@@ -1318,7 +1367,7 @@ class DownloaderBot:
                     if offset and job.source.kind == "playlist":
                         await asyncio.sleep(LOOKUP_GAP_SECONDS)
                     try:
-                        video = job.video if job.video else await fetch_video(self.http, entry.url, job.api_endpoint)
+                        video = job.video if job.video else await lookup(self.http, entry.url, job.api_endpoint)
                         youtube_name = entry.title or await get_youtube_title(self.http, entry.url)
                         video = replace(video, title=choose_title(youtube_name, video.title, entry.url))
                         job.title = video.title
@@ -1358,7 +1407,7 @@ class DownloaderBot:
                                     LOG.info("Link refused for item %s (HTTP %s); requesting a fresh link",
                                              index, exc.status)
                                     try:
-                                        fresh = await fetch_video(self.http, entry.url, job.api_endpoint)
+                                        fresh = await lookup(self.http, entry.url, job.api_endpoint)
                                         fresh_stream = fresh.streams.get(quality)
                                     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError):
                                         fresh_stream = None
@@ -1491,6 +1540,9 @@ class DownloaderBot:
             # Prefer the file URL supplied by the API, then its parent listing
             # thumbnail. Both go through the same JPEG/redirect/blank checks as YouTube.
             urls = list(dict.fromkeys(url for url in (video.thumbnail, *job.thumbnail_urls) if url))
+        elif job.source.kind == "rumble":
+            # Rumble only offers the image its API supplies; no YouTube-style fallbacks.
+            urls = [video.thumbnail] if video.thumbnail else []
         else:
             video_id = source.rsplit("=", 1)[-1]
             # Prefer the API's supplied thumbnail; YouTube sizes are fallbacks.
