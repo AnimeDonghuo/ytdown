@@ -1,10 +1,9 @@
-import asyncio
 import io
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from ytdown.bot import DownloaderBot, Job, RangeRequest
+from ytdown.bot import DownloaderBot, Job
 from ytdown.core import Source, Video
 from ytdown.terabox import (TeraboxFile, TeraboxListing, normalize_terabox,
                             parse_terabox_source)
@@ -223,8 +222,9 @@ class ModeAndFolderTests(unittest.IsolatedAsyncioTestCase):
 class StreamMetadataTests(unittest.IsolatedAsyncioTestCase):
     async def test_terabox_mkv_keeps_container_and_size_and_duration(self):
         from ytdown.media import MediaInfo
+        from tests.test_bot import GOOD_STILL, cached_still, returned_video
         service = DownloaderBot(MagicMock(), MagicMock())
-        service.client.send_file = AsyncMock()
+        service.client.send_file = AsyncMock(return_value=returned_video(cached_still(GOOD_STILL)))
         service.progress = AsyncMock()
         job = Job(7, "peer", 2, Source("terabox", SHARE), ("1080p",), None)
         item = TeraboxFile("1", "movie.mkv", "1080p", CDN,
@@ -247,8 +247,9 @@ class StreamMetadataTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_terabox_missing_api_thumbnail_uses_frame_preview(self):
         from ytdown.media import MediaInfo
+        from tests.test_bot import GOOD_STILL, cached_still, returned_video
         service = DownloaderBot(MagicMock(), MagicMock())
-        service.client.send_file = AsyncMock()
+        service.client.send_file = AsyncMock(return_value=returned_video(cached_still(GOOD_STILL)))
         service.progress = AsyncMock()
         item = TeraboxFile("1", "film.mkv", "480p", CDN, "", "video/x-matroska", 1024)
         job = Job(7, "peer", 2, Source("terabox", SHARE), ("480p",), None)

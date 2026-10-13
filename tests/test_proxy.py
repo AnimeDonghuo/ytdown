@@ -1,3 +1,4 @@
+import os
 import asyncio
 import io
 import logging
@@ -1021,6 +1022,153 @@ class BotProxyCommandTests(unittest.IsolatedAsyncioTestCase):
             await self.service.youtube_task(7, ytdlp, "https://www.youtube.com/watch?v=x")
         self.assertEqual(len(calls), 1)
         self.assertEqual(pool.entries["http://1.2.3.4:8080"].fail_count, 0)
+
+
+class SiteProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """Dailymotion and Rumble traffic must ride the pool when proxy mode is on."""
+
+    def setUp(self):
+        self.client = MagicMock()
+        self.client.send_message = AsyncMock(return_value=SimpleNamespace(id=11))
+        self.client.edit_message = AsyncMock()
+        self.service = DownloaderBot(self.client, MagicMock())
+        self.service.progress = AsyncMock()
+
+    def event(self, text="", *, uid=7, notice=None):
+        message = SimpleNamespace(document=None, attributes=[])
+        return SimpleNamespace(sender_id=uid, raw_text=text, is_private=True, message=message,
+                               client=self.client,
+                               respond=AsyncMock(return_value=notice or SimpleNamespace(
+                                   edit=AsyncMock(), respond=AsyncMock())),
+                               get_input_chat=AsyncMock(return_value="peer"))
+
+    def proxy_mode_on(self, uid=7, *lines):
+        pool = self.service.pool_for(uid)
+        pool.add([parse_proxy_line(line) for line in (lines or ("1.2.3.4:8080",))])
+        self.service.proxy_state[uid] = True
+        return pool
+
+    async def test_change_offers_all_four_services_and_dailymotion_wins(self):
+        event = self.event("/change")
+        await self.service.on_message(event)
+        buttons = [button.type.data.decode() for row in event.respond.call_args.kwargs["buttons"]
+                   for button in row]
+        token = self.service.mode_tokens[7]
+        for service in ("youtube", "terabox", "dailymotion", "rumble"):
+            self.assertIn(f"m:{token}:{service}", buttons)
+        callback = self.event("")
+        callback.data = f"m:{token}:dailymotion".encode()
+        callback.answer = AsyncMock()
+        callback.edit = AsyncMock()
+        await self.service.callback(callback)
+        self.assertEqual(self.service.modes[7], "dailymotion")
+        self.assertIn("Dailymotion mode is active", callback.edit.call_args.args[0])
+
+    async def test_rumble_lookup_rides_the_proxy_router(self):
+        self.proxy_mode_on()
+        self.service.modes[7] = "rumble"
+        event = self.event("https://rumble.com/v4t3sz8-playing-some-fallout-76.html",
+                           notice=SimpleNamespace(edit=AsyncMock()))
+        from ytdown.core import Video
+        with patch("ytdown.bot.fetch_rumble", new=AsyncMock(return_value=Video("T", {"720p": "u"}))) as fetch:
+            await self.service.on_link(event)
+        self.assertIs(fetch.call_args.args[0], self.service.routers[7])
+
+    async def test_dailymotion_lookup_rides_the_proxy_router_and_custom_api(self):
+        self.proxy_mode_on()
+        self.service.modes[7] = "dailymotion"
+        self.service.set_api(7, "https://mine.example.com/dm", "dailymotion")
+        event = self.event("https://www.dailymotion.com/video/x7tgad0",
+                           notice=SimpleNamespace(edit=AsyncMock()))
+        info = SimpleNamespace(title="T", duration=60, poster=None, formats=())
+        with patch("ytdown.bot.fetch_dailymotion", new=AsyncMock(return_value=info)) as fetch:
+            await self.service.on_link(event)
+        self.assertIs(fetch.call_args.args[0], self.service.routers[7])
+        self.assertEqual(fetch.call_args.args[2], "https://mine.example.com/dm")
+
+    async def test_dailymotion_lookup_fails_over_to_the_next_proxy(self):
+        pool = self.proxy_mode_on(7, "1.2.3.4:8080", "5.6.7.8:9090")
+        self.service.modes[7] = "dailymotion"
+        sessions = []
+
+        def factory(proxy):
+            session = FakeSession(refused if proxy.url == "http://1.2.3.4:8080" else None)
+            sessions.append((proxy.url, session))
+            return session
+
+        router = self.service.router_for(7)
+        router.session_factory = factory
+        pool._cursor = 0
+        info = SimpleNamespace(title="T", duration=60, poster=None, formats=())
+
+        async def fetch(session, url, endpoint):
+            async with session.get("https://samra-dailymotion.example/api/info") as response:
+                self.assertEqual(response.status, 204)
+            return info
+
+        event = self.event("https://www.dailymotion.com/video/x7tgad0",
+                           notice=SimpleNamespace(edit=AsyncMock()))
+        with patch("ytdown.bot.fetch_dailymotion", new=fetch):
+            await self.service.on_link(event)
+        self.assertEqual([url for url, _ in sessions],
+                         ["http://1.2.3.4:8080", "http://5.6.7.8:9090"])
+        self.assertEqual(pool.get(parse_proxy_line("1.2.3.4:8080")).fail_count, 1)
+
+    async def test_dailymotion_download_passes_the_pool_proxy_to_yt_dlp(self):
+        from ytdown.core import Source
+        from ytdown.dailymotion import DMFormat, DailymotionInfo
+        from ytdown.bot import Job
+        fmt = DMFormat("720p", "https://cdn.example.com/720/index.m3u8", 1280, 720, 2500000)
+        info = DailymotionInfo("Midnight Sun", 87, "https://cdn.example.com/poster.jpg", (fmt,))
+        self.proxy_mode_on()
+        job = Job(7, "peer", 2, Source("dailymotion", "https://www.dailymotion.com/video/x7tgad0"),
+                  ("720p",), info)
+        self.service.jobs[job.token] = job
+        self.service.send_stream = AsyncMock()
+        calls = []
+
+        def fake_download(url, out_dir, on_bytes, stop, **kwargs):
+            calls.append(kwargs)
+            path = os.path.join(out_dir, "stream.mp4")
+            with open(path, "wb") as handle:
+                handle.write(b"x" * 1000)
+            on_bytes(1000, 1000)
+            return path
+
+        with patch("ytdown.bot.download_dailymotion", new=fake_download), \
+             patch("ytdown.bot.ffmpeg_ready", return_value=True), \
+             patch("ytdown.bot.thumbnail_jpeg", new=AsyncMock(return_value=None)) as thumb:
+            await self.service.run_job(job)
+        self.assertEqual(calls, [{"proxy": "http://1.2.3.4:8080"}])
+        # The poster thumbnail is fetched through the same pool session.
+        self.assertIs(thumb.call_args.args[0], self.service.router_for(7))
+
+    async def test_dailymotion_download_stays_direct_when_proxy_mode_is_off(self):
+        from ytdown.core import Source
+        from ytdown.dailymotion import DMFormat, DailymotionInfo
+        from ytdown.bot import Job
+        fmt = DMFormat("720p", "https://cdn.example.com/720/index.m3u8", 1280, 720, 2500000)
+        info = DailymotionInfo("Midnight Sun", 87, "", (fmt,))
+        job = Job(7, "peer", 2, Source("dailymotion", "https://www.dailymotion.com/video/x7tgad0"),
+                  ("720p",), info)
+        self.service.jobs[job.token] = job
+        self.service.send_stream = AsyncMock()
+        calls = []
+
+        def fake_download(url, out_dir, on_bytes, stop, **kwargs):
+            calls.append(kwargs)
+            path = os.path.join(out_dir, "stream.mp4")
+            with open(path, "wb") as handle:
+                handle.write(b"x" * 1000)
+            on_bytes(1000, 1000)
+            return path
+
+        with patch("ytdown.bot.download_dailymotion", new=fake_download), \
+             patch("ytdown.bot.ffmpeg_ready", return_value=True), \
+             patch("ytdown.bot.thumbnail_jpeg", new=AsyncMock(return_value=None)):
+            await self.service.run_job(job)
+        self.assertEqual(calls, [{}])
+
 
 
 if __name__ == "__main__":

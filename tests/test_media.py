@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from PIL import Image
-from ytdown.media import MediaInfo, MediaProbe, jpeg_preview, thumbnail_jpeg
+from ytdown.media import MediaInfo, MediaProbe, jpeg_preview, thumbnail_jpeg, usable_still
 
 
 class MediaTests(unittest.IsolatedAsyncioTestCase):
@@ -173,3 +173,28 @@ class ThumbnailSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.get.return_value = response
         self.assertIsNone(await thumbnail_jpeg(session, "https://example.com/start.jpg"))
         self.assertEqual(session.get.call_count, 1)
+
+
+class ReturnedStillTests(unittest.TestCase):
+    def jpeg(self, color, size=(320, 180)):
+        from PIL import ImageDraw
+        image = Image.new("RGB", size, color)
+        if color != "white":
+            ImageDraw.Draw(image).rectangle((0, 0, size[0] // 3, size[1]), fill="red")
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=80)
+        return out.getvalue()
+
+    def test_usable_still_accepts_real_frames_only(self):
+        self.assertTrue(usable_still(self.jpeg("blue")))
+        self.assertFalse(usable_still(self.jpeg("white")))
+        self.assertFalse(usable_still(b""))
+        self.assertFalse(usable_still(b"not an image"))
+        self.assertFalse(usable_still(b"x" * (1024 * 1024 + 1)))
+        logo = Image.new("RGB", (320, 180), "white")
+        from PIL import ImageDraw
+        ImageDraw.Draw(logo).rectangle((145, 70, 175, 95), fill="red")
+        out = io.BytesIO()
+        logo.save(out, format="JPEG", quality=80)
+        self.assertFalse(usable_still(out.getvalue()))
+

@@ -131,6 +131,30 @@ class MediaProbe:
             return None
 
 
+def mostly_white(image: Image.Image) -> bool:
+    """True for blank white placeholders, including ones with a small logo."""
+    sample = image.convert("RGB").resize((32, 32), Image.Resampling.BILINEAR)
+    pixels = sample.tobytes()
+    bright = [min(pixels[i:i + 3]) >= 240 for i in range(0, len(pixels), 3)]
+    border = [bright[y * 32 + x] for y in range(32) for x in range(32)
+              if x in (0, 31) or y in (0, 31)]
+    return sum(bright) >= 0.9 * len(bright) or (
+        sum(bright) >= 0.82 * len(bright) and sum(border) >= 0.95 * len(border))
+
+
+def usable_still(data: bytes) -> bool:
+    """Whether Telegram's returned still is a decodable, non-white image."""
+    if not data or len(data) > 1024 * 1024:
+        return False
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.width * image.height > 5_000_000:
+                return False
+            return not mostly_white(image)
+    except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
+        return False
+
+
 def jpeg_preview(data: bytes) -> tuple[bytes, int, int] | None:
     """Normalize a provider image or extracted frame for Telegram thumbnails."""
     if not data or len(data) > 4 * 1024 * 1024:
@@ -143,13 +167,7 @@ def jpeg_preview(data: bytes) -> tuple[bytes, int, int] | None:
         image = image.convert("RGB")
         # A valid maxresdefault URL can return an almost-white placeholder with
         # a small logo; low variance alone does not catch it. Try HQ instead.
-        sample = image.resize((32, 32), Image.Resampling.BILINEAR)
-        pixels = sample.tobytes()
-        bright = [min(pixels[i:i + 3]) >= 240 for i in range(0, len(pixels), 3)]
-        border = [bright[y * 32 + x] for y in range(32) for x in range(32)
-                  if x in (0, 31) or y in (0, 31)]
-        if sum(bright) >= 0.9 * len(bright) or (
-                sum(bright) >= 0.82 * len(bright) and sum(border) >= 0.95 * len(border)):
+        if mostly_white(image):
             return None
         # Telegram silently ignores many otherwise valid thumbnails above ~20 KB.
         # Compress/downscale until it can reliably attach, preserving aspect ratio.

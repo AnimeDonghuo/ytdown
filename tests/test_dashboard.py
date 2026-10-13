@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from ytdown.bot import API_URL, DownloaderBot, Job, Selection, cancel_entities
 from ytdown.core import Source, Video
-from ytdown.terabox import TERABOX_API_URL, parse_terabox_source
+from ytdown.terabox import parse_terabox_source
 
 VIDEO_URL = "https://www.youtube.com/watch?v=3SY1i5CB03Q"
 SHARE_URL = "https://terasharefile.com/s/16E1yDzvD_txbiR561VPxBA"
@@ -90,13 +90,12 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
         waiting = Job(7, "peer", 11, Source("video", VIDEO_URL), ("360p",), None)
         other_user = Job(8, "other-peer", 12, Source("video", VIDEO_URL), ("480p",), None)
         self.service.jobs = {j.token: j for j in (running, waiting, other_user)}
-        self.service.completed[7] = [(asyncio.get_running_loop().time(), "🎬 finished-video\n📋 Finished")]
         await self.service.on_message(self.event)
         self.assertEqual(len(self.sent), 1)
         first = self.sent[0][1]
-        for part in ("running-video", "finished-video", running.token, waiting.token,
-                     "Queued", "Running"):
+        for part in ("running-video", running.token, waiting.token, "Queued", "Running"):
             self.assertIn(part, first)
+        self.assertNotIn("finished-video", first)
         self.assertNotIn(other_user.token, first)
         self.assertEqual(len(self.sent[0][2]["formatting_entities"]), 2)
         self.assertEqual(len(self.sent[0][2]["buttons"]), 1)  # Refresh only.
@@ -202,12 +201,12 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(job.token, self.service.jobs)
         self.event.raw_text = "/status"
         await self.service.on_message(self.event)
-        self.assertIn("Cancelled before transfer started", self.sent[-1][1])
+        self.assertNotIn("Cancelled before transfer started", self.sent[-1][1])
+        self.assertIn("No active transfers", self.sent[-1][1])
 
-    async def test_done_replaces_running_status_and_keeps_recent_finished(self):
+    async def test_done_replaces_running_status_with_active_jobs_only(self):
         running = Job(7, "peer", 12, Source("video", VIDEO_URL), ("480p",), None, state="running")
         self.service.jobs[running.token] = running
-        self.service.completed[7] = [(asyncio.get_running_loop().time(), "🎬 Yesterday's video · Finished")]
         await self.service.on_message(self.event)  # dashboard #101
         self.service.run_job = AsyncMock()
         choice = Selection("abc12345", Source("video", VIDEO_URL), ("720p",), "peer",
@@ -220,7 +219,7 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
         new_text = self.client.send_message.await_args.args[1]
         self.assertIn(running.token, new_text)
         self.assertIn("Running", new_text)
-        self.assertIn("Yesterday's video", new_text)
+        self.assertNotIn("Yesterday's video", new_text)
         self.assertIn("New title", new_text)
         self.assertIn("Queued", new_text)
         self.assertIn("Queue #1", new_text)
@@ -229,7 +228,7 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
         queued = next(job for job in self.service.user_jobs(7) if job is not running)
         await queued.task
 
-    async def test_finished_transfer_remains_in_combined_status_with_next_job(self):
+    async def test_finished_transfer_leaves_status_with_next_job(self):
         completed = Job(7, "peer", 10, Source("video", VIDEO_URL), ("480p",),
                         Video("Completed title", {"480p": "https://cdn.example.com/480.mp4"}))
         queued = Job(7, "peer", 11, Source("video", VIDEO_URL), ("360p",), None)
@@ -240,36 +239,43 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(completed.token, self.service.jobs)
         self.assertEqual(self.service.user_jobs(7), [queued])
         dashboard_text = self.client.edit_message.await_args.args[2]
-        self.assertIn("Completed title", dashboard_text)
-        self.assertIn("Finished", dashboard_text)
+        self.assertNotIn("Completed title", dashboard_text)
+        self.assertNotIn("Finished", dashboard_text)
         self.assertIn("Queued", dashboard_text)
         self.assertIn(queued.token, dashboard_text)
         self.event.raw_text = "/status"
         await self.service.on_message(self.event)
-        self.assertIn("Completed title", self.sent[-1][1])
-        self.assertIn("Finished", self.sent[-1][1])
+        self.assertNotIn("Completed title", self.sent[-1][1])
+        self.assertIn(queued.token, self.sent[-1][1])
         self.assertIn(101, self.client.delete_messages.await_args.args[1])
 
-    async def test_status_retains_five_recent_finished_jobs(self):
-        now = asyncio.get_running_loop().time()
-        self.service.completed[7] = [(now - i, f"🎬 Finished video {i}") for i in range(5)]
-        await self.service.on_message(self.event)
-        for i in range(5):
-            self.assertIn(f"Finished video {i}", self.sent[-1][1])
+    async def test_cancelled_and_finished_jobs_never_appear_in_status(self):
+        cancelled = Job(7, "peer", 10, Source("video", VIDEO_URL), ("480p",), None)
+        cancelled.title = "Stopped by me"
+        self.service.jobs[cancelled.token] = cancelled
+        self.service.send_stream = AsyncMock(side_effect=asyncio.CancelledError())
+        await self.service.run_job(cancelled)  # Ends as cancelled and leaves the jobs table.
+        self.assertNotIn(cancelled.token, self.service.jobs)
+        await self.service.on_message(self.event)  # /status
+        self.assertNotIn("Stopped by me", self.sent[-1][1])
+        self.assertIn("No active transfers", self.sent[-1][1])
 
-    async def test_numbered_apis_only_removes_own_custom_url(self):
+    async def test_apis_lists_each_service_and_removes_one_by_keyword(self):
         custom = "https://my-api.example.com/convert?key=abc"
         self.service.set_api(7, custom)
+        self.service.set_api(7, "https://tera.example.com/api", "terabox")
         self.event.raw_text = "/apis"
         await self.service.on_message(self.event)
         text = self.sent[-1][1]
-        self.assertIn("1. YouTube default: " + API_URL, text)
-        self.assertIn("2. Terabox: " + TERABOX_API_URL, text)
-        self.assertIn("3. YouTube custom: " + custom, text)
-        self.event.raw_text = "/apis remove 1"
-        await self.service.on_message(self.event)
-        self.assertEqual(self.service.api_for(7), custom)
-        self.event.raw_text = "/apis remove 3"
+        self.assertIn("YouTube: " + custom + " (custom)", text)
+        self.assertIn("Terabox: https://tera.example.com/api (custom)", text)
+        self.assertIn("Dailymotion: ", text)
+        self.event.raw_text = "/apis remove yt"
         await self.service.on_message(self.event)
         self.assertEqual(self.service.api_for(7), API_URL)
+        self.assertEqual(self.service.api_for(7, "terabox"), "https://tera.example.com/api")
         self.assertEqual(self.service.api_for(8), API_URL)
+        self.event.raw_text = "/apis remove daily"
+        await self.service.on_message(self.event)
+        self.assertIn("No custom Dailymotion API to remove.", self.sent[-1][1])
+
