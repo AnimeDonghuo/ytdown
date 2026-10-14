@@ -1017,3 +1017,60 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
             check_media_tools()
         self.assertIn("ffmpeg, ffprobe not found", logs.output[0])
 
+
+class CrunchyrollRefusalTests(unittest.IsolatedAsyncioTestCase):
+    """Crunchyroll links are recognised, and answered honestly instead of with a parse error."""
+
+    def service(self):
+        client = MagicMock()
+        client.send_message = AsyncMock(return_value=SimpleNamespace(id=101))
+        return DownloaderBot(client, MagicMock())
+
+    def event(self, text):
+        return SimpleNamespace(sender_id=7, raw_text=text, is_private=True,
+                               get_input_chat=AsyncMock(return_value="peer"),
+                               respond=AsyncMock())
+
+    def test_recognises_crunchyroll_links_only(self):
+        from ytdown.bot import crunchyroll_link
+        for link in ("https://www.crunchyroll.com/watch/GY9P5KJ3R/some-episode",
+                     "https://crunchyroll.com/watch/GY9P5KJ3R",
+                     "https://beta.crunchyroll.com/series/G6QWD3PJ6/one-piece",
+                     "http://crunchyroll.com/watch/GY9P5KJ3R",
+                     "https://www.crunchyroll.com/watch/GY9P5KJ3R?utm_source=x",
+                     "https://www.crunchyroll.com"):  # Any Crunchyroll URL gets the explanation.
+            self.assertTrue(crunchyroll_link(link), link)
+        for link in ("https://www.crunchyroll.com.evil.example/watch/GY9P5KJ3R",
+                     "https://notcrunchyroll.com/watch/GY9P5KJ3R",
+                     "https://youtu.be/3SY1i5CB03Q", "", "crunchyroll.com/watch/x", 7):
+            self.assertFalse(crunchyroll_link(link), link)
+
+    async def test_a_crunchyroll_link_explains_why_it_is_not_supported(self):
+        service = self.service()
+        event = self.event("https://www.crunchyroll.com/watch/GY9P5KJ3R/some-episode")
+        await service.on_link(event)
+        reply = event.respond.call_args.args[0]
+        self.assertIn("Widevine-encrypted", reply)
+        self.assertIn("does not decrypt DRM", reply)
+        self.assertIn("premium account", reply)  # Points at the supported offline route.
+        self.assertEqual(service.selections, {})  # Nothing was queued.
+
+    async def test_the_same_answer_comes_in_every_mode(self):
+        service = self.service()
+        for mode in ("youtube", "terabox", "dailymotion", "rumble"):
+            service.modes[7] = mode
+            event = self.event("https://www.crunchyroll.com/watch/GY9P5KJ3R")
+            await service.on_link(event)
+            self.assertIn("Crunchyroll is not supported", event.respond.call_args.args[0], mode)
+
+    async def test_a_crunchyroll_link_is_never_taken_for_an_api_endpoint(self):
+        from ytdown.bot import normalize_api_endpoint
+        with self.assertRaisesRegex(ValueError, "DRM-protected"):
+            normalize_api_endpoint("https://www.crunchyroll.com/watch/GY9P5KJ3R")
+
+    async def test_a_plain_text_message_still_gets_the_generic_help(self):
+        service = self.service()
+        event = self.event("hello there")
+        await service.on_link(event)
+        self.assertNotIn("Widevine", event.respond.call_args.args[0])
+

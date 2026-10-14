@@ -247,6 +247,32 @@ class Job:
     listing: TeraboxListing | None = None
 
 
+# Crunchyroll is recognised only to explain why it cannot be downloaded. Every
+# stream it serves is Widevine-encrypted, and reading those needs a CDM device
+# file plus a Widevine licence request to recover the content keys — DRM
+# circumvention this bot does not do.
+CRUNCHYROLL_HOSTS = ("crunchyroll.com",)
+CRUNCHYROLL_NOTICE = (
+    "Crunchyroll is not supported: its streams are Widevine-encrypted, and this bot does not "
+    "decrypt DRM. Downloading them would mean asking Widevine for the content keys with a real "
+    "CDM device file and then decrypting the video (what tools like "
+    "LastPerson07/Crunchyroll-Downloader do with pywidevine + mp4decrypt); that breaks "
+    "Crunchyroll's terms and would get the account and the bot banned.\n\n"
+    "For offline viewing, use the Crunchyroll app's own downloads with a premium account — "
+    "that is the supported route. Everything else here (YouTube, Terabox, Dailymotion, "
+    "Rumble) is unaffected.")
+
+
+def crunchyroll_link(raw: str) -> bool:
+    """True for a Crunchyroll URL, whatever subdomain it uses."""
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    parts = urlsplit(raw.strip())
+    host = (parts.hostname or "").lower().rstrip(".")
+    return bool(parts.scheme in ("http", "https") and host and
+                any(host == suffix or host.endswith("." + suffix) for suffix in CRUNCHYROLL_HOSTS))
+
+
 def is_media_link(raw: str) -> bool:
     """Keep media links out of a pending /changeapi URL prompt."""
     for parser in (parse_source, parse_terabox_source, parse_dailymotion_source, parse_rumble_source):
@@ -269,6 +295,9 @@ def normalize_api_endpoint(raw: str) -> str:
         raise ValueError("Send an API endpoint, not a YouTube video link.")
     if host.endswith("rumble.com"):
         raise ValueError("Send an API endpoint, not a Rumble video link.")
+    if host == "crunchyroll.com" or host.endswith(".crunchyroll.com"):
+        raise ValueError("Crunchyroll is not supported (its streams are DRM-protected), "
+                         "so it has no API to point at.")
     params = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k.lower() != "url"]
     return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", urlencode(params), ""))
 
@@ -1705,6 +1734,9 @@ class DownloaderBot:
                       else Source("rumble", parse_rumble_source(event.raw_text)) if mode == "rumble"
                       else parse_source(event.raw_text))
         except ValueError as exc:
+            if crunchyroll_link(event.raw_text or ""):
+                await event.respond(CRUNCHYROLL_NOTICE, parse_mode=None)
+                return
             # A pasted proxy list is the most common mistake here; point at /proxychk.
             proxies, _ = parse_proxies(event.raw_text or "", 10)
             if len(proxies) >= 2:
