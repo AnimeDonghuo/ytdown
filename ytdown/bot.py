@@ -41,6 +41,12 @@ from .dailymotion import (DAILYMOTION_API_URL, MAX_API_BYTES, MAX_MANIFEST_BYTES
                           proxy_manifest, read_bounded)
 from .rumble import (RUMBLE_API_URL, RumbleError, extract_rumble, normalize_rumble,
                      parse_rumble_source)
+from .mega import (MAX_MEGA_LINKS, MEGA_API_URL, MEGA_HOSTS, MegaError, MegaFile, MegaListing,
+                   find_mega_links, mega_source, merge_listings, normalize_mega, parse_mega_source,
+                   video_choice)
+from .social import (MAX_SOCIAL_LINKS, SOCIAL_API_URL, SOCIAL_HOSTS, SocialBatch, SocialChoice,
+                     SocialDownload, SocialError, SocialMedia, find_social_links, normalize_social,
+                     parse_social_source, social_choices, social_source)
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg, usable_still
 from .proxy import (CHECK_TARGETS, KNOWN_TARGETS, MAX_PROXIES, MIN_LATENCY_MS, SERVICE_KEYS, TOO_FAST,
@@ -49,20 +55,26 @@ from .proxy import (CHECK_TARGETS, KNOWN_TARGETS, MAX_PROXIES, MIN_LATENCY_MS, S
                     run_checks, short_reason, site_marks, target_for, target_label, with_url)
 
 LOG = logging.getLogger(__name__)
-MODE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion", "rumble": "Rumble"}
+MODE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion",
+               "rumble": "Rumble", "mega": "MEGA", "social": "Instagram/Facebook"}
 API_URL = "https://samra-youtube-api.antideploy.com/"
 DEFAULT_APIS = {"youtube": API_URL, "terabox": TERABOX_API_URL, "dailymotion": DAILYMOTION_API_URL,
-                "rumble": RUMBLE_API_URL}
-SERVICE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion", "rumble": "Rumble"}
+                "rumble": RUMBLE_API_URL, "mega": MEGA_API_URL, "social": SOCIAL_API_URL}
+SERVICE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion",
+                  "rumble": "Rumble", "mega": "MEGA", "social": "Instagram/Facebook"}
 SERVICE_KEYWORDS = {"yt": "youtube", "youtube": "youtube", "tera": "terabox", "terabox": "terabox",
                     "daily": "dailymotion", "dailymotion": "dailymotion", "dm": "dailymotion",
-                    "rumble": "rumble", "rum": "rumble"}
+                    "rumble": "rumble", "rum": "rumble", "mega": "mega", "mg": "mega",
+                    "mega.nz": "mega", "social": "social", "insta": "social", "ig": "social",
+                    "instagram": "social", "fb": "social", "facebook": "social"}
 RESET_WORDS = ("reset", "remove", "default")
 MAX_WAITING = 4
 MAX_SELECTIONS = 100
 SESSION_SECONDS = 1800
 # Telegram clients limit uploads to 4,000 parts of 512 KiB (2,000 MiB).
 # 2,047 MiB would need 4,094 parts and can fail near the end of an upload.
+# The Instagram/Facebook API scrapes the platform and routinely answers late.
+SOCIAL_TIMEOUT = aiohttp.ClientTimeout(total=300, connect=30, sock_read=180)
 MAX_MT_MB = 2000
 PART_BYTES = 512 * 1024
 MAX_PARTS = 4000
@@ -183,7 +195,8 @@ class Selection:
     api_endpoint: str = API_URL
     start: int = 1
     end: int = 1
-    listing: TeraboxListing | None = None
+    listing: TeraboxListing | MegaListing | None = None
+    social: SocialMedia | SocialBatch | None = None
 
 
 @dataclass
@@ -192,7 +205,7 @@ class RangeRequest:
     peer: object
     count: int
     api_endpoint: str = API_URL
-    listing: TeraboxListing | None = None
+    listing: TeraboxListing | MegaListing | None = None
     created: float = field(default_factory=time.monotonic)
 
 
@@ -244,7 +257,8 @@ class Job:
     current_url: str = ""
     start: int = 1
     end: int = 1
-    listing: TeraboxListing | None = None
+    listing: TeraboxListing | MegaListing | None = None
+    social: SocialMedia | SocialBatch | None = None
 
 
 # Crunchyroll is recognised only to explain why it cannot be downloaded. Every
@@ -275,7 +289,10 @@ def crunchyroll_link(raw: str) -> bool:
 
 def is_media_link(raw: str) -> bool:
     """Keep media links out of a pending /changeapi URL prompt."""
-    for parser in (parse_source, parse_terabox_source, parse_dailymotion_source, parse_rumble_source):
+    if find_mega_links(raw or "") or find_social_links(raw or ""):
+        return True  # One media link, or a whole list of them.
+    for parser in (parse_source, parse_terabox_source, parse_dailymotion_source, parse_rumble_source,
+                   parse_mega_source, parse_social_source):
         try:
             parser(raw)
             return True
@@ -298,18 +315,24 @@ def normalize_api_endpoint(raw: str) -> str:
     if host == "crunchyroll.com" or host.endswith(".crunchyroll.com"):
         raise ValueError("Crunchyroll is not supported (its streams are DRM-protected), "
                          "so it has no API to point at.")
+    if any(host == suffix or host.endswith("." + suffix) for suffix in MEGA_HOSTS):
+        raise ValueError("Send an API endpoint, not a MEGA file or folder link.")
+    if any(host == suffix or host.endswith("." + suffix) for suffix in SOCIAL_HOSTS):
+        raise ValueError("Send an API endpoint, not an Instagram or Facebook link.")
     params = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k.lower() != "url"]
     return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", urlencode(params), ""))
 
 
 async def fetch_json_api(session: aiohttp.ClientSession, api_endpoint: str, url: str,
-                         max_bytes: int = 2_000_000):
+                         max_bytes: int = 2_000_000,
+                         timeout: aiohttp.ClientTimeout | None = None):
     endpoint, params = api_endpoint, {"url": url}
     for _ in range(5):
         if not public_https_url(endpoint):
             raise ValueError("API redirected to an unsafe address.")
         async with session.get(endpoint, params=params, allow_redirects=False,
-                               timeout=aiohttp.ClientTimeout(total=240, connect=20)) as response:
+                               timeout=timeout or aiohttp.ClientTimeout(total=240,
+                                                                       connect=20)) as response:
             if response.status in (301, 302, 303, 307, 308):
                 location = response.headers.get("Location")
                 if not location:
@@ -379,6 +402,32 @@ async def fetch_rumble(session: aiohttp.ClientSession, url: str, endpoint: str =
 async def fetch_terabox(session: aiohttp.ClientSession, url: str,
                          endpoint: str = TERABOX_API_URL) -> TeraboxListing:
     return normalize_terabox(await fetch_json_api(session, endpoint, url, 4_000_000))
+
+
+async def fetch_mega(session: aiohttp.ClientSession, url: str,
+                     endpoint: str = MEGA_API_URL) -> MegaListing:
+    """A MEGA file or folder link: the API returns the whole folder tree."""
+    return normalize_mega(await fetch_json_api(session, endpoint, url, 8_000_000))
+
+
+async def fetch_social(session: aiohttp.ClientSession, url: str,
+                       endpoint: str = SOCIAL_API_URL) -> SocialMedia:
+    """An Instagram/Facebook link through the DESI API.
+
+    That API scrapes the platforms, so it is slow by nature: it gets the long
+    timeout, one retry when the connection itself fails, and nothing that would
+    cut a working-but-slow answer short.
+    """
+    try:
+        payload = await fetch_json_api(session, endpoint, url, 2_000_000, timeout=SOCIAL_TIMEOUT)
+    except aiohttp.ClientError as exc:
+        if isinstance(exc, aiohttp.ClientResponseError):
+            raise
+        LOG.info("Instagram/Facebook API connection failed (%s); trying once more",
+                 type(exc).__name__)
+        await asyncio.sleep(3)
+        payload = await fetch_json_api(session, endpoint, url, 2_000_000, timeout=SOCIAL_TIMEOUT)
+    return normalize_social(payload, url)
 
 
 def dailymotion_poster(url: str, known: str = "") -> str:
@@ -472,6 +521,47 @@ async def get_youtube_title(session, url: str, proxy: str | None = None) -> str:
     return ""
 
 
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0 Safari/537.36")
+MAX_SOCIAL_IMAGE_BYTES = 12 * 1024 * 1024
+
+
+async def download_social_image(session: aiohttp.ClientSession, url: str, headers: dict,
+                                limit: int) -> bytes:
+    """Fetch an Instagram/Facebook image, bounded, following at most four redirects."""
+    for _ in range(5):
+        if not public_https_url(url):
+            raise ValueError("The provider supplied an unsafe download link.")
+        async with session.get(url, allow_redirects=False, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=60, connect=20)) as response:
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("Download redirect has no destination.")
+                url = urljoin(str(response.url), location)
+                continue
+            response.raise_for_status()
+            if response.content_type in ("text/html", "application/json"):
+                raise ValueError("The media link returned a page instead of a file.")
+            if response.content_length and response.content_length > limit:
+                raise FileTooLarge()
+            data = await response.content.read(limit + 1)
+            if not data:
+                raise ValueError("The media link returned an empty file.")
+            if len(data) > limit:
+                raise FileTooLarge()
+            return data
+    raise ValueError("Too many download redirects.")
+
+
+def media_filename(title: str, item, index: int, total: int) -> str:
+    """A safe file name for one social media item, numbered inside a selection."""
+    safe = re.sub(r"[^\w .-]", "_", str(title or "media"), flags=re.UNICODE).strip(" .")[:80] or "media"
+    prefix = f"{index:02d}-{total:02d} " if total > 1 else ""
+    tag = re.sub(r"[^\w .-]", "_", item.label)[:24] or item.kind  # Spaces read better than "_".
+    return f"{prefix}{safe} [{tag}]{item.suffix}"
+
+
 def choose_title(youtube: str, provider: str, url: str) -> str:
     return youtube or provider or f"YouTube video {url.rsplit('=', 1)[-1]}"
 
@@ -556,7 +646,7 @@ async def upload_parts(client, reader: HTTPReader, size: int, filename: str,
 async def upload_stream(client: TelegramClient, session: aiohttp.ClientSession, url: str,
                         filename: str, max_bytes: int, *, on_total=None, on_download=None,
                         on_upload=None, on_flood=None, on_data=None, in_flight: int = 2,
-                        expected_size: int = 0):
+                        expected_size: int = 0, headers: dict | None = None):
     """Download from CDN while uploading MTProto parts. Never store a 2 GB file on Koyeb.
 
 Pipelines bounded saveBigFilePart/saveFilePart requests from the HTTP stream,
@@ -565,7 +655,7 @@ Pipelines bounded saveBigFilePart/saveFilePart requests from the HTTP stream,
     for _ in range(5):
         if not public_https_url(url):
             raise ValueError("The provider supplied an unsafe download link.")
-        async with session.get(url, allow_redirects=False, auto_decompress=False,
+        async with session.get(url, allow_redirects=False, auto_decompress=False, headers=headers,
                                timeout=aiohttp.ClientTimeout(total=None, connect=20, sock_read=120)) as response:
             if response.status in (301, 302, 303, 307, 308):
                 location = response.headers.get("Location")
@@ -1127,8 +1217,9 @@ class DownloaderBot:
         unknown = [part for part in parts if part not in known]
         if unknown:
             await event.respond("Unknown site: " + ", ".join(unknown) + ". Use dailymotion, rumble, "
-                                "youtube or terabox (for example /proxychk sites rumble,youtube), or "
-                                "/proxychk sites default for Dailymotion + Rumble.")
+                                "youtube, terabox, mega, instagram or facebook (for example "
+                                "/proxychk sites rumble,youtube), or /proxychk sites default for "
+                                "Dailymotion + Rumble.")
             return
         self.proxy_check_keys = keys
         self.refresh_check_targets()
@@ -1393,16 +1484,17 @@ class DownloaderBot:
         head, _, tail = arg.partition(" ")
         head, tail = head.lower(), tail.strip()
         if not arg:
-            await event.respond("Choose a service with /changeapi yt, tera, daily or rumble, then send its "
-                                "public HTTPS API URL, for example /changeapi yt https://example.com/?url=. "
-                                "/changeapi show lists them; /changeapi reset restores all built-in APIs.")
+            await event.respond("Choose a service with /changeapi yt, tera, daily, rumble, mega or ig, "
+                                "then send its public HTTPS API URL, for example "
+                                "/changeapi yt https://example.com/?url=. /changeapi show lists them; "
+                                "/changeapi reset restores all built-in APIs.")
             return
         if head == "show":
             await event.respond("\n".join(self.api_lines(uid)), parse_mode=None)
             return
         if head in RESET_WORDS:
             if tail and tail.lower() not in SERVICE_KEYWORDS:
-                await event.respond("Unknown service. Use yt, tera or daily.")
+                await event.respond("Unknown service. Use yt, tera, daily, rumble, mega or ig.")
                 return
             service = SERVICE_KEYWORDS[tail.lower()] if tail else None
             self.clear_api(uid, service)
@@ -1447,19 +1539,22 @@ class DownloaderBot:
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
         if command in ("/start", "/help"):
             await event.respond(
-                "Choose YouTube, Terabox, Dailymotion or Rumble with /change, then send a link for that service. "
+                "Choose YouTube, Terabox, Dailymotion, Rumble, MEGA or Instagram/Facebook with /change, "
+                "then send a link for that service. "
                 "Pick one or several available qualities and tap Done. Playlists/folders first show "
                 "their file count; send a range such as 1-29 or 200-300, then select qualities. "
                 "Send another link while a job runs to queue it. Transfers stay sequential.\n\n"
                 "A watch link containing list= is treated as a playlist; remove it for just one video.\n\n"
-                "/change — YouTube / Terabox / Dailymotion / Rumble buttons\n"
+                "/change — YouTube / Terabox / Dailymotion / Rumble / MEGA / Instagram-Facebook buttons\n"
+                "MEGA: send a file or folder link, or several links at once. Instagram/Facebook: send a "
+                "post/reel/video link — that API is slow, so give it a minute.\n"
                 "/status or /queue — one live status for running and queued jobs\n"
                 "/cancel — list jobs; /cancel_<job-id> stops one with a tappable command\n"
                 "/apis — numbered API list; /apis remove 3 resets a custom API\n"
-                "/changeapi yt|tera|daily|rumble <URL> — set your own API for one service; /changeapi reset restores all\n"
+                "/changeapi yt|tera|daily|rumble|mega|ig <URL> — set your own API for one service; /changeapi reset restores all\n"
                 "/proxychk — paste or upload a proxy list; checks Dailymotion + Rumble APIs\n"
                 "/proxychk url <https://…> — also check your own API host\n"
-                "/proxychk sites dailymotion,rumble,youtube,terabox — choose which sites are tested\n"
+                "/proxychk sites dailymotion,rumble,youtube,terabox,mega,social — choose which sites are tested\n"
                 "/proxychk fast <ms|off> — replies faster than this fail automatically\n"
                 "/proxychk export [all] — save the pool as a .txt to paste back after a restart\n"
                 "/proxy — proxy mode ON/OFF, pool status, re-check or clear the pool\n"
@@ -1492,7 +1587,10 @@ class DownloaderBot:
                                 buttons=[[Button.inline("▶️ YouTube", data=f"m:{token}:youtube".encode()),
                                           Button.inline("📁 Terabox", data=f"m:{token}:terabox".encode())],
                                          [Button.inline("🎞 Dailymotion", data=f"m:{token}:dailymotion".encode()),
-                                           Button.inline("🟣 Rumble", data=f"m:{token}:rumble".encode())]])
+                                           Button.inline("🟣 Rumble", data=f"m:{token}:rumble".encode())],
+                                         [Button.inline("🗂 MEGA", data=f"m:{token}:mega".encode()),
+                                           Button.inline("📸 Instagram/Facebook",
+                                                         data=f"m:{token}:social".encode())]])
         elif command == "/changeapi":
             await self.handle_changeapi(event, text)
         elif command in ("/status", "/queue"):
@@ -1533,7 +1631,8 @@ class DownloaderBot:
                     "some sites is still usable for those, and only a real JSON answer from an API "
                     "counts as a pass. Working ones join your pool and dead ones are marked, with "
                     f"{self.proxy_workers} parallel workers. /proxychk stop cancels. /proxychk sites "
-                    "picks the sites (youtube, terabox, dailymotion, rumble); /proxychk url "
+                    "picks the sites (youtube, terabox, dailymotion, rumble, mega, instagram, "
+                    "facebook); /proxychk url "
                     "<https://…> adds your own API host. " + self.fast_guard_text(uid) + ".",
                     parse_mode=None)
         elif command == "/proxy":
@@ -1576,12 +1675,13 @@ class DownloaderBot:
                 else:
                     await event.respond(f"No custom {SERVICE_LABELS[service]} API to remove.")
             elif len(arg) > 1:
-                await event.respond("Use /apis to list the APIs, or /apis remove yt|tera|daily|rumble to restore one "
+                await event.respond("Use /apis to list the APIs, or /apis remove yt|tera|daily|rumble|mega|ig to restore one "
                                     "built-in API.")
             else:
                 await event.respond("\n".join(["Configured APIs (for your account):", *self.api_lines(uid),
-                                                "Change with /changeapi yt|tera|daily|rumble <URL>; restore with "
-                                                "/changeapi yt|tera|daily|rumble reset."]), parse_mode=None)
+                                                "Change with /changeapi yt|tera|daily|rumble|mega|ig <URL>; "
+                                                "restore with /changeapi yt|tera|daily|rumble|mega|ig reset."]),
+                                  parse_mode=None)
         elif command == "/cancel" or command.startswith("/cancel_"):
             uid = event.sender_id
             if command.startswith("/cancel_") and not re.fullmatch(r"/cancel_[a-f0-9]{8}", command):
@@ -1660,6 +1760,89 @@ class DownloaderBot:
                 self.pending_ranges.pop(event.sender_id, None)
                 await self.on_link(event)
 
+    @staticmethod
+    def mega_choices(files: tuple[MegaFile, ...]) -> tuple[str, ...]:
+        """MEGA files come as they are: the choice is the kind of file."""
+        order = ("Video", "Audio", "File")
+        found = {video_choice(file) for file in files}
+        return tuple(kind for kind in order if kind in found)
+
+    async def read_mega_links(self, uid: int, links: tuple[str, ...], endpoint: str
+                              ) -> tuple[MegaListing, list[str]]:
+        """Read several MEGA links at once and merge them into one listing.
+
+        One link the API cannot read never sinks the batch: the other links are
+        still listed, and the prompt names the ones that were skipped.
+        """
+        session = self.http_for(uid)
+        results = await asyncio.gather(*(fetch_mega(session, link, endpoint) for link in links),
+                                       return_exceptions=True)
+        listings: list[MegaListing] = []
+        labels: list[str] = []
+        broken: list[str] = []
+        for position, result in enumerate(results, 1):
+            if isinstance(result, MegaListing) and result.files:
+                listings.append(result)
+                labels.append(str(position))  # The pasted link's own number.
+                continue
+            reason = (str(result) if isinstance(result, MegaError) and str(result)
+                      else "the API could not read it" if not isinstance(result, BaseException)
+                      else type(result).__name__)
+            broken.append(f"link {position} ({reason})")
+        if not listings:
+            raise MegaError("None of those MEGA links could be read. " + "; ".join(broken[:3]) + ".")
+        return merge_listings(listings, tuple(labels)), broken
+
+    async def read_social_links(self, uid: int, links: tuple[str, ...], endpoint: str
+                                ) -> tuple[SocialBatch, list[str]]:
+        """Read several Instagram/Facebook links at once and offer them as one list.
+
+        The API is slow, so the links are read in parallel rather than one after
+        another; a link it cannot read is named in the prompt and the rest stay.
+        """
+        session = self.http_for(uid)
+        results = await asyncio.gather(*(fetch_social(session, link, endpoint) for link in links),
+                                       return_exceptions=True)
+        slots: list[SocialMedia | None] = []
+        broken: list[str] = []
+        for position, result in enumerate(results, 1):
+            if isinstance(result, SocialMedia):
+                slots.append(result)
+                continue
+            slots.append(None)  # Keeps this link's number for the options that did work.
+            reason = (str(result) if isinstance(result, SocialError) and str(result)
+                      else "the API could not read it" if not isinstance(result, BaseException)
+                      else type(result).__name__)
+            broken.append(f"link {position} ({reason})")
+        if not any(slots):
+            raise SocialError("None of those links could be read. " + "; ".join(broken[:3]) + ".")
+        return SocialBatch(tuple(slots)), broken
+
+    @staticmethod
+    def social_prompt(media: "SocialMedia | SocialBatch", choices: tuple[SocialChoice, ...],
+                      broken: list[str]) -> str:
+        """The lookup message: what was found, what can be picked, what failed."""
+        if isinstance(media, SocialBatch):
+            lines = [f"📸 {media.title}:"]
+            lines += [f"· {position}. {item.platform}: {item.title} — {len(item.options())} option(s)"
+                      for position, item in media.present()]
+        else:
+            lines = [f"📸 {media.platform}: {media.title}"]
+        lines += [f"· {choice.label} ({choice.item.kind}, {choice.item.format})"
+                  for choice in choices]
+        if isinstance(media, SocialBatch) and media.dropped:
+            lines.append(f"… {media.dropped} more option(s) do not fit here; send fewer links "
+                         "and every option appears.")
+        text = "\n".join(lines) + DownloaderBot.mega_note(broken)
+        return text + "\nChoose one or more, then tap Done:"
+
+    @staticmethod
+    def mega_note(broken: list[str]) -> str:
+        """One warning line for the links a multi-link paste could not read."""
+        if not broken:
+            return ""
+        return f"\n⚠️ Skipped {len(broken)} link(s): " + "; ".join(broken[:2]) + "."
+
     def listing_choices(self, files: tuple[TeraboxFile, ...]) -> tuple[str, ...]:
         return tuple(sorted({item.quality for item in files},
                             key=lambda q: (q == "Original", q == "MP3", int(q[:-1]) if q.endswith("p") and q[:-1].isdigit() else 0)))
@@ -1684,10 +1867,14 @@ class DownloaderBot:
         if len(self.selections) >= MAX_SELECTIONS:
             await event.respond("Too many open selections right now. Try again later.")
             return
-        files = (tuple(file for index in range(start - 1, end)
-                       for file in request.listing.options_for(index)) if request.listing else ())
-        choices = (self.listing_choices(files) if files else
-                   tuple(f"{q}p" for q in VIDEO_QUALITIES))
+        if isinstance(request.listing, MegaListing):
+            files = tuple(request.listing.files[start - 1:end])
+            choices = self.mega_choices(files) or ("Video",)
+        else:
+            files = (tuple(file for index in range(start - 1, end)
+                           for file in request.listing.options_for(index)) if request.listing else ())
+            choices = (self.listing_choices(files) if files else
+                       tuple(f"{q}p" for q in VIDEO_QUALITIES))
         selection = Selection(secrets.token_hex(4), request.source, choices, request.peer,
                               api_endpoint=request.api_endpoint, start=start, end=end,
                               listing=request.listing)
@@ -1732,6 +1919,8 @@ class DownloaderBot:
             source = (Source("terabox", parse_terabox_source(event.raw_text)) if mode == "terabox"
                       else Source("dailymotion", parse_dailymotion_source(event.raw_text)) if mode == "dailymotion"
                       else Source("rumble", parse_rumble_source(event.raw_text)) if mode == "rumble"
+                      else Source("mega", mega_source(event.raw_text)) if mode == "mega"
+                      else Source("social", social_source(event.raw_text)) if mode == "social"
                       else parse_source(event.raw_text))
         except ValueError as exc:
             if crunchyroll_link(event.raw_text or ""):
@@ -1835,6 +2024,80 @@ class DownloaderBot:
                                       f"{human_size(item.size) if item.size else 'size unknown'}\n"
                                       "Choose a format, then Done:", buttons=self.keyboard(selection))
                 return
+            if source.kind == "mega":
+                links = find_mega_links(event.raw_text or "", MAX_MEGA_LINKS + 1)
+                if len(links) > MAX_MEGA_LINKS:
+                    await event.respond(f"Send at most {MAX_MEGA_LINKS} MEGA links at a time.")
+                    return
+                endpoint = self.api_for(uid, "mega")
+                if len(links) > 1:
+                    notice = await event.respond(f"Reading {len(links)} MEGA links through the API…")
+                    listing, broken = await self.read_mega_links(uid, links, endpoint)
+                else:
+                    notice = await event.respond("Reading this MEGA link through the API…")
+                    listing, broken = await fetch_mega(self.http_for(uid), source.url, endpoint), []
+                if self.modes.get(uid, "youtube") != mode:
+                    await notice.edit("Mode changed. Send your link again.")
+                    return
+                if not listing.files:
+                    # An empty listing is an API failure, not an empty folder:
+                    # there is nothing to show and nothing to pick.
+                    raise MegaError("This MEGA link has no files the bot can download.")
+                count = len(listing.files)
+                if count > 1:
+                    folder = Source("mega", source.url)
+                    self.pending_ranges[uid] = RangeRequest(folder, peer, count,
+                                                            api_endpoint=endpoint,
+                                                            listing=listing)
+                    names = listing.names(15)
+                    extra = (f"\n(The API sent {count} of {listing.reported_files} files; "
+                             "that is what the bot can take.)" if listing.truncated else "")
+                    where = f"{len(links)} MEGA links" if len(links) > 1 else "MEGA folder"
+                    await notice.edit(
+                        f"🗂 {where}: {count} files, {len(listing.folders)} subfolders."
+                        + self.mega_note(broken) + "\n"
+                        + "\n".join(names) + extra
+                        + f"\n\nSend an inclusive range like 1-{min(count, 5)} "
+                          f"(up to {self.playlist_limit} per job), or /cancel.",
+                        parse_mode=None)
+                else:
+                    item = listing.files[0]
+                    selection = Selection(secrets.token_hex(4), source,
+                                          self.mega_choices((item,)), peer, listing=listing,
+                                          api_endpoint=endpoint)
+                    self.selections[uid] = selection
+                    await notice.edit(self.mega_note(broken) + f"{item.path}\n"
+                                      f"{human_size(item.size) if item.size else 'size unknown'}"
+                                      f" · {video_choice(item)}\nChoose it, then tap Done:",
+                                      buttons=self.keyboard(selection), parse_mode=None)
+                return
+            if source.kind == "social":
+                links = find_social_links(event.raw_text or "", MAX_SOCIAL_LINKS + 1)
+                if len(links) > MAX_SOCIAL_LINKS:
+                    await event.respond(f"Send at most {MAX_SOCIAL_LINKS} Instagram/Facebook "
+                                        "links at a time.")
+                    return
+                endpoint = self.api_for(uid, "social")
+                if len(links) > 1:
+                    notice = await event.respond(f"Reading {len(links)} Instagram/Facebook links… "
+                                                 "this API is slow, so it can take a few minutes. "
+                                                 "/cancel to stop.")
+                    media, broken = await self.read_social_links(uid, links, endpoint)
+                else:
+                    notice = await event.respond("Reading this Instagram/Facebook link… this API is "
+                                                 "slow, so it can take a minute. /cancel to stop.")
+                    media, broken = await fetch_social(self.http_for(uid), source.url, endpoint), []
+                if self.modes.get(uid, "youtube") != mode:
+                    await notice.edit("Mode changed. Send your link again.")
+                    return
+                choices = social_choices(media)
+                selection = Selection(secrets.token_hex(4), source,
+                                      tuple(choice.label for choice in choices), peer, social=media,
+                                      api_endpoint=endpoint)
+                self.selections[uid] = selection
+                await notice.edit(self.social_prompt(media, choices, broken),
+                                  buttons=self.keyboard(selection), parse_mode=None)
+                return
             notice = await event.respond("Checking available qualities… This API may take 1–2 minutes. /cancel to stop.")
             http = self.http_for(uid)
             proxy = self.proxy_for(uid)
@@ -1868,7 +2131,12 @@ class DownloaderBot:
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError) as exc:
             LOG.warning("Link lookup failed for user %s: %s", uid, type(exc).__name__)
             if notice:
-                await self.safe_edit(notice, "Could not load this link. The API or source may be unavailable; try later.")
+                # Our own providers explain themselves ("private post", "no files");
+                # a raw library error would only confuse, so it stays generic.
+                reason = str(exc) if isinstance(exc, (MegaError, SocialError)) and str(exc) else ""
+                await self.safe_edit(notice, f"Could not load this link. {reason}" if reason else
+                                     "Could not load this link. The API or source may be "
+                                     "unavailable; try later.")
         finally:
             self.lookups.pop(uid, None)
 
@@ -2000,8 +2268,9 @@ class DownloaderBot:
         selected = tuple(key for key in selection.choices if key in selection.selected)
         job = Job(uid, selection.peer, event.message_id, selection.source, selected, selection.video,
                   api_endpoint=selection.api_endpoint, start=selection.start, end=selection.end,
-                  listing=selection.listing)
+                  listing=selection.listing, social=selection.social)
         job.title = (selection.video.title if selection.video else
+                     selection.social.title if selection.social else
                      selection.listing.files[job.start - 1].title if selection.listing else "")
         job.detail = f"Queued: {', '.join(selected)}. Waiting for the download slot."
         self.selections.pop(uid, None)
@@ -2092,6 +2361,12 @@ class DownloaderBot:
                 await self.progress(job, "Starting…")
                 if job.source.kind == "dailymotion":
                     await self.run_dailymotion(job)
+                    return
+                if job.source.kind == "social":
+                    await self.run_social(job)
+                    return
+                if job.source.kind == "mega":
+                    await self.run_mega(job)
                     return
                 if job.source.kind == "playlist":
                     await self.progress(job, f"Reading playlist entries {job.start}-{job.end}…")
@@ -2235,6 +2510,187 @@ class DownloaderBot:
                 job.reporter.cancel()
                 await asyncio.gather(job.reporter, return_exceptions=True)
             await self.archive_job(job)
+
+    async def run_mega(self, job: Job) -> None:
+        """One MEGA file or a folder range: stream each file straight to Telegram.
+
+        Files are downloaded through the API URL the listing handed over, so
+        proxy mode and the tool limits apply exactly as they do everywhere else.
+        """
+        listing = job.listing
+        if not isinstance(listing, MegaListing):
+            raise MegaError("The MEGA listing is missing; send the link again.")
+        multi = job.start > 1 or job.end > job.start
+        files = listing.files[job.start - 1:job.end] if multi else listing.files[:1]
+        if not files:
+            raise MegaError("No files in that range.")
+        wanted = [file for file in files if video_choice(file) in job.selected]
+        oversized = [file for file in wanted if file.size and file.size > self.max_bytes]
+        if oversized:
+            LOG.info("MEGA job %s: %d of %d selected file(s) exceed the %d MiB limit", job.token,
+                     len(oversized), len(wanted), self.max_bytes // 1048576)
+        sent = too_large = failed = 0
+        skip_reasons: list[str] = []
+        for offset, file in enumerate(files):
+            choice = video_choice(file)
+            if choice not in job.selected:
+                continue
+            index = job.start + offset if multi else offset + 1
+            job.item_index = index
+            job.item_total = job.end if multi else len(files)
+            job.current_url = f"{job.source.url}#{file.file_id}:{choice}"
+            job.title = file.title
+            job.quality = choice
+            job.total_bytes = job.downloaded = job.uploaded = 0
+            job.speed = 0.0
+            job.sample_bytes, job.sample_at = 0, time.monotonic()
+            if file.size > self.max_bytes:
+                too_large += 1
+                continue
+            video = Video(file.title, {choice: file.url}, thumbnail="")
+            await self.progress(job, f"Downloading MEGA → Telegram ({file.path}).")
+            urls = file.alternates()
+            for attempt, url in enumerate(urls):
+                try:
+                    await self.send_stream(job, video, choice, url, index, job.item_total, file)
+                    sent += 1
+                    break
+                except FileTooLarge:
+                    too_large += 1
+                    break
+                except UnknownLength:
+                    skip_reasons.append(f"{file.filename}: unknown size")
+                    failed += 1
+                    break
+                except (aiohttp.ClientError, RPCError, asyncio.TimeoutError, ValueError,
+                        OSError) as exc:
+                    # The API's download route can refuse a link while its streaming
+                    # route still works, so the other URLs for the same file are tried.
+                    if attempt + 1 < len(urls) and not job.downloaded:
+                        LOG.info("MEGA link refused for %s (%s); trying the next URL",
+                                 file.filename, type(exc).__name__)
+                        continue
+                    LOG.warning("MEGA transfer failed for %s: %s", file.filename, type(exc).__name__)
+                    skip_reasons.append(f"{file.filename}: {type(exc).__name__}")
+                    failed += 1
+                    break
+        summary = f"✅ Sent {sent} file(s) from MEGA."
+        if too_large:
+            summary += f" {too_large} over the size limit."
+        if failed:
+            summary += f" {failed} failed."
+        if skip_reasons:
+            summary += " " + " · ".join(skip_reasons[:3])
+        await self.progress(job, summary, force=True)
+
+    async def run_social(self, job: Job) -> None:
+        """Instagram/Facebook: download the chosen media straight from the CDN."""
+        media = job.social
+        if not isinstance(media, (SocialMedia, SocialBatch)):
+            raise SocialError("The Instagram/Facebook lookup is missing; send the link again.")
+        options = social_choices(media)
+        sent = failed = 0
+        reasons: list[str] = []
+        job.item_total = len(job.selected)
+        for offset, label in enumerate(job.selected):
+            choice = next((option for option in options if option.label == label), None)
+            if choice is None:
+                failed += 1
+                continue
+            item = choice.item
+            job.item_index = offset + 1
+            job.quality = item.label
+            job.title = choice.media.title
+            job.current_url = item.url
+            job.total_bytes = job.downloaded = job.uploaded = 0
+            job.speed = 0.0
+            job.sample_bytes, job.sample_at = 0, time.monotonic()
+            await self.progress(job, f"Downloading {item.label} → Telegram.")
+            try:
+                await self.send_social(job, choice.media, item)
+                sent += 1
+            except (aiohttp.ClientError, RPCError, asyncio.TimeoutError, ValueError,
+                    OSError) as exc:
+                LOG.warning("Instagram/Facebook transfer failed (%s): %s", item.label,
+                            type(exc).__name__)
+                reasons.append(f"{item.label}: {type(exc).__name__}")
+                failed += 1
+        summary = f"✅ Sent {sent} item(s)." if sent else "No media could be sent."
+        if failed:
+            summary += f" {failed} failed ({' · '.join(reasons[:3])})."
+        await self.progress(job, summary, force=True)
+
+    async def send_social(self, job: Job, media: SocialMedia, item: SocialDownload) -> None:
+        """Send one Instagram/Facebook file: a photo, a video or a document.
+
+        The CDN URLs are signed for a browser, so the requests carry a browser
+        user agent and the platform's referer. Images are bounded downloads,
+        videos stream through the same MTProto pipeline as every other service.
+        """
+        filename = media_filename(media.title, item, job.item_index, job.item_total)
+        headers = {"User-Agent": BROWSER_UA, "Referer": f"https://www.{'instagram.com' if media.platform == 'Instagram' else 'facebook.com'}/"}
+        session = self.http_for(job.user_id)
+        thumb_data = thumb_w = thumb_h = None
+        if not item.is_video:
+            # Images are small: one bounded read, then send (or refuse) it.
+            data = await download_social_image(session, item.url, headers, MAX_SOCIAL_IMAGE_BYTES)
+            if item.is_image:
+                buffer = io.BytesIO(data)
+                buffer.name = filename
+                sent = await self.client.send_file(job.peer, buffer, caption=media.title,
+                                                   parse_mode=None, force_document=False)
+                LOG.info("Sent %s image (%d bytes)", media.platform, len(data))
+                return sent
+            buffer = io.BytesIO(data)
+            buffer.name = filename
+            return await self.client.send_file(job.peer, buffer, caption=media.title,
+                                               parse_mode=None, force_document=True)
+        probe = MediaProbe(item.suffix)
+        def on_total(count: int) -> None:
+            job.total_bytes = count
+        def on_download(count: int) -> None:
+            job.downloaded += count
+        def on_upload(done: int, total: int) -> None:
+            job.uploaded = done
+            job.total_bytes = total
+        def on_flood(seconds: int) -> None:
+            job.rate_limit_until = time.monotonic() + seconds if seconds else 0
+        uploaded = await upload_stream(self.client, session, item.url, filename, self.max_bytes,
+                                       on_total=on_total, on_download=on_download,
+                                       on_upload=on_upload, on_flood=on_flood,
+                                       on_data=probe.add, in_flight=self.in_flight,
+                                       headers=headers)
+        info = await probe.inspect()
+        if media.thumbnail:
+            cover = await thumbnail_jpeg(session, media.thumbnail)
+            if cover:
+                thumb_data, thumb_w, thumb_h = cover
+        if not thumb_data:
+            frame = await probe.preview_jpeg()
+            if frame:
+                thumb_data, thumb_w, thumb_h = frame
+        thumb_file = io.BytesIO(thumb_data) if thumb_data else None
+        if thumb_file:
+            thumb_file.name = "preview.jpg"
+        attributes = [types.DocumentAttributeVideo(duration=info.duration,
+                                                   w=info.width or thumb_w or 16,
+                                                   h=info.height or thumb_h or 9,
+                                                   supports_streaming=True)]
+        await self.progress(job, "Preparing preview and sending file to chat.")
+        try:
+            sent = await self.client.send_file(job.peer, uploaded, caption=media.title,
+                                               parse_mode=None, mime_type="video/mp4",
+                                               attributes=attributes, supports_streaming=True,
+                                               thumb=thumb_file)
+        except (PhotoInvalidDimensionsError, PhotoInvalidError, VideoContentTypeInvalidError):
+            thumb_file = None
+            sent = await self.client.send_file(job.peer, uploaded, caption=media.title,
+                                               parse_mode=None, mime_type="video/mp4",
+                                               attributes=attributes, supports_streaming=True,
+                                               force_document=True)
+        LOG.info("Sent %s video (%d bytes, cover %s)", media.platform, job.total_bytes,
+                 "yes" if thumb_data else "no")
+        return sent
 
     async def run_dailymotion(self, job: Job) -> None:
         """One Dailymotion video: HLS variant -> temporary MP4 (yt-dlp + ffmpeg) -> upload from disk."""
@@ -2417,9 +2873,12 @@ class DownloaderBot:
             LOG.warning("Could not send the cover photo; the video remains in the chat", exc_info=True)
 
     async def send_stream(self, job: Job, video: Video, quality: str, url: str, index: int, total: int,
-                          source_file: TeraboxFile | None = None) -> None:
+                          source_file: TeraboxFile | MegaFile | None = None) -> None:
         suffix = (Path(source_file.filename).suffix.lower() if source_file else
                   ".mp3" if quality == AUDIO else ".mp4")
+        # ".mp4.ts", ".part" and friends exist in the wild; Telegram needs a sane one.
+        suffix = suffix if re.fullmatch(r"\.[a-z0-9]{1,8}", suffix or "") else (
+            ".mp3" if quality == AUDIO else ".mp4")
         suffix = suffix if re.fullmatch(r"\.[a-z0-9]{1,8}", suffix) else ".bin"
         audio = quality.lower() == "mp3" or bool(source_file and source_file.mime.startswith("audio/"))
         video_file = source_file.video if source_file else not audio

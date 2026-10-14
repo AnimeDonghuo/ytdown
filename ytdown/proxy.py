@@ -71,9 +71,22 @@ TERABOX_TARGET = CheckTarget("terabox", "Terabox", "TB", "https://www.terabox.co
 YOUTUBE_TARGET = CheckTarget("youtube", "YouTube", "YT", CHECK_URL, nocontent=True,
                              hosts=("youtube.com", "youtu.be", "ytimg.com", "googlevideo.com",
                                     "youtube-nocookie.com", "ggpht.com"))
+# MEGA and the social API are checked against the site itself; their APIs take a
+# link parameter, so there is no fixed API probe to point a check at (see
+# api_target: without an API_PROBES entry the site probe is kept).
+MEGA_TARGET = CheckTarget("mega", "MEGA", "MG", "https://mega.nz/robots.txt",
+                          hosts=("mega.nz", "mega.io", "mega.co.nz"))
+SOCIAL_TARGET = CheckTarget("social", "Instagram/Facebook", "IG", "https://www.instagram.com/robots.txt",
+                            hosts=("instagram.com", "instagr.am", "cdninstagram.com",
+                                   "facebook.com", "fb.com", "fb.watch", "fbcdn.net"))
 CHECK_TARGETS = (DAILYMOTION_TARGET, RUMBLE_TARGET)
 # Every site a check can be pointed at, not just the selected ones.
-KNOWN_TARGETS = (DAILYMOTION_TARGET, RUMBLE_TARGET, YOUTUBE_TARGET, TERABOX_TARGET)
+KNOWN_TARGETS = (DAILYMOTION_TARGET, RUMBLE_TARGET, YOUTUBE_TARGET, TERABOX_TARGET,
+                 MEGA_TARGET, SOCIAL_TARGET)
+# Names people type for a target that is called something else internally.
+TARGET_ALIASES = {"mega.nz": "mega", "mg": "mega", "insta": "social", "ig": "social",
+                  "instagram": "social", "fb": "social", "facebook": "social",
+                  "insta-fb": "social", "instagram/facebook": "social"}
 # A stable public link per service, so the API probe makes the provider do real
 # work instead of answering a bare request with a generic error page.
 API_PROBES = {
@@ -82,7 +95,7 @@ API_PROBES = {
     "dailymotion": "https://www.dailymotion.com/video/x7tgad0",
     "rumble": "https://rumble.com/v4t3sz8-playing-some-fallout-76-sleep-token-day.html",
 }
-SERVICE_KEYS = ("youtube", "terabox", "dailymotion", "rumble")
+SERVICE_KEYS = ("youtube", "terabox", "dailymotion", "rumble", "mega", "social")
 PROXY_ATTEMPTS = 3  # Proxies tried for one request before the direct fallback.
 RETRY_STATUSES = frozenset({407, 502, 503, 504})  # Proxy-level HTTP errors, not the site's.
 MIN_LATENCY_MS = 20  # Replies faster than this mean no real round trip: auto-fail.
@@ -536,7 +549,8 @@ def resolve_targets(keys: str = "", url: str = "", apis: Mapping[str, str] | Non
     if parts:
         # Keep the order the user typed, ignoring names we do not know.
         for part in parts:
-            target = next((item for item in KNOWN_TARGETS if item.key == part), None)
+            key = TARGET_ALIASES.get(part, part)
+            target = next((item for item in KNOWN_TARGETS if item.key == key), None)
             if target is not None and target.key not in chosen:
                 chosen[target.key] = target
     if not chosen:
@@ -554,8 +568,13 @@ def api_probe_url(endpoint: str, key: str) -> str:
 
 
 def api_target(target: CheckTarget, endpoint: str) -> CheckTarget:
-    """Turn a site probe into an API probe for this service, or keep it as it is."""
-    if not public_api_url(endpoint):
+    """Turn a site probe into an API probe for this service, or keep it as it is.
+
+    Services whose API takes a link parameter (MEGA, Instagram/Facebook) have no
+    probe in API_PROBES: their checks stay on the site's own probe rather than
+    calling an API endpoint that would answer an error for a missing link.
+    """
+    if not public_api_url(endpoint) or not API_PROBES.get(target.key):
         return target
     return replace(target, label=f"{target.label} API", url=api_probe_url(endpoint, target.key),
                    json=True, nocontent=False, lax=False)
