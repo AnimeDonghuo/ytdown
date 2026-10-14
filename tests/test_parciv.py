@@ -1,5 +1,6 @@
 """apitera readers: the catalogue, the stream/post answers, names and title matching."""
 import os
+import shutil
 import tempfile
 import threading
 import unittest
@@ -347,6 +348,7 @@ class DownloadTests(unittest.TestCase):
 
     def setUp(self):
         self.out = tempfile.mkdtemp(prefix="ytdown-parciv-test-")
+        self.addCleanup(shutil.rmtree, self.out, ignore_errors=True)
         self.progress = []
 
     def write(self, name="stream.mp4", body=None):
