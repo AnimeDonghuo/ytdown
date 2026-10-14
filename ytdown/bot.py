@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 import aiohttp
 from aiohttp import web
@@ -249,6 +249,7 @@ class LatestPanel:
     sections: tuple[str, ...] = ()
     page: int = 1
     words: str = ""  # Set on a search panel: Refresh repeats the search, not the listing.
+    url: str = ""  # Set when the panel came from a link: Refresh re-reads that link.
     created: float = field(default_factory=time.monotonic)
 
 
@@ -2525,6 +2526,35 @@ class DownloaderBot:
                 items.append(item)
         return tuple(items[:SEARCH_LIMIT]), tuple(notes)
 
+    async def show_listing_url(self, uid: int, peer, notice, url: str, section: str) -> None:
+        """List any apitera catalogue-style URL: a family endpoint or a search link.
+
+        The API has more endpoints than the ones `/latest` polls (Anime and
+        Donghua each have a dozen), so any of them can be opened by sending its
+        link: this reads it, shows what it listed and offers the same buttons.
+        """
+        api = ParcivApi(self.api_for(uid, "parciv"))
+        session = self.http_for(uid)
+        parts = urlsplit(url)
+        query = dict(pair.split("=", 1) for pair in parts.query.split("&") if "=" in pair)
+        page = max(1, min(50, int(re.sub(r"\D", "", query.get("page", "1")) or 1)))
+        payload = await fetch_parciv_json(session, url)
+        items = parse_catalogue(payload, section, api)
+        if not items:
+            raise ParcivError("That apitera URL listed no items.")
+        keys = await self.dm_titles(peer)
+        token = secrets.token_hex(4)
+        self.auto_tokens[uid] = token
+        self.latest_panels[uid] = LatestPanel(peer, getattr(notice, "id", 0), token, items,
+                                              (section,), page, url=url)
+        words = unquote(query.get("query") or query.get("q") or query.get("search") or "").strip()
+        if words:  # A search link: keep the matches, but never empty the API's own answer.
+            items = tuple(item for item in items if matches_words(item.title, words)) or items
+        text = (self.search_panel_text(uid, items, keys, words, (section,)) if words
+                else self.latest_panel_text(uid, items, keys, (section,), page))
+        await self.safe_edit(notice, text, buttons=self.latest_buttons(uid, token, items, keys),
+                             parse_mode=None)
+
     async def show_search(self, uid: int, peer, notice, words: str,
                           sections: tuple[str, ...]) -> None:
         """Edit `notice` into the search matches with the same buttons as /latest."""
@@ -2590,8 +2620,21 @@ class DownloaderBot:
             match = re.search(r"[?&](?:id|subjectId)=([\w-]+)", link) or re.search(r"/(\d{6,})", link)
             subject_id = match.group(1) if match else ""
         if not subject_id:
-            raise ParcivError("That apitera URL names no item. Send /latest to browse, or a "
-                              "/moviebox/stream?id=… link.")
+            # Any other catalogue-style link of these families: Anime and Donghua each
+            # have a dozen endpoints, and any of them can be opened this way.
+            family = next((name for name in PARCIV_STREAM_SECTIONS
+                           if path.startswith(f"/{name}/")), "")
+            if not family and not path.startswith("/moviebox/"):
+                raise ParcivError("That apitera URL names no item. Send /latest to browse, or a "
+                                  "/moviebox/stream?id=… link.")
+            notice = notice or await event.respond("Reading that apitera listing…")
+            try:
+                await self.show_listing_url(uid, peer, notice, link, family or "movies")
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+                LOG.warning("apitera listing link failed: %s", type(exc).__name__)
+                await self.safe_edit(notice, f"That apitera URL listed nothing "
+                                             f"({type(exc).__name__}).")
+            return
         await self.parciv_item_selection(event, uid, peer, api,
                                          ParcivItem(subject_id=subject_id, name="", section="movies"),
                                          notice=notice)
@@ -2698,6 +2741,10 @@ class DownloaderBot:
             return
         if action == "latest":
             self.auto_peers[uid] = panel.peer
+            if getattr(panel, "url", ""):  # A link panel: Refresh re-reads that link.
+                await event.answer("Refreshing…")
+                await self.show_listing_url(uid, panel.peer, event, panel.url, panel.sections[0])
+                return
             if panel.words:  # A search panel: Refresh repeats the search.
                 await event.answer("Searching again…")
                 await self.show_search(uid, panel.peer, event, panel.words, panel.sections)

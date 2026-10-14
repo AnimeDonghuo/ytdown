@@ -406,6 +406,42 @@ class LinkFlowTests(BotCase):
         self.assertEqual(job.title, "PAW Patrol: The Dino Movie")
         await asyncio.gather(job.task, return_exceptions=True)
 
+    async def test_another_family_endpoint_lists_its_items(self):
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        link = "https://api.parciv.workers.dev/anime/popular"
+        with patch("ytdown.bot.fetch_parciv_json", new=AsyncMock(return_value=MOVIES)) as fetch:
+            await self.service.on_link(self.event(link, notice=notice))
+        self.assertEqual(fetch.await_args.args[1], link)
+        text = notice.edit.call_args.args[0]
+        self.assertIn("🔎 apitera — page 1 of Anime", text)
+        panel = self.service.latest_panels[7]
+        self.assertEqual(panel.sections, ("anime",))
+        self.assertEqual(panel.items[0].section, "anime")
+        self.assertEqual(panel.url, link)
+
+    async def test_a_search_link_lists_what_it_found(self):
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        link = "https://api.parciv.workers.dev/moviebox/search?query=paw%20patrol"
+        with patch("ytdown.bot.fetch_parciv_json", new=AsyncMock(return_value=MOVIES)):
+            await self.service.on_link(self.event(link, notice=notice))
+        text = notice.edit.call_args.args[0]
+        self.assertIn("🔎 apitera search — paw patrol", text)
+        self.assertIn("1. ⬇️ PAW Patrol: The Dino Movie (2026)", text)
+        self.assertNotIn("2. ", text)  # The API's extra rows are dropped when the words match some.
+
+    async def test_the_refresh_button_of_a_link_panel_re_reads_the_link(self):
+        link = "https://api.parciv.workers.dev/anime/popular"
+        self.service.auto_peers[7] = "peer"
+        self.service.latest_panels[7] = SimpleNamespace(
+            peer="peer", items=(), sections=("anime",), page=1, words="", url=link)
+        self.service.auto_tokens[7] = "tok"
+        self.service.show_listing_url = AsyncMock()
+        click = SimpleNamespace(sender_id=7, data=b"a:tok:latest", is_private=True, message_id=21,
+                                answer=AsyncMock(), edit=AsyncMock())
+        await self.service.callback(click)
+        self.assertEqual(self.service.show_listing_url.call_args.args[3], link)
+        self.assertEqual(self.service.show_listing_url.call_args.args[4], "anime")
+
     async def test_a_catalogue_link_lists_that_section(self):
         with patch("ytdown.bot.fetch_parciv_catalogue",
                    new=AsyncMock(return_value=CataloguePage("tv", 2, parse_catalogue(MOVIES, "tv")))):
