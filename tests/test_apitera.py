@@ -419,6 +419,23 @@ class LinkFlowTests(BotCase):
         self.assertEqual(panel.items[0].section, "anime")
         self.assertEqual(panel.url, link)
 
+    async def test_an_unfamiliar_family_path_is_read_as_a_listing(self):
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        link = "https://api.parciv.workers.dev/iptv/live"
+        with patch("ytdown.bot.fetch_parciv_json", new=AsyncMock(return_value=MOVIES)) as fetch:
+            await self.service.on_link(self.event(link, notice=notice))
+        self.assertEqual(fetch.await_args.args[1], link)
+        self.assertIn("🔎 apitera — page 1 of iptv", notice.edit.call_args.args[0])
+        self.assertEqual(self.service.latest_panels[7].sections, ("iptv",))
+
+    async def test_a_link_that_lists_nothing_says_so(self):
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        with patch("ytdown.bot.fetch_parciv_json", new=AsyncMock(return_value={"ok": True})):
+            await self.service.on_link(self.event(
+                "https://api.parciv.workers.dev/iptv/channels", notice=notice))
+        self.assertIn("Could not read that apitera listing", notice.edit.call_args.args[0])
+        self.assertIn("does not list catalogue entries", notice.edit.call_args.args[0])
+
     async def test_a_search_link_lists_what_it_found(self):
         notice = SimpleNamespace(id=21, edit=AsyncMock())
         link = "https://api.parciv.workers.dev/moviebox/search?query=paw%20patrol"

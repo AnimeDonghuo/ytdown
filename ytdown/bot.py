@@ -2541,7 +2541,7 @@ class DownloaderBot:
         payload = await fetch_parciv_json(session, url)
         items = parse_catalogue(payload, section, api)
         if not items:
-            raise ParcivError("That apitera URL listed no items.")
+            raise ParcivError("this URL does not list catalogue entries")
         keys = await self.dm_titles(peer)
         token = secrets.token_hex(4)
         self.auto_tokens[uid] = token
@@ -2620,20 +2620,26 @@ class DownloaderBot:
             match = re.search(r"[?&](?:id|subjectId)=([\w-]+)", link) or re.search(r"/(\d{6,})", link)
             subject_id = match.group(1) if match else ""
         if not subject_id:
-            # Any other catalogue-style link of these families: Anime and Donghua each
-            # have a dozen endpoints, and any of them can be opened this way.
+            # Any other catalogue-style link: Anime and Donghua each have a dozen
+            # endpoints (and the API has other families), so whatever this path names
+            # is read as a listing instead of being refused.
             family = next((name for name in PARCIV_STREAM_SECTIONS
                            if path.startswith(f"/{name}/")), "")
-            if not family and not path.startswith("/moviebox/"):
-                raise ParcivError("That apitera URL names no item. Send /latest to browse, or a "
-                                  "/moviebox/stream?id=… link.")
+            if not family:
+                family = next((name for name in PARCIV_SECTIONS
+                               if path.startswith(f"/moviebox/{name}")), "")
+            if path.startswith("/moviebox/"):
+                section = family or "movies"
+            else:
+                section = family or (path.strip("/").split("/")[0] or "movies")
             notice = notice or await event.respond("Reading that apitera listing…")
             try:
-                await self.show_listing_url(uid, peer, notice, link, family or "movies")
+                await self.show_listing_url(uid, peer, notice, link, section)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
                 LOG.warning("apitera listing link failed: %s", type(exc).__name__)
-                await self.safe_edit(notice, f"That apitera URL listed nothing "
-                                             f"({type(exc).__name__}).")
+                reason = str(exc) if isinstance(exc, (ParcivError, ValueError)) and str(exc) \
+                    else type(exc).__name__
+                await self.safe_edit(notice, f"Could not read that apitera listing ({reason}).")
             return
         await self.parciv_item_selection(event, uid, peer, api,
                                          ParcivItem(subject_id=subject_id, name="", section="movies"),
