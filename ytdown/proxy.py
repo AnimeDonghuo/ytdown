@@ -76,26 +76,35 @@ YOUTUBE_TARGET = CheckTarget("youtube", "YouTube", "YT", CHECK_URL, nocontent=Tr
 # api_target: without an API_PROBES entry the site probe is kept).
 MEGA_TARGET = CheckTarget("mega", "MEGA", "MG", "https://mega.nz/robots.txt",
                           hosts=("mega.nz", "mega.io", "mega.co.nz"))
+# apitera answers JSON, so a check of it can be a real API call (see PATH_PROBES).
+PARCIV_TARGET = CheckTarget("parciv", "apitera", "PV",
+                            "https://api.parciv.workers.dev/moviebox/movies",
+                            hosts=("api.parciv.workers.dev", "hakunaymatata.com", "aoneroom.com"),
+                            json=True)
 SOCIAL_TARGET = CheckTarget("social", "Instagram/Facebook", "IG", "https://www.instagram.com/robots.txt",
                             hosts=("instagram.com", "instagr.am", "cdninstagram.com",
                                    "facebook.com", "fb.com", "fb.watch", "fbcdn.net"))
 CHECK_TARGETS = (DAILYMOTION_TARGET, RUMBLE_TARGET)
 # Every site a check can be pointed at, not just the selected ones.
 KNOWN_TARGETS = (DAILYMOTION_TARGET, RUMBLE_TARGET, YOUTUBE_TARGET, TERABOX_TARGET,
-                 MEGA_TARGET, SOCIAL_TARGET)
+                 MEGA_TARGET, SOCIAL_TARGET, PARCIV_TARGET)
 # Names people type for a target that is called something else internally.
 TARGET_ALIASES = {"mega.nz": "mega", "mg": "mega", "insta": "social", "ig": "social",
                   "instagram": "social", "fb": "social", "facebook": "social",
-                  "insta-fb": "social", "instagram/facebook": "social"}
+                  "insta-fb": "social", "instagram/facebook": "social",
+                  "apitera": "parciv", "moviebox": "parciv", "mb": "parciv", "pv": "parciv"}
 # A stable public link per service, so the API probe makes the provider do real
 # work instead of answering a bare request with a generic error page.
+# APIs whose health check is a call of their own rather than ?url=<link>:
+# (the base path under the endpoint, the real call to make).
+PATH_PROBES = {"parciv": ("moviebox", "movies?page=1")}
 API_PROBES = {
     "youtube": "https://www.youtube.com/watch?v=3SY1i5CB03Q",
     "terabox": "https://www.terabox.com/s/12345",
     "dailymotion": "https://www.dailymotion.com/video/x7tgad0",
     "rumble": "https://rumble.com/v4t3sz8-playing-some-fallout-76-sleep-token-day.html",
 }
-SERVICE_KEYS = ("youtube", "terabox", "dailymotion", "rumble", "mega", "social")
+SERVICE_KEYS = ("youtube", "terabox", "dailymotion", "rumble", "mega", "social", "parciv")
 PROXY_ATTEMPTS = 3  # Proxies tried for one request before the direct fallback.
 RETRY_STATUSES = frozenset({407, 502, 503, 504})  # Proxy-level HTTP errors, not the site's.
 MIN_LATENCY_MS = 20  # Replies faster than this mean no real round trip: auto-fail.
@@ -567,14 +576,35 @@ def api_probe_url(endpoint: str, key: str) -> str:
     return f"{endpoint}{'&' if '?' in endpoint else '?'}{urlencode({'url': probe})}"
 
 
+def api_probe_path(endpoint: str, base: str, suffix: str) -> str:
+    """A service's own health-check call on the endpoint the user configured.
+
+    The endpoint may be the API root or already include the base ("…/moviebox"),
+    so the call is attached to whichever one it is.
+    """
+    root = endpoint.rstrip("/")
+    if urlsplit(root).path.rstrip("/").endswith("/" + base):
+        return f"{root}/{suffix}"
+    return f"{root}/{base}/{suffix}"
+
+
 def api_target(target: CheckTarget, endpoint: str) -> CheckTarget:
     """Turn a site probe into an API probe for this service, or keep it as it is.
 
     Services whose API takes a link parameter (MEGA, Instagram/Facebook) have no
     probe in API_PROBES: their checks stay on the site's own probe rather than
     calling an API endpoint that would answer an error for a missing link.
+    Providers in PATH_PROBES are probed with a real call of their own instead
+    (apitera: page 1 of its Moviebox catalogue), which needs no link parameter.
     """
-    if not public_api_url(endpoint) or not API_PROBES.get(target.key):
+    if not public_api_url(endpoint):
+        return target
+    fixed = PATH_PROBES.get(target.key)
+    if fixed:
+        return replace(target, label=f"{target.label} API",
+                       url=api_probe_path(endpoint, fixed[0], fixed[1]),
+                       json=True, nocontent=False, lax=False)
+    if not API_PROBES.get(target.key):
         return target
     return replace(target, label=f"{target.label} API", url=api_probe_url(endpoint, target.key),
                    json=True, nocontent=False, lax=False)

@@ -47,6 +47,15 @@ from .mega import (MAX_MEGA_LINKS, MEGA_API_URL, MEGA_HOSTS, MegaError, MegaFile
 from .social import (MAX_SOCIAL_LINKS, SOCIAL_API_URL, SOCIAL_HOSTS, SocialBatch, SocialChoice,
                      SocialDownload, SocialError, SocialMedia, find_social_links, normalize_social,
                      parse_social_source, social_choices, social_source)
+from .parciv import (AUTO_SECTIONS, DM_SCAN_LIMIT, MAX_AUTO_LIMIT, MAX_PARCIV_BYTES, PARCIV_API_URL,
+                     PARCIV_SECTIONS, PARCIV_STREAM_SECTIONS, ParcivApi, ParcivError, ParcivItem,
+                     ParcivMedia,
+                     ParcivSource, download_parciv, is_parciv_media_endpoint,
+                     parse_catalogue, parse_detail, parse_parciv_source, parse_post, parse_sections,
+                     parse_stream, pick_media, title_variants)
+from .apitera import (AUTO_INTERVAL_DEFAULT, AUTO_INTERVAL_MIN, CataloguePage, ParcivBatch,
+                      already_uploaded, interval_text, limit_text, listing_lines, new_items,
+                      normalise_sections, parse_interval, parse_limit, past_titles, sections_text)
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg, usable_still
 from .proxy import (CHECK_TARGETS, KNOWN_TARGETS, MAX_PROXIES, MIN_LATENCY_MS, SERVICE_KEYS, TOO_FAST,
@@ -56,17 +65,21 @@ from .proxy import (CHECK_TARGETS, KNOWN_TARGETS, MAX_PROXIES, MIN_LATENCY_MS, S
 
 LOG = logging.getLogger(__name__)
 MODE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion",
-               "rumble": "Rumble", "mega": "MEGA", "social": "Instagram/Facebook"}
+               "rumble": "Rumble", "mega": "MEGA", "social": "Instagram/Facebook",
+               "parciv": "apitera"}
 API_URL = "https://samra-youtube-api.antideploy.com/"
 DEFAULT_APIS = {"youtube": API_URL, "terabox": TERABOX_API_URL, "dailymotion": DAILYMOTION_API_URL,
-                "rumble": RUMBLE_API_URL, "mega": MEGA_API_URL, "social": SOCIAL_API_URL}
+                "rumble": RUMBLE_API_URL, "mega": MEGA_API_URL, "social": SOCIAL_API_URL,
+                "parciv": PARCIV_API_URL}
 SERVICE_LABELS = {"youtube": "YouTube", "terabox": "Terabox", "dailymotion": "Dailymotion",
-                  "rumble": "Rumble", "mega": "MEGA", "social": "Instagram/Facebook"}
+                  "rumble": "Rumble", "mega": "MEGA", "social": "Instagram/Facebook",
+                  "parciv": "apitera"}
 SERVICE_KEYWORDS = {"yt": "youtube", "youtube": "youtube", "tera": "terabox", "terabox": "terabox",
                     "daily": "dailymotion", "dailymotion": "dailymotion", "dm": "dailymotion",
                     "rumble": "rumble", "rum": "rumble", "mega": "mega", "mg": "mega",
                     "mega.nz": "mega", "social": "social", "insta": "social", "ig": "social",
-                    "instagram": "social", "fb": "social", "facebook": "social"}
+                    "instagram": "social", "fb": "social", "facebook": "social",
+                    "parciv": "parciv", "apitera": "parciv", "moviebox": "parciv", "mb": "parciv"}
 RESET_WORDS = ("reset", "remove", "default")
 MAX_WAITING = 4
 MAX_SELECTIONS = 100
@@ -197,6 +210,7 @@ class Selection:
     end: int = 1
     listing: TeraboxListing | MegaListing | None = None
     social: SocialMedia | SocialBatch | None = None
+    parciv: ParcivBatch | None = None
 
 
 @dataclass
@@ -219,6 +233,19 @@ class Dashboard:
     next_edit: float = 0.0
     edit_flood_until: float = 0.0
     last_manual: float = 0.0
+
+
+@dataclass
+class LatestPanel:
+    """One /latest reply: the catalogue entries it listed and the buttons on it."""
+
+    peer: object
+    message_id: int
+    token: str = field(default_factory=lambda: secrets.token_hex(4))
+    items: tuple[ParcivItem, ...] = ()
+    sections: tuple[str, ...] = ()
+    page: int = 1
+    created: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -259,6 +286,7 @@ class Job:
     end: int = 1
     listing: TeraboxListing | MegaListing | None = None
     social: SocialMedia | SocialBatch | None = None
+    parciv: ParcivBatch | None = None
 
 
 # Crunchyroll is recognised only to explain why it cannot be downloaded. Every
@@ -291,8 +319,10 @@ def is_media_link(raw: str) -> bool:
     """Keep media links out of a pending /changeapi URL prompt."""
     if find_mega_links(raw or "") or find_social_links(raw or ""):
         return True  # One media link, or a whole list of them.
+    if is_parciv_media_endpoint(raw or ""):
+        return True
     for parser in (parse_source, parse_terabox_source, parse_dailymotion_source, parse_rumble_source,
-                   parse_mega_source, parse_social_source):
+                   parse_mega_source, parse_social_source, parse_parciv_source):
         try:
             parser(raw)
             return True
@@ -319,18 +349,27 @@ def normalize_api_endpoint(raw: str) -> str:
         raise ValueError("Send an API endpoint, not a MEGA file or folder link.")
     if any(host == suffix or host.endswith("." + suffix) for suffix in SOCIAL_HOSTS):
         raise ValueError("Send an API endpoint, not an Instagram or Facebook link.")
+    if is_parciv_media_endpoint(raw):
+        raise ValueError("Send an API endpoint, not one apitera item's stream link "
+                         "(use /parciv for that).")
     params = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k.lower() != "url"]
     return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", urlencode(params), ""))
 
 
-async def fetch_json_api(session: aiohttp.ClientSession, api_endpoint: str, url: str,
+async def fetch_json_api(session: aiohttp.ClientSession, api_endpoint: str, url: str = "",
                          max_bytes: int = 2_000_000,
-                         timeout: aiohttp.ClientTimeout | None = None):
-    endpoint, params = api_endpoint, {"url": url}
+                         timeout: aiohttp.ClientTimeout | None = None,
+                         params: dict | None = None):
+    """GET a JSON API endpoint, following a few redirects, on public HTTPS only.
+
+    Most providers take the media link as ``?url=``; apitera's endpoints take their
+    own query instead, so ``params`` can replace it.
+    """
+    endpoint, query = api_endpoint, {"url": url} if params is None else dict(params)
     for _ in range(5):
         if not public_https_url(endpoint):
             raise ValueError("API redirected to an unsafe address.")
-        async with session.get(endpoint, params=params, allow_redirects=False,
+        async with session.get(endpoint, params=query, allow_redirects=False,
                                timeout=timeout or aiohttp.ClientTimeout(total=240,
                                                                        connect=20)) as response:
             if response.status in (301, 302, 303, 307, 308):
@@ -338,7 +377,7 @@ async def fetch_json_api(session: aiohttp.ClientSession, api_endpoint: str, url:
                 if not location:
                     raise ValueError("API redirect has no destination.")
                 endpoint = urljoin(str(response.url), location)
-                params = None  # The Location already contains its own query.
+                query = None  # The Location already contains its own query.
                 continue
             response.raise_for_status()
             if response.content_length and response.content_length > max_bytes:
@@ -408,6 +447,37 @@ async def fetch_mega(session: aiohttp.ClientSession, url: str,
                      endpoint: str = MEGA_API_URL) -> MegaListing:
     """A MEGA file or folder link: the API returns the whole folder tree."""
     return normalize_mega(await fetch_json_api(session, endpoint, url, 8_000_000))
+
+
+async def fetch_parciv_json(session: aiohttp.ClientSession, url: str,
+                           params: dict | None = None):
+    """One apitera endpoint (catalogue page, detail, stream or post) as JSON."""
+    return await fetch_json_api(session, url, "", MAX_PARCIV_BYTES, params=params or {})
+
+
+async def fetch_parciv_catalogue(session: aiohttp.ClientSession, api: ParcivApi, section: str,
+                                 page: int = 1) -> CataloguePage:
+    """One catalogue page of the apitera API (Moviebox, Anime or Donghua)."""
+    url = api.section(section, page)
+    payload = await fetch_parciv_json(session, url)
+    return CataloguePage(section=section, page=page, url=url,
+                         items=parse_catalogue(payload, section, api))
+
+
+async def fetch_parciv_media(session: aiohttp.ClientSession, api: ParcivApi,
+                             item: ParcivItem) -> ParcivMedia:
+    """The media of one item: the stream answer, or the post call for Anime/Donghua."""
+    if item.section in PARCIV_STREAM_SECTIONS:
+        return parse_post(await fetch_parciv_json(session, api.post(item.section, item)), item)
+    payload = await fetch_parciv_json(session, api.stream(item.subject_id))
+    return pick_media(parse_stream(payload, item.subject_id), item)
+
+
+async def fetch_parciv_item(session: aiohttp.ClientSession, api: ParcivApi,
+                            item: ParcivItem) -> ParcivItem:
+    """The detail call: it carries the name, cover and summary the catalogue page lacks."""
+    payload = await fetch_parciv_json(session, api.detail(item.subject_id))
+    return parse_detail(payload, item)
 
 
 async def fetch_social(session: aiohttp.ClientSession, url: str,
@@ -722,6 +792,19 @@ class DownloaderBot:
         self.mode_tokens: dict[int, str] = {}
         self.pending_ranges: dict[int, RangeRequest] = {}
         self.dashboards: dict[int, Dashboard] = {}
+        # apitera automation: the watcher, its sections, its pace and its DM check.
+        self.auto_enabled: dict[int, bool] = {}
+        self.auto_tasks: dict[int, asyncio.Task] = {}
+        self.auto_peers: dict[int, object] = {}
+        self.auto_sections: dict[int, tuple[str, ...]] = {}
+        self.auto_limits: dict[int, int] = {}
+        self.auto_running: set[int] = set()
+        self.auto_last: dict[int, float] = {}
+        self.auto_tokens: dict[int, str] = {}
+        self.latest_panels: dict[int, LatestPanel] = {}
+        self.auto_interval = float(env_int("PARCIV_AUTO_INTERVAL", AUTO_INTERVAL_DEFAULT,
+                                           AUTO_INTERVAL_MIN, 24 * 3600))
+        self.auto_limit_default = env_int("PARCIV_AUTO_LIMIT", 3, 1, MAX_AUTO_LIMIT)
         self.status_lock = asyncio.Lock()  # Serialize /status replacements.
         self.slot = asyncio.Semaphore(1)
         self.turn = asyncio.Condition()  # Preserve enqueue order even if status edits are slow.
@@ -1217,7 +1300,7 @@ class DownloaderBot:
         unknown = [part for part in parts if part not in known]
         if unknown:
             await event.respond("Unknown site: " + ", ".join(unknown) + ". Use dailymotion, rumble, "
-                                "youtube, terabox, mega, instagram or facebook (for example "
+                                "youtube, terabox, mega, instagram, facebook or apitera (for example "
                                 "/proxychk sites rumble,youtube), or /proxychk sites default for "
                                 "Dailymotion + Rumble.")
             return
@@ -1548,15 +1631,20 @@ class DownloaderBot:
                 "/change — YouTube / Terabox / Dailymotion / Rumble / MEGA / Instagram-Facebook buttons\n"
                 "MEGA: send a file or folder link, or several links at once. Instagram/Facebook: send a "
                 "post/reel/video link — that API is slow, so give it a minute.\n"
+                "apitera (Moviebox/Anime/Donghua): /latest lists page 1 by hand, /auto on uploads every "
+                "new title automatically, /parciv <link|id> reads one item.\n"
                 "/status or /queue — one live status for running and queued jobs\n"
                 "/cancel — list jobs; /cancel_<job-id> stops one with a tappable command\n"
                 "/apis — numbered API list; /apis remove 3 resets a custom API\n"
                 "/changeapi yt|tera|daily|rumble|mega|ig <URL> — set your own API for one service; /changeapi reset restores all\n"
                 "/proxychk — paste or upload a proxy list; checks Dailymotion + Rumble APIs\n"
                 "/proxychk url <https://…> — also check your own API host\n"
-                "/proxychk sites dailymotion,rumble,youtube,terabox,mega,social — choose which sites are tested\n"
+                "/proxychk sites dailymotion,rumble,youtube,terabox,mega,social,apitera — pick the sites\n"
                 "/proxychk fast <ms|off> — replies faster than this fail automatically\n"
                 "/proxychk export [all] — save the pool as a .txt to paste back after a restart\n"
+                "/auto [on|off|now|sections|limit <n>|every <15m>] — automatic apitera uploads\n"
+                "/latest [movies,anime,donghua] [count] [page=2] — browse the catalogue now\n"
+                "/parciv <apitera link or subject id> — read and queue one item\n"
                 "/proxy — proxy mode ON/OFF, pool status, re-check or clear the pool\n"
                 "/limits — size and queue limits\n/help — these instructions\n\n"
                 "Only download media you have permission to use.")
@@ -1590,9 +1678,17 @@ class DownloaderBot:
                                            Button.inline("🟣 Rumble", data=f"m:{token}:rumble".encode())],
                                          [Button.inline("🗂 MEGA", data=f"m:{token}:mega".encode()),
                                            Button.inline("📸 Instagram/Facebook",
-                                                         data=f"m:{token}:social".encode())]])
+                                                         data=f"m:{token}:social".encode())],
+                                         [Button.inline("🎬 apitera (Moviebox/Anime/Donghua)",
+                                                        data=f"m:{token}:parciv".encode())]])
         elif command == "/changeapi":
             await self.handle_changeapi(event, text)
+        elif command == "/auto":
+            await self.handle_auto(event, text)
+        elif command == "/latest":
+            await self.handle_latest(event, text)
+        elif command == "/parciv":
+            await self.handle_parciv(event, text)
         elif command in ("/status", "/queue"):
             await self.show_dashboard(event)
         elif command == "/proxychk":
@@ -1632,7 +1728,7 @@ class DownloaderBot:
                     "counts as a pass. Working ones join your pool and dead ones are marked, with "
                     f"{self.proxy_workers} parallel workers. /proxychk stop cancels. /proxychk sites "
                     "picks the sites (youtube, terabox, dailymotion, rumble, mega, instagram, "
-                    "facebook); /proxychk url "
+                    "facebook, apitera); /proxychk url "
                     "<https://…> adds your own API host. " + self.fast_guard_text(uid) + ".",
                     parse_mode=None)
         elif command == "/proxy":
@@ -1920,6 +2016,7 @@ class DownloaderBot:
                       else Source("dailymotion", parse_dailymotion_source(event.raw_text)) if mode == "dailymotion"
                       else Source("rumble", parse_rumble_source(event.raw_text)) if mode == "rumble"
                       else Source("mega", mega_source(event.raw_text)) if mode == "mega"
+                      else Source("parciv", parse_parciv_source(event.raw_text)) if mode == "parciv"
                       else Source("social", social_source(event.raw_text)) if mode == "social"
                       else parse_source(event.raw_text))
         except ValueError as exc:
@@ -2071,6 +2168,10 @@ class DownloaderBot:
                                       f" · {video_choice(item)}\nChoose it, then tap Done:",
                                       buttons=self.keyboard(selection), parse_mode=None)
                 return
+            if source.kind == "parciv":
+                notice = await event.respond("Reading this apitera link…")
+                await self.parciv_link_flow(event, uid, peer, source.url, notice=notice)
+                return
             if source.kind == "social":
                 links = find_social_links(event.raw_text or "", MAX_SOCIAL_LINKS + 1)
                 if len(links) > MAX_SOCIAL_LINKS:
@@ -2133,18 +2234,333 @@ class DownloaderBot:
             if notice:
                 # Our own providers explain themselves ("private post", "no files");
                 # a raw library error would only confuse, so it stays generic.
-                reason = str(exc) if isinstance(exc, (MegaError, SocialError)) and str(exc) else ""
+                reason = (str(exc) if isinstance(exc, (MegaError, SocialError, ParcivError, ValueError))
+                          and str(exc) and len(str(exc)) < 200 else "")
                 await self.safe_edit(notice, f"Could not load this link. {reason}" if reason else
                                      "Could not load this link. The API or source may be "
                                      "unavailable; try later.")
         finally:
             self.lookups.pop(uid, None)
 
-    async def safe_edit(self, message, text: str) -> None:
+    async def safe_edit(self, message, text: str, **kwargs) -> None:
         try:
-            await message.edit(text)
+            await message.edit(text, **kwargs)
         except RPCError:
             LOG.warning("Could not update a Telegram message", exc_info=True)
+
+    # ------------------------------------------------- apitera commands
+
+    async def handle_auto(self, event, text: str) -> None:
+        """`/auto` — the automatic apitera watcher: on, off, now, sections, limit, every."""
+        uid = event.sender_id
+        arg = text.partition(" ")[2].strip()
+        head, _, tail = arg.partition(" ")
+        head, tail = head.lower(), tail.strip()
+        if not arg:
+            token = secrets.token_hex(4)
+            self.auto_tokens[uid] = token
+            on = self.auto_enabled.get(uid, False)
+            buttons = [[Button.inline("⏸ Turn off" if on else "▶️ Turn on",
+                                      data=f"a:{token}:{'off' if on else 'on'}".encode())],
+                       [Button.inline("🔎 Check now", data=f"a:{token}:now".encode()),
+                        Button.inline("📄 Latest list", data=f"a:{token}:latest".encode())]]
+            await event.respond(self.auto_status_text(uid), buttons=buttons, parse_mode=None)
+            await event.respond("Turn it on to upload new apitera titles automatically. "
+                                "`/auto sections movies,anime` picks the sections, "
+                                "`/auto limit 3` the items per section, `/auto every 15m` the pace. "
+                                "`/auto now` checks once; `/latest` lists page 1 by hand.",
+                                parse_mode=None)
+            return
+        if head in ("on", "off", "yes", "no", "enable", "disable"):
+            turn_on = head in ("on", "yes", "enable")
+            if turn_on:
+                # Remember where the uploads go: this chat.
+                self.auto_peers[uid] = await event.get_input_chat()
+                self.auto_enabled[uid] = True
+                self.start_auto_watch(uid)
+            else:
+                self.stop_auto_watch(uid)
+            await event.respond(self.auto_status_text(uid), parse_mode=None)
+            return
+        if head in ("now", "check", "run"):
+            self.auto_peers[uid] = await event.get_input_chat()
+            notice = await event.respond("Checking the apitera catalogue…")
+            try:
+                result = await self.run_auto_check(uid, notice=notice, note="Manual check (/auto now).")
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError, RPCError) as exc:
+                await self.safe_edit(notice, f"Could not check the catalogue ({type(exc).__name__}).")
+                return
+            if "Queued" not in result:
+                await self.safe_edit(notice, result)
+            return
+        if head == "sections":
+            if not tail or tail.lower() in ("default", "all", "reset"):
+                self.auto_sections[uid] = AUTO_SECTIONS
+                await event.respond(f"Automatic sections: {sections_text(AUTO_SECTIONS)}.")
+                return
+            try:
+                sections = parse_sections(tail)
+            except ParcivError as exc:
+                await event.respond(str(exc))
+                return
+            self.auto_sections[uid] = sections
+            await event.respond(f"Automatic sections: {sections_text(sections)}.")
+            return
+        if head == "limit":
+            if not tail:
+                await event.respond(f"Automatic limit: {limit_text(self.auto_limits.get(uid, self.auto_limit_default))}. "
+                                    f"Use /auto limit <1-{MAX_AUTO_LIMIT}>.")
+                return
+            try:
+                self.auto_limits[uid] = parse_limit(tail)
+            except ValueError as exc:
+                await event.respond(f"{exc} Use /auto limit <1-{MAX_AUTO_LIMIT}>.")
+                return
+            await event.respond(f"Automatic limit: {limit_text(self.auto_limits[uid])}.")
+            return
+        if head in ("every", "interval", "pace"):
+            if not tail:
+                await event.respond(f"Automatic pace: every {interval_text(int(self.auto_interval))}. "
+                                    "Use /auto every 15m.")
+                return
+            try:
+                self.auto_interval = float(parse_interval(tail))
+            except ValueError as exc:
+                await event.respond(f"{exc} Use /auto every 15m.")
+                return
+            if self.auto_enabled.get(uid):
+                self.stop_auto_watch(uid)
+                self.auto_enabled[uid] = True
+                self.start_auto_watch(uid)
+            await event.respond(f"Automatic pace: every {interval_text(int(self.auto_interval))}.")
+            return
+        await event.respond("Use /auto, /auto on|off, /auto now, /auto sections movies,anime, "
+                            f"/auto limit <1-{MAX_AUTO_LIMIT}>, or /auto every 15m.")
+
+    async def handle_latest(self, event, text: str) -> None:
+        """`/latest [sections] [count] [page=2]` — browse page 1 of the catalogue by hand."""
+        uid = event.sender_id
+        sections: tuple[str, ...] = ()
+        count = self.auto_limit_default
+        page = 1
+        try:
+            for part in text.split()[1:]:
+                low = part.strip().lower()
+                if low.isdigit():
+                    count = max(1, min(MAX_AUTO_LIMIT, int(low)))
+                elif re.fullmatch(r"page=?-?\d{0,2}", low.replace(" ", "")):
+                    page = max(1, min(50, int(re.sub(r"\D", "", low) or 1)))
+                elif low.startswith("page") and low[4:].isdigit():
+                    page = max(1, min(50, int(low[4:])))
+                else:
+                    sections += tuple(section for section in parse_sections(part)
+                                      if section not in sections)
+        except (ValueError, ParcivError) as exc:
+            await event.respond(str(exc))
+            return
+        sections = normalise_sections(sections)
+        peer = await event.get_input_chat()
+        self.auto_peers[uid] = peer
+        notice = await event.respond(f"Reading {sections_text(sections)}…")
+        try:
+            await self.show_latest(uid, peer, notice, sections, page, count)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+            LOG.warning("apitera /latest failed: %s", type(exc).__name__)
+            await self.safe_edit(notice, f"Could not read the apitera catalogue "
+                                         f"({type(exc).__name__}). Try again in a minute.")
+
+    async def show_latest(self, uid: int, peer, notice, sections: tuple[str, ...], page: int,
+                          count: int) -> None:
+        """Read the catalogue and edit `notice` into the listing with its buttons."""
+        api = ParcivApi(self.api_for(uid, "parciv"))
+        pages, problems = await self.read_catalogue(uid, api, sections, count, page)
+        items = tuple(item for page_items in pages for item in page_items.items)
+        if not items:
+            reason = "; ".join(problems[:2]) or "the API answered nothing"
+            await self.safe_edit(notice, f"No catalogue entries came back: {reason}.")
+            return
+        keys = await self.dm_titles(peer)
+        token = secrets.token_hex(4)
+        self.auto_tokens[uid] = token
+        self.latest_panels[uid] = LatestPanel(peer, getattr(notice, "id", 0), token, items,
+                                              sections, page)
+        await self.safe_edit(notice, self.latest_panel_text(uid, items, keys, sections, page),
+                             buttons=self.latest_buttons(uid, token, items, keys), parse_mode=None)
+
+    def latest_panel_text(self, uid: int, items: tuple[ParcivItem, ...], keys: set[str],
+                          sections: tuple[str, ...], page: int) -> str:
+        fresh = new_items(items, keys)
+        on = self.auto_enabled.get(uid, False)
+        lines = [f"🔎 apitera — page {page} of {sections_text(sections)}",
+                 "✅ = already in your DM · ⬇️ = not uploaded yet", ""]
+        lines += listing_lines(CataloguePage("", page, items), keys, len(items))
+        lines += ["", f"⬇️ {len(fresh)} of {len(items)} listed title(s) are new. Every quality of a "
+                      "title is uploaded, named with its language and subtitle tags."]
+        lines.append(f"🤖 Automatic: {'ON' if on else 'OFF'} · every "
+                     f"{interval_text(int(self.auto_interval))} · "
+                     f"{limit_text(self.auto_limits.get(uid, self.auto_limit_default))}")
+        return "\n".join(lines)
+
+    def latest_buttons(self, uid: int, token: str, items: tuple[ParcivItem, ...],
+                       keys: set[str]) -> list:
+        fresh = len(new_items(items, keys))
+        on = self.auto_enabled.get(uid, False)
+        return [[Button.inline(f"⬇️ Download new ({fresh})", data=f"a:{token}:go".encode()),
+                 Button.inline(f"⬇️ Download all ({len(items)})", data=f"a:{token}:all".encode())],
+                [Button.inline("🔁 Refresh", data=f"a:{token}:latest".encode()),
+                 Button.inline("⏸ Auto off" if on else "▶️ Auto on",
+                               data=f"a:{token}:{'off' if on else 'on'}".encode())]]
+
+    async def parciv_link_flow(self, event, uid: int, peer, link: str, notice=None) -> None:
+        """A hand-sent apitera link: a catalogue page lists, one item offers its qualities."""
+        api = ParcivApi(self.api_for(uid, "parciv"))
+        parts = urlsplit(link)
+        path = parts.path.rstrip("/").lower()
+        query = dict(pair.split("=", 1) for pair in parts.query.split("&") if "=" in pair)
+        section = next((name for name in PARCIV_STREAM_SECTIONS if path.startswith(f"/{name}")), "")
+        if section and (path.endswith("/post") or query.get("slug")):
+            item = ParcivItem(subject_id=query.get("id") or query.get("slug", ""), name="",
+                              section=section, post_url=link)
+            await self.parciv_item_selection(event, uid, peer, api, item, notice=notice)
+            return
+        if path.endswith(("/latest", "/videos", "/trending")) and section:
+            notice = notice or await event.respond(f"Reading {sections_text((section,))}…")
+            await self.show_latest(uid, peer, notice, (section,), 1, self.auto_limit_default)
+            return
+        listed = next((name for name in PARCIV_SECTIONS if path.endswith(f"/{name}")), "")
+        if listed and not query.get("id"):
+            page = max(1, min(50, int(re.sub(r"\D", "", query.get("page", "1")) or 1)))
+            notice = notice or await event.respond(f"Reading {sections_text((listed,))}…")
+            await self.show_latest(uid, peer, notice, (listed,), page, self.auto_limit_default)
+            return
+        subject_id = query.get("id") or query.get("subjectId") or query.get("subject_id") or ""
+        if not subject_id:
+            match = re.search(r"[?&](?:id|subjectId)=([\w-]+)", link) or re.search(r"/(\d{6,})", link)
+            subject_id = match.group(1) if match else ""
+        if not subject_id:
+            raise ParcivError("That apitera URL names no item. Send /latest to browse, or a "
+                              "/moviebox/stream?id=… link.")
+        await self.parciv_item_selection(event, uid, peer, api,
+                                         ParcivItem(subject_id=subject_id, name="", section="movies"),
+                                         notice=notice)
+
+    async def parciv_item_selection(self, event, uid: int, peer, api: ParcivApi,
+                                    item: ParcivItem, notice=None) -> None:
+        """Read one item's media and offer its qualities as toggle buttons."""
+        notice = notice or await event.respond("Reading this apitera item…")
+        session = self.http_for(uid)
+        if item.subject_id and not item.post_url:
+            try:
+                item = await fetch_parciv_item(session, api, item)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+                LOG.info("apitera detail lookup failed (%s); using the stream title",
+                         type(exc).__name__)
+        media = await fetch_parciv_media(session, api, item)
+        sources = media.labelled_sources()
+        if not sources:
+            raise ParcivError("This apitera item offers no downloadable quality.")
+        # The batch carries what was just read, so the job's title is the real one.
+        item = replace(item, name=media.title or item.name, poster=media.poster or item.poster,
+                       episode=media.episode or item.episode, langs=media.langs or item.langs,
+                       summary=media.summary or item.summary)
+        batch = ParcivBatch(items=(item,), check_dm=False, source_url=api.endpoint)
+        selection = Selection(secrets.token_hex(4), Source("parciv", api.endpoint),
+                              tuple(source.label for source in sources), peer, parciv=batch,
+                              api_endpoint=self.api_for(uid, "parciv"))
+        self.selections[uid] = selection
+        lines = [f"🎬 {media.title}"]
+        if media.episode:
+            lines.append(f"· {media.episode}")
+        if media.langs:
+            lines.append("· Audio: " + ", ".join(media.langs))
+        if media.subtitles:
+            lines.append("· Subtitles: " + ", ".join(media.subtitles))
+        lines += [f"· {source.label} ({source.codec or 'video'}{', DASH' if source.dash else ''}"
+                  f"{', ' + human_size(source.size) if source.size else ''})" for source in sources]
+        lines.append("Choose one or more, then tap Done:")
+        await notice.edit("\n".join(lines), buttons=self.keyboard(selection), parse_mode=None)
+
+    async def handle_parciv(self, event, text: str) -> None:
+        """`/parciv <link|id>` — read one apitera item, or browse a catalogue link."""
+        uid = event.sender_id
+        arg = text.partition(" ")[2].strip()
+        if not arg:
+            await event.respond("Use /parciv <apitera link or subject id>, or send the link in "
+                                "apitera mode. /latest browses the catalogue; /auto turns the "
+                                "automatic uploads on and off.")
+            return
+        peer = await event.get_input_chat()
+        self.auto_peers[uid] = peer
+        if arg.isdigit():
+            item = ParcivItem(subject_id=arg, name="", section="movies")
+        else:
+            try:
+                link = parse_parciv_source(arg)
+            except ValueError as exc:
+                await event.respond(str(exc))
+                return
+            notice = await event.respond("Reading this apitera link…")
+            try:
+                await self.parciv_link_flow(event, uid, peer, link, notice=notice)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+                LOG.warning("apitera link failed: %s", type(exc).__name__)
+                reason = str(exc) if isinstance(exc, ParcivError) and str(exc) else type(exc).__name__
+                await self.safe_edit(notice, f"Could not read that apitera link ({reason}).")
+            return
+        api = ParcivApi(self.api_for(uid, "parciv"))
+        try:
+            await self.parciv_item_selection(event, uid, peer, api, item)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+            LOG.warning("apitera item failed: %s", type(exc).__name__)
+            reason = str(exc) if isinstance(exc, ParcivError) and str(exc) else type(exc).__name__
+            await event.respond(f"Could not read that apitera item ({reason}).")
+
+    async def auto_action(self, event, uid: int, action: str) -> None:
+        """The buttons on the /auto panel and on a /latest listing."""
+        if action in ("on", "off"):
+            if action == "on":
+                self.auto_peers[uid] = await event.get_input_chat()
+                self.auto_enabled[uid] = True
+                self.start_auto_watch(uid)
+            else:
+                self.stop_auto_watch(uid)
+            await event.answer("Automatic uploads ON" if action == "on" else "Automatic uploads OFF")
+            await event.edit(self.auto_status_text(uid), buttons=self.latest_buttons(
+                uid, self.auto_tokens.get(uid, ""), self.latest_panels[uid].items if uid in self.latest_panels else (),
+                set()))
+            return
+        if action == "now":
+            self.auto_peers[uid] = self.auto_peers.get(uid) or await event.get_input_chat()
+            await event.answer("Checking now…")
+            try:
+                result = await self.run_auto_check(uid, note="Manual check (button).")
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+                await event.edit(f"Could not check the catalogue ({type(exc).__name__}).")
+                return
+            if "Queued" not in result:
+                await event.edit(result)
+            return
+        panel = self.latest_panels.get(uid)
+        if panel is None:
+            await event.answer("That listing expired. Send /latest again.", alert=True)
+            return
+        if action == "latest":
+            await event.answer("Refreshing…")
+            self.auto_peers[uid] = panel.peer
+            await self.show_latest(uid, panel.peer, event, panel.sections, panel.page,
+                                   self.auto_limit_default)
+            return
+        if action in ("go", "all"):
+            keys = await self.dm_titles(panel.peer) if action == "go" else set()
+            items = new_items(panel.items, keys) if action == "go" else panel.items
+            if not items:
+                await event.answer("Nothing new to download.", alert=True)
+                return
+            batch = ParcivBatch(items=items, check_dm=True, source_url=self.api_for(uid, "parciv"),
+                                sections=panel.sections)
+            await event.answer(f"Queued {len(items)} title(s)")
+            await self.queue_parciv_job(uid, panel.peer, batch, notice=event,
+                                        note="From the /latest listing.")
 
     async def callback(self, event) -> None:
         uid = event.sender_id
@@ -2174,6 +2590,14 @@ class DownloaderBot:
                 await event.answer("Proxy panel expired. Send /proxy again.", alert=True)
                 return
             await self.proxy_action(event, uid, parts[2])
+            return
+        if parts[0] == "a":
+            if (not event.is_private or len(parts) != 3 or self.auto_tokens.get(uid) != parts[1]
+                    or parts[2] not in ("on", "off", "now", "latest", "go", "all")):
+                await event.answer("These apitera buttons expired. Send /auto or /latest again.",
+                                   alert=True)
+                return
+            await self.auto_action(event, uid, parts[2])
             return
         if parts[0] == "m":
             if (not event.is_private or len(parts) != 3 or self.mode_tokens.get(uid) != parts[1]
@@ -2266,11 +2690,13 @@ class DownloaderBot:
             await event.answer("Queue is full (one active, four waiting). Try later.", alert=True)
             return
         selected = tuple(key for key in selection.choices if key in selection.selected)
+        parciv = replace(selection.parciv, qualities=selected) if selection.parciv else None
         job = Job(uid, selection.peer, event.message_id, selection.source, selected, selection.video,
                   api_endpoint=selection.api_endpoint, start=selection.start, end=selection.end,
-                  listing=selection.listing, social=selection.social)
+                  listing=selection.listing, social=selection.social, parciv=parciv)
         job.title = (selection.video.title if selection.video else
                      selection.social.title if selection.social else
+                     selection.parciv.title if selection.parciv else
                      selection.listing.files[job.start - 1].title if selection.listing else "")
         job.detail = f"Queued: {', '.join(selected)}. Waiting for the download slot."
         self.selections.pop(uid, None)
@@ -2361,6 +2787,9 @@ class DownloaderBot:
                 await self.progress(job, "Starting…")
                 if job.source.kind == "dailymotion":
                     await self.run_dailymotion(job)
+                    return
+                if job.parciv:
+                    await self.run_parciv(job)
                     return
                 if job.source.kind == "social":
                     await self.run_social(job)
@@ -2691,6 +3120,311 @@ class DownloaderBot:
         LOG.info("Sent %s video (%d bytes, cover %s)", media.platform, job.total_bytes,
                  "yes" if thumb_data else "no")
         return sent
+
+    # ------------------------------------------------------------- apitera
+
+    async def dm_titles(self, peer, limit: int = DM_SCAN_LIMIT) -> set[str]:
+        """The titles this DM already holds, so an automatic run uploads nothing twice."""
+        try:
+            messages = [message async for message in self.client.iter_messages(peer, limit=limit)]
+        except (RPCError, OSError, ValueError, TypeError) as exc:
+            # Without the history the check cannot run; the job still uploads what it found.
+            LOG.warning("Could not read the DM history for the apitera check: %s", type(exc).__name__)
+            return set()
+        keys = past_titles(messages)
+        LOG.info("apitera: %d title form(s) already in this chat", len(keys))
+        return keys
+
+    def parciv_busy(self, uid: int) -> bool:
+        """True while this user has an apitera batch queued or running."""
+        return any(job.user_id == uid and job.parciv for job in self.jobs.values())
+
+    async def read_catalogue(self, uid: int, api: ParcivApi, sections: tuple[str, ...],
+                             limit: int, page: int = 1) -> tuple[list[CataloguePage], list[str]]:
+        """Read page 1 of each section; a failing section is reported, not fatal."""
+        session = self.http_for(uid)
+        results = await asyncio.gather(
+            *(fetch_parciv_catalogue(session, api, section, page) for section in sections),
+            return_exceptions=True)
+        pages: list[CataloguePage] = []
+        problems: list[str] = []
+        for section, result in zip(sections, results):
+            if isinstance(result, CataloguePage):
+                if result.items:
+                    pages.append(CataloguePage(result.section, result.page,
+                                               result.items[:limit], result.url))
+                else:
+                    problems.append(f"{sections_text((section,))} listed nothing")
+                continue
+            reason = str(result) if isinstance(result, (ParcivError, ValueError)) and str(result) \
+                else type(result).__name__
+            problems.append(f"{sections_text((section,))}: {reason}")
+            LOG.warning("apitera catalogue read failed for %s: %s", section, type(result).__name__)
+        return pages, problems
+
+    async def queue_parciv_job(self, uid: int, peer, batch: ParcivBatch, *,
+                               notice=None, note: str = "") -> Job | None:
+        """Put one apitera batch into the download queue and open its status message.
+
+        The batch is a normal job, so /status, /cancel and the one-transfer-at-a-time
+        rule apply exactly as they do for a hand-sent link.
+        """
+        if len(self.jobs) >= MAX_WAITING + 1:
+            text = "Queue is full (one active, four waiting). Try again later."
+            LOG.info("apitera: %s", text)
+            if notice is not None:
+                await self.safe_edit(notice, text)
+            else:
+                await self.client.send_message(peer, text)
+            return None
+        if notice is not None:
+            message_id = getattr(notice, "id", 0)
+        else:
+            sent = await self.client.send_message(peer, f"🤖 apitera: {batch.plan_line()}")
+            message_id = sent.id
+        job = Job(uid, peer, message_id, Source("parciv", batch.source_url), ("All",), None,
+                  parciv=batch, api_endpoint=self.api_for(uid, "parciv"))
+        job.title = batch.title
+        job.detail = f"Queued: {batch.plan_line()}. {note}".strip()
+        self.jobs[job.token] = job
+        job.task = asyncio.create_task(self.run_job(job))
+        job.task.add_done_callback(lambda task: self.on_job_done(job, task))
+        await self.render(job, force=True)
+        return job
+
+    async def run_parciv(self, job: Job) -> None:
+        """apitera: upload every quality of every item that is not in the DM yet.
+
+        One item at a time: read its detail (the canonical name) and its stream
+        answer, then download each quality to a temporary file and send it as a
+        streamable video with the API's poster as the cover. Files above the bot's
+        size limit are reported instead of being downloaded.
+        """
+        batch = job.parciv
+        if not isinstance(batch, ParcivBatch):
+            raise ParcivError("The apitera batch is missing; send the link again.")
+        uid = job.user_id
+        api = ParcivApi(job.api_endpoint or DEFAULT_APIS["parciv"])
+        dm_keys = await self.dm_titles(job.peer) if batch.check_dm else set()
+        sent = skipped = failed = too_large = 0
+        reasons: list[str] = []
+        job.item_total = len(batch.items)
+        for position, item in enumerate(batch.items, 1):
+            job.item_index = position
+            job.title = item.title
+            job.quality = ""
+            job.total_bytes = job.downloaded = job.uploaded = 0
+            job.speed = 0.0
+            job.sample_bytes, job.sample_at = 0, time.monotonic()
+            await self.progress(job, f"Reading {item.title} ({item.kind})…")
+            try:
+                media = await self.parciv_media(uid, api, item)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+                failed += 1
+                reasons.append(f"{item.title}: {type(exc).__name__}")
+                LOG.warning("apitera lookup failed for %s: %s", item.title, type(exc).__name__)
+                continue
+            if batch.check_dm and already_uploaded(media.title, dm_keys):
+                skipped += 1
+                LOG.info("apitera: %s is already in this chat", media.title)
+                await self.progress(job, f"Already in your DM: {media.title}. Skipping.")
+                continue
+            job.title = media.title
+            sources = [source for source in media.labelled_sources()
+                       if not batch.qualities or source.label in batch.qualities]
+            if not sources:
+                failed += 1
+                reasons.append(f"{item.title}: no matching quality")
+                continue
+            for source in sources:
+                job.quality = source.label
+                job.total_bytes = source.size
+                job.downloaded = job.uploaded = 0
+                job.speed = 0.0
+                job.sample_bytes, job.sample_at = 0, time.monotonic()
+                if source.size and source.size > self.max_bytes:
+                    too_large += 1
+                    LOG.info("apitera %s %s: %d bytes is over the limit", media.title, source.label,
+                             source.size)
+                    continue
+                tmpdir = tempfile.mkdtemp(prefix="ytdown-parciv-")
+                stop = threading.Event()
+                try:
+                    if source.size and shutil.disk_usage(tmpdir).free < source.size * 1.2:
+                        raise ParcivError("not enough free disk space on this host")
+                    proxy = self.proxy_for(uid, "parciv")
+                    await self.progress(job, f"Downloading {media.title} {source.label}…")
+
+                    def on_bytes(done: int, total: int, size: int = source.size) -> None:
+                        job.downloaded = done
+                        job.total_bytes = total or size
+
+                    try:
+                        path = await asyncio.to_thread(
+                            download_parciv, source.url, tmpdir, on_bytes, stop,
+                            proxy=proxy.url if proxy else None, headers=source.headers,
+                            label=source.label,
+                            duration=media.duration or source.duration, title=media.title)
+                    except asyncio.CancelledError:
+                        stop.set()  # Stops the worker thread at its next progress callback.
+                        raise
+                    size = os.path.getsize(path)
+                    if size > self.max_bytes:
+                        too_large += 1
+                        continue
+                    await self.send_parciv_file(job, media, source, path, tmpdir)
+                    sent += 1
+                    if batch.check_dm:
+                        dm_keys |= title_variants(media.title)
+                except ParcivError as exc:
+                    failed += 1
+                    reasons.append(f"{media.title} {source.label}: {exc}")
+                    LOG.warning("apitera transfer failed for %s %s: %s", media.title,
+                                source.label, exc)
+                except (aiohttp.ClientError, RPCError, asyncio.TimeoutError, ValueError,
+                        OSError) as exc:
+                    failed += 1
+                    reasons.append(f"{media.title} {source.label}: {type(exc).__name__}")
+                    LOG.warning("apitera upload failed for %s %s: %s", media.title, source.label,
+                                type(exc).__name__)
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+        summary = f"✅ Uploaded {sent} file(s) from apitera."
+        if skipped:
+            summary += f" {skipped} title(s) were already in your DM."
+        if too_large:
+            summary += f" {too_large} file(s) are over the size limit."
+        if failed:
+            summary += f" {failed} failed ({' · '.join(reasons[:3])})."
+        await self.progress(job, summary, force=True)
+
+    async def parciv_media(self, uid: int, api: ParcivApi, item: ParcivItem) -> ParcivMedia:
+        """One item's media, with the detail call first so the name is the API's own."""
+        session = self.http_for(uid)
+        try:
+            item = await fetch_parciv_item(session, api, item)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+            # The catalogue name is good enough to upload under; the stream call is next.
+            LOG.info("apitera detail for %s failed (%s); using the catalogue name", item.title,
+                     type(exc).__name__)
+        return await fetch_parciv_media(session, api, item)
+
+    async def send_parciv_file(self, job: Job, media: ParcivMedia, source: ParcivSource,
+                               path: str, tmpdir: str) -> None:
+        """Send one downloaded quality as a streamable video, titled the way it was asked for.
+
+        The name carries the API's title, its audio language tags and its subtitle
+        language before the quality: "PAW Patrol_ The Dino Movie [Hindi] [Eng Sub]
+        [360p].mp4", from a file already on disk (DASH streams need ffmpeg to mux).
+        """
+        title = media.display_title(source)
+        # Brackets stay: the language tags are part of the name the user asked for.
+        safe = re.sub(r"[^\w .\[\]-]", "_", title, flags=re.UNICODE).strip(" .") or "video"
+        suffix = Path(path).suffix.lower() or ".mp4"
+        final = os.path.join(tmpdir, media_name(safe, source.label, 100) + suffix)
+        os.replace(path, final)
+        duration = media.duration or source.duration
+        thumb = (await thumbnail_jpeg(self.http_for(job.user_id), media.poster)
+                 if media.poster else None)
+        thumb_file = None
+        if thumb:
+            thumb_file = io.BytesIO(thumb[0])
+            thumb_file.name = "preview.jpg"
+        job.total_bytes = os.path.getsize(final)
+        job.uploaded = 0
+
+        def on_upload(done: int, total: int) -> None:
+            job.uploaded = done
+            job.total_bytes = total
+
+        await self.progress(job, "Uploading to Telegram…")
+        message = await self.client.send_file(
+            job.peer, final, caption=media_name(title, source.label, 750), parse_mode=None,
+            mime_type="video/webm" if suffix == ".webm" else "video/mp4", supports_streaming=True,
+            thumb=thumb_file,
+            attributes=[types.DocumentAttributeVideo(duration=duration, w=source.width or 1280,
+                                                     h=source.height or 720, supports_streaming=True)],
+            progress_callback=on_upload)
+        LOG.info("Sent apitera %s %s (%d bytes, cover %s)", media.title, source.label,
+                 job.total_bytes, "yes" if thumb else "no")
+        return message
+
+    async def run_auto_check(self, uid: int, *, notice=None, note: str = "") -> str:
+        """Read the catalogue and queue one batch for the titles the DM does not hold."""
+        if self.parciv_busy(uid):
+            return "An apitera batch is already queued or running. /cancel stops it."
+        peer = self.auto_peers.get(uid)
+        if peer is None:
+            return "Send /auto on first, so the bot knows where to upload."
+        sections = normalise_sections(self.auto_sections.get(uid, ()))
+        limit = self.auto_limits.get(uid, self.auto_limit_default)
+        api = ParcivApi(self.api_for(uid, "parciv"))
+        pages, problems = await self.read_catalogue(uid, api, sections, limit)
+        items = tuple(item for page in pages for item in page.items)
+        if not items:
+            reason = "; ".join(problems[:2]) or "no entries"
+            result = f"Nothing to upload: {reason}."
+        else:
+            keys = await self.dm_titles(peer)
+            fresh = new_items(items, keys)
+            if not fresh:
+                result = f"Nothing new: all {len(items)} listed title(s) are already in your DM."
+            else:
+                batch = ParcivBatch(items=fresh, check_dm=True, source_url=api.endpoint,
+                                    sections=sections)
+                job = await self.queue_parciv_job(uid, peer, batch, notice=notice, note=note)
+                result = (f"Queued {len(fresh)} new title(s) from {sections_text(sections)} "
+                          f"({len(items) - len(fresh)} already in your DM).") if job else (
+                    "The queue is full; the next automatic check will retry.")
+        if notice is not None and "Queued" not in result:
+            await self.safe_edit(notice, result)
+        return result
+
+    async def auto_watch(self, uid: int) -> None:
+        """The watcher behind `/auto on`: check, upload what is missing, wait, repeat."""
+        LOG.info("apitera auto watch started for user %s (every %s)", uid,
+                 interval_text(int(self.auto_interval)))
+        while True:
+            await asyncio.sleep(self.auto_interval)
+            if not self.auto_enabled.get(uid) or uid in self.auto_running:
+                continue
+            self.auto_running.add(uid)
+            try:
+                self.auto_last[uid] = time.monotonic()
+                message = await self.run_auto_check(uid, note="Automatic check.")
+                LOG.info("apitera automatic check for user %s: %s", uid, message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.warning("apitera automatic check failed for user %s", uid, exc_info=True)
+            finally:
+                self.auto_running.discard(uid)
+
+    def auto_status_text(self, uid: int) -> str:
+        on = self.auto_enabled.get(uid, False)
+        sections = normalise_sections(self.auto_sections.get(uid, ()))
+        limit = self.auto_limits.get(uid, self.auto_limit_default)
+        last = self.auto_last.get(uid)
+        lines = [f"🤖 apitera auto: {'ON' if on else 'OFF'}",
+                 f"Sections: {sections_text(sections)} (page 1 each)",
+                 f"Pace: every {interval_text(int(self.auto_interval))}, {limit_text(limit)}",
+                 "Uploads: every quality of each title, named with its language and subtitle tags",
+                 "DM check: titles already in this chat are skipped",
+                 f"API: {self.api_for(uid, 'parciv')}"]
+        lines.append(f"Last check: {int(time.monotonic() - last)}s ago" if last else "Last check: not yet")
+        return "\n".join(lines)
+
+    def start_auto_watch(self, uid: int) -> None:
+        task = self.auto_tasks.get(uid)
+        if task and not task.done():
+            return
+        self.auto_tasks[uid] = asyncio.create_task(self.auto_watch(uid))
+
+    def stop_auto_watch(self, uid: int) -> None:
+        self.auto_enabled[uid] = False
+        task = self.auto_tasks.pop(uid, None)
+        if task:
+            task.cancel()
 
     async def run_dailymotion(self, job: Job) -> None:
         """One Dailymotion video: HLS variant -> temporary MP4 (yt-dlp + ffmpeg) -> upload from disk."""
