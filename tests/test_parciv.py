@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 from ytdown.apitera import (already_uploaded, listing_lines, new_items, parse_interval, parse_limit,
                             past_titles, interval_text)
 from ytdown.parciv import (AUTO_SECTIONS, PARCIV_API_URL, ParcivApi, ParcivError, ParcivItem,
+                            family_base, matches_words, search_url,  # noqa: F401 (used below)
                            download_parciv, is_parciv_media_endpoint, message_titles,
                            normalize_section, parse_catalogue, parse_detail, parse_parciv_source,
                            parse_post, parse_sections, parse_stream, pick_media, quality_label,
@@ -434,6 +435,41 @@ class DownloadTests(unittest.TestCase):
             with self.assertRaises(DownloadCancelled):
                 download_parciv("https://cdn.example.com/a.mp4", self.out, lambda *a: None, stop)
         self.assertTrue(stop.is_set())
+
+
+class SearchTests(unittest.TestCase):
+    """`/search`: the per-family search URLs and the title matching."""
+
+    def test_a_family_search_uses_that_family_base(self):
+        api = ParcivApi(PARCIV_API_URL)
+        self.assertEqual(search_url(api, "movies", "paw patrol"),
+                         "https://api.parciv.workers.dev/moviebox/search?query=paw%20patrol")
+        self.assertEqual(search_url(api, "tvshows", "the office"),
+                         "https://api.parciv.workers.dev/moviebox/search?query=the%20office")
+        self.assertEqual(search_url(api, "anime", "one piece 1130"),
+                         "https://api.parciv.workers.dev/anime/search?query=one%20piece%201130")
+        self.assertEqual(search_url(api, "donghua", "battle through"),
+                         "https://api.parciv.workers.dev/donghua/search?query=battle%20through")
+
+    def test_a_users_own_endpoint_keeps_its_own_base(self):
+        api = ParcivApi("https://example.com/api/moviebox")
+        self.assertEqual(family_base(api, "kids"), "https://example.com/api/moviebox")
+        self.assertEqual(family_base(api, "anime"), "https://example.com/anime")
+        self.assertEqual(search_url(api, "kids", "paw"),
+                         "https://example.com/api/moviebox/search?query=paw")
+
+    def test_every_word_has_to_appear_in_the_title(self):
+        self.assertTrue(matches_words("PAW Patrol: The Dino Movie (2026)", "paw patrol"))
+        self.assertTrue(matches_words("PAW Patrol: The Dino Movie (2026)", "dino"))
+        self.assertTrue(matches_words("One Piece Episode 1130 [Japanese] [Indonesian Sub]",
+                                      "one piece 1130"))
+        self.assertTrue(matches_words("Spider-Man_ Hari Baru [480p].mp4", "spider man"))
+        self.assertFalse(matches_words("PAW Patrol: The Dino Movie (2026)", "paw patrol 1130"))
+        self.assertFalse(matches_words("Matchbox the Movie (2026)", "paw"))
+
+    def test_an_empty_query_matches_nothing(self):
+        self.assertFalse(matches_words("PAW Patrol: The Dino Movie (2026)", ""))
+        self.assertFalse(matches_words("PAW Patrol: The Dino Movie (2026)", "   "))
 
 
 if __name__ == "__main__":

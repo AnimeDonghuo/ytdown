@@ -1,11 +1,13 @@
-"""apitera in the bot: /latest, /auto, /parciv and the upload runner."""
+"""apitera in the bot: /latest, /search, /auto, /parciv and the upload runner."""
 import asyncio
 import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from ytdown.apitera import CataloguePage, ParcivBatch
+import aiohttp
+
+from ytdown.apitera import SEARCH_SECTIONS, CataloguePage, ParcivBatch, parse_search
 from ytdown.bot import (DEFAULT_APIS, DownloaderBot, Job, MODE_LABELS, is_media_link,
                         normalize_api_endpoint)
 from ytdown.core import Source
@@ -187,14 +189,16 @@ class AutoTests(BotCase):
                       new=AsyncMock(side_effect=ParcivError("no stream in this test"))), \
                 patch("ytdown.bot.fetch_parciv_item", new=AsyncMock(side_effect=lambda s, a, i: i)):
             result = await self.service.run_auto_check(7)
-        self.assertIn("Queued 2 new title(s)", result)
-        self.assertEqual(len(self.service.jobs), 1)
-        job = next(iter(self.service.jobs.values()))
+            self.assertIn("Queued 2 new title(s)", result)
+            self.assertEqual(len(self.service.jobs), 1)
+            job = next(iter(self.service.jobs.values()))
+            # The job runs while the fakes are still in place, so it fails cleanly instead
+            # of reaching the mocked session's real HTTP calls.
+            await asyncio.gather(job.task, return_exceptions=True)
         self.assertTrue(job.parciv.check_dm)
         self.assertEqual(len(job.parciv.items), 2)
         self.assertEqual(job.source.kind, "parciv")
         self.assertEqual(job.api_endpoint, DEFAULT_APIS["parciv"])
-        await asyncio.gather(job.task, return_exceptions=True)
 
     async def test_nothing_new_is_reported_without_queueing(self):
         self.client.iter_messages = MagicMock(return_value=FakeHistory(
@@ -442,6 +446,130 @@ class LinkFlowTests(BotCase):
                                 message_id=21, answer=AsyncMock(), edit=AsyncMock())
         await self.service.callback(click)
         self.assertEqual(self.service.modes[7], "parciv")
+
+
+class ParseSearchTests(unittest.TestCase):
+    """`/search` line parsing: sections first, the words untouched otherwise."""
+
+    def test_a_bare_query_searches_every_family(self):
+        self.assertEqual(parse_search("/search paw patrol"), (SEARCH_SECTIONS, "paw patrol"))
+
+    def test_named_sections_narrow_the_search(self):
+        self.assertEqual(parse_search("/search movies paw patrol"), (("movies",), "paw patrol"))
+        self.assertEqual(parse_search("/search anime,donghua one piece"),
+                         (("anime", "donghua"), "one piece"))
+
+    def test_sections_can_be_named_at_the_end(self):
+        self.assertEqual(parse_search("/search paw patrol sections=movies,anime"),
+                         (("movies", "anime"), "paw patrol"))
+
+    def test_a_word_that_is_not_a_section_stays_in_the_query(self):
+        self.assertEqual(parse_search("/search in the mood for love"),
+                         (SEARCH_SECTIONS, "in the mood for love"))
+        self.assertEqual(parse_search("/search sections=in the mood for love"),
+                         (SEARCH_SECTIONS, "in the mood for love"))
+
+    def test_an_empty_line_asks_for_words(self):
+        self.assertEqual(parse_search("/search"), (SEARCH_SECTIONS, ""))
+        self.assertEqual(parse_search("/search@some_bot   "), (SEARCH_SECTIONS, ""))
+
+
+class SearchTests(BotCase):
+    """`/search`: the API's own search call, the page fallback and the buttons."""
+
+    async def test_the_search_call_is_asked_per_family_and_the_matches_are_listed(self):
+        self.client.iter_messages = MagicMock(return_value=FakeHistory(
+            [stored("Matchbox the Movie (2026) [Hindi] [1080p].mp4")]))
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        with patch("ytdown.bot.fetch_parciv_json", new=AsyncMock(return_value=MOVIES)) as fetch:
+            await self.service.handle_search(self.event("/search paw patrol", notice=notice),
+                                             "/search paw patrol")
+        text = notice.edit.call_args.args[0]
+        self.assertIn("🔎 apitera search — paw patrol", text)
+        self.assertIn("1. ⬇️ PAW Patrol: The Dino Movie (2026)", text)
+        self.assertIn("⬇️ 1 of 1 match(es) are new", text)
+        buttons = notice.edit.call_args.kwargs["buttons"]
+        self.assertEqual([button.text for row in buttons for button in row],
+                         ["⬇️ Download new (1)", "⬇️ Download all (1)", "🔁 Refresh", "▶️ Auto on"])
+        urls = [call.args[1] for call in fetch.await_args_list]
+        # One call per family: the six Moviebox sections share one search call.
+        self.assertEqual(sorted(urls),
+                         ["https://api.parciv.workers.dev/anime/search?query=paw%20patrol",
+                          "https://api.parciv.workers.dev/donghua/search?query=paw%20patrol",
+                          "https://api.parciv.workers.dev/moviebox/search?query=paw%20patrol"])
+        panel = self.service.latest_panels[7]
+        self.assertEqual(panel.words, "paw patrol")
+        self.assertEqual([item.title for item in panel.items],
+                         ["PAW Patrol: The Dino Movie (2026)"])
+
+    async def test_a_family_without_a_search_call_falls_back_to_its_pages(self):
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        page = CataloguePage("movies", 1, parse_catalogue(MOVIES, "movies"))
+        with patch("ytdown.bot.fetch_parciv_json",
+                   new=AsyncMock(side_effect=aiohttp.ClientError("HTTP 404"))), \
+                patch("ytdown.bot.fetch_parciv_catalogue",
+                      new=AsyncMock(return_value=page)) as pages:
+            await self.service.handle_search(self.event(notice=notice), "/search movies paw")
+        text = notice.edit.call_args.args[0]
+        self.assertIn("1. ⬇️ PAW Patrol: The Dino Movie (2026)", text)
+        self.assertIn("⚠️", text)
+        self.assertIn("scanned", text)
+        self.assertEqual(pages.await_count, 2)
+
+    async def test_a_title_listed_in_several_families_is_kept_once(self):
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        page = CataloguePage("movies", 1, parse_catalogue(MOVIES, "movies"))
+        with patch("ytdown.bot.fetch_parciv_json",
+                   new=AsyncMock(side_effect=aiohttp.ClientError("HTTP 404"))), \
+                patch("ytdown.bot.fetch_parciv_catalogue",
+                      new=AsyncMock(return_value=page)) as pages:
+            await self.service.handle_search(self.event(notice=notice), "/search paw")
+        text = notice.edit.call_args.args[0]
+        self.assertIn("1. ⬇️ PAW Patrol: The Dino Movie (2026)", text)
+        self.assertNotIn("2. ", text)
+        # Six Moviebox sections + Anime + Donghua, two pages each.
+        self.assertEqual(pages.await_count, 16)
+
+    async def test_a_search_without_words_shows_the_usage(self):
+        event = self.event()
+        await self.service.handle_search(event, "/search")
+        self.assertIn("Use /search <words>", event.respond.call_args.args[0])
+
+    async def test_nothing_matched_is_said_plainly(self):
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        with patch("ytdown.bot.fetch_parciv_json",
+                   new=AsyncMock(return_value={"results": []})), \
+                patch("ytdown.bot.fetch_parciv_catalogue",
+                      new=AsyncMock(return_value=CataloguePage("movies", 1, ()))):
+            await self.service.handle_search(self.event(notice=notice), "/search movies zzz")
+        self.assertIn("🔎 Nothing matched 'zzz'", notice.edit.call_args.args[0])
+
+    async def test_the_refresh_button_repeats_the_search(self):
+        self.service.auto_peers[7] = "peer"
+        self.service.latest_panels[7] = SimpleNamespace(
+            peer="peer", items=(), sections=("movies",), page=1, words="paw patrol")
+        self.service.auto_tokens[7] = "tok"
+        self.service.show_search = AsyncMock()
+        click = SimpleNamespace(sender_id=7, data=b"a:tok:latest", is_private=True, message_id=21,
+                                answer=AsyncMock(), edit=AsyncMock())
+        await self.service.callback(click)
+        self.assertEqual(click.answer.call_args.args[0], "Searching again…")
+        self.assertEqual(self.service.show_search.call_args.args[3], "paw patrol")
+        self.assertEqual(self.service.show_search.call_args.args[4], ("movies",))
+
+    async def test_a_search_download_button_queues_the_matches(self):
+        self.service.auto_peers[7] = "peer"
+        self.service.latest_panels[7] = SimpleNamespace(
+            peer="peer", items=parse_catalogue(MOVIES, "movies"), sections=("movies", "anime"),
+            page=1, words="paw")
+        self.service.auto_tokens[7] = "tok"
+        self.service.queue_parciv_job = AsyncMock(return_value=None)
+        click = SimpleNamespace(sender_id=7, data=b"a:tok:all", is_private=True, message_id=21,
+                                answer=AsyncMock(), edit=AsyncMock())
+        await self.service.callback(click)
+        batch = self.service.queue_parciv_job.call_args.args[2]
+        self.assertEqual(len(batch.items), 3)
+        self.assertEqual(batch.sections, ("movies", "anime"))
 
 
 if __name__ == "__main__":

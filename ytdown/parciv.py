@@ -151,6 +151,28 @@ def parse_sections(raw: str) -> tuple[str, ...]:
     return tuple(names)
 
 
+def family_base(api: "ParcivApi", section: str) -> str:
+    """The family URL a section lives under: the Moviebox base, Anime or Donghua."""
+    if section in PARCIV_STREAM_SECTIONS:
+        return f"{api.root}/{PARCIV_STREAM_SECTIONS[section]}"
+    return api.moviebox
+
+
+def search_url_for(base: str, words: str) -> str:
+    """A family's own search call, `…/<family>/search?query=…`.
+
+    Whether the family really has a search call is the API's business: a refusal
+    is answered by scanning its catalogue pages instead.
+    """
+    query = quote(" ".join(str(words or "").split()), safe="")
+    return f"{str(base).rstrip('/')}/search?query={query}"
+
+
+def search_url(api: "ParcivApi", section: str, words: str) -> str:
+    """That section's family search call (see `search_url_for`)."""
+    return search_url_for(family_base(api, section), words)
+
+
 def parse_parciv_source(raw: str) -> str:
     """Return the apitera link a message points at, or raise ValueError."""
     text = str(raw or "").strip()
@@ -228,6 +250,28 @@ def titles_match(left: object, right: object) -> bool:
                                           re.match(r"(?:episode|season|ep|s\d)\b|\d", tail)):
                     return True
     return False
+
+
+def matches_words(title: object, words: str) -> bool:
+    """True when every word of a search query appears in this title.
+
+    Tags, quality and language words are ignored, so "paw patrol" finds
+    `PAW Patrol: The Dino Movie (2026)` and "one piece 1130" finds
+    `One Piece Episode 1130 [Japanese] [Indonesian Sub]`.
+    """
+    if not str(words or "").strip():
+        return False
+    text = str(title or "").lower()
+    key = title_key(title)
+    for part in str(words or "").split():
+        needle = part.strip().lower()
+        if not needle:
+            continue
+        stripped = title_key(part)
+        if needle in text or (stripped and stripped in key):
+            continue
+        return False
+    return True
 
 
 def message_titles(message: object) -> tuple[str, ...]:

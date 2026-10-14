@@ -50,12 +50,13 @@ from .social import (MAX_SOCIAL_LINKS, SOCIAL_API_URL, SOCIAL_HOSTS, SocialBatch
 from .parciv import (AUTO_SECTIONS, DM_SCAN_LIMIT, MAX_AUTO_LIMIT, MAX_PARCIV_BYTES, PARCIV_API_URL,
                      PARCIV_SECTIONS, PARCIV_STREAM_SECTIONS, ParcivApi, ParcivError, ParcivItem,
                      ParcivMedia,
-                     ParcivSource, download_parciv, is_parciv_media_endpoint,
-                     parse_catalogue, parse_detail, parse_parciv_source, parse_post, parse_sections,
-                     parse_stream, pick_media, title_variants)
+                     ParcivSource, download_parciv, family_base, is_parciv_media_endpoint,
+                     matches_words, parse_catalogue, parse_detail, parse_parciv_source, parse_post,
+                     parse_sections, parse_stream, pick_media, search_url_for, title_variants)
 from .apitera import (AUTO_INTERVAL_DEFAULT, AUTO_INTERVAL_MIN, CataloguePage, ParcivBatch,
                       already_uploaded, interval_text, limit_text, listing_lines, new_items,
-                      normalise_sections, parse_interval, parse_limit, past_titles, sections_text)
+                      normalise_sections, parse_interval, parse_limit, parse_search, past_titles,
+                      sections_text, SEARCH_SECTIONS)
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg, usable_still
 from .proxy import (CHECK_TARGETS, KNOWN_TARGETS, MAX_PROXIES, MIN_LATENCY_MS, SERVICE_KEYS, TOO_FAST,
@@ -83,6 +84,8 @@ SERVICE_KEYWORDS = {"yt": "youtube", "youtube": "youtube", "tera": "terabox", "t
 RESET_WORDS = ("reset", "remove", "default")
 MAX_WAITING = 4
 MAX_SELECTIONS = 100
+SEARCH_LIMIT = 12  # How many matches one /search reply shows (and downloads at most).
+SEARCH_PAGES = 2  # Catalogue pages scanned per family when the API has no search call.
 SESSION_SECONDS = 1800
 # Telegram clients limit uploads to 4,000 parts of 512 KiB (2,000 MiB).
 # 2,047 MiB would need 4,094 parts and can fail near the end of an upload.
@@ -245,6 +248,7 @@ class LatestPanel:
     items: tuple[ParcivItem, ...] = ()
     sections: tuple[str, ...] = ()
     page: int = 1
+    words: str = ""  # Set on a search panel: Refresh repeats the search, not the listing.
     created: float = field(default_factory=time.monotonic)
 
 
@@ -1631,8 +1635,9 @@ class DownloaderBot:
                 "/change — YouTube / Terabox / Dailymotion / Rumble / MEGA / Instagram-Facebook buttons\n"
                 "MEGA: send a file or folder link, or several links at once. Instagram/Facebook: send a "
                 "post/reel/video link — that API is slow, so give it a minute.\n"
-                "apitera (Moviebox/Anime/Donghua): /latest lists page 1 by hand, /auto on uploads every "
-                "new title automatically, /parciv <link|id> reads one item.\n"
+                "apitera (Moviebox/Anime/Donghua): /latest lists page 1 by hand, /search <words> finds "
+                "a title, /auto on uploads every new title automatically, /parciv <link|id> reads one "
+                "item.\n"
                 "/status or /queue — one live status for running and queued jobs\n"
                 "/cancel — list jobs; /cancel_<job-id> stops one with a tappable command\n"
                 "/apis — numbered API list; /apis remove 3 resets a custom API\n"
@@ -1644,6 +1649,7 @@ class DownloaderBot:
                 "/proxychk export [all] — save the pool as a .txt to paste back after a restart\n"
                 "/auto [on|off|now|sections|limit <n>|every <15m>] — automatic apitera uploads\n"
                 "/latest [movies,anime,donghua] [count] [page=2] — browse the catalogue now\n"
+                "/search [movies,anime] <words> — find a title in every apitera catalogue\n"
                 "/parciv <apitera link or subject id> — read and queue one item\n"
                 "/proxy — proxy mode ON/OFF, pool status, re-check or clear the pool\n"
                 "/limits — size and queue limits\n/help — these instructions\n\n"
@@ -1687,6 +1693,8 @@ class DownloaderBot:
             await self.handle_auto(event, text)
         elif command == "/latest":
             await self.handle_latest(event, text)
+        elif command in ("/search", "/find"):
+            await self.handle_search(event, text)
         elif command == "/parciv":
             await self.handle_parciv(event, text)
         elif command in ("/status", "/queue"):
@@ -2411,6 +2419,150 @@ class DownloaderBot:
                  Button.inline("⏸ Auto off" if on else "▶️ Auto on",
                                data=f"a:{token}:{'off' if on else 'on'}".encode())]]
 
+    async def handle_search(self, event, text: str) -> None:
+        """`/search [sections] <words>` — find a title in the apitera catalogues."""
+        uid = event.sender_id
+        sections, words = parse_search(text)
+        if not words:
+            await event.respond("Use /search <words> to look for a title in every apitera catalogue "
+                                "(Moviebox movies, tv, tvshows, animation, kids, recommend, Anime, "
+                                "Donghua). Narrow it with /search movies,anime <words>, or add "
+                                "sections=movies,anime.")
+            return
+        peer = await event.get_input_chat()
+        self.auto_peers[uid] = peer
+        notice = await event.respond(f"🔎 Searching {sections_text(sections)} for {words}…")
+        try:
+            await self.show_search(uid, peer, notice, words, sections)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+            LOG.warning("apitera /search failed: %s", type(exc).__name__)
+            await self.safe_edit(notice, f"Could not search the apitera catalogue "
+                                         f"({type(exc).__name__}). Try again in a minute.")
+
+    async def search_family(self, uid: int, api: ParcivApi, base: str, sections: tuple[str, ...],
+                            words: str) -> tuple[tuple[ParcivItem, ...], str]:
+        """One family's search: its own search call, else its catalogue pages.
+
+        A search call that answers with matches is believed; anything else (a
+        refused call, an answer this API does not serve, no match at all) falls
+        back to reading that family's catalogue pages and filtering them here.
+        """
+        session = self.http_for(uid)
+        answered = False  # Whether this family has a search call at all.
+        try:
+            payload = await fetch_parciv_json(session, search_url_for(base, words))
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+            LOG.info("apitera search call refused for %s (%s); scanning its pages",
+                     sections_text(sections), type(exc).__name__)
+        else:
+            answered = True
+            found = tuple(item for item in parse_catalogue(payload, sections[0], api)
+                          if matches_words(item.title, words))
+            if found:
+                return found[:SEARCH_LIMIT], ""
+        reads = await asyncio.gather(
+            *(fetch_parciv_catalogue(session, api, section, page)
+              for section in sections for page in range(1, SEARCH_PAGES + 1)),
+            return_exceptions=True)
+        matches: list[ParcivItem] = []
+        seen: set[str] = set()
+        failed = 0
+        for result in reads:
+            if not isinstance(result, CataloguePage):
+                failed += 1
+                LOG.info("apitera catalogue read failed (%s)",
+                         type(result).__name__ if not isinstance(result, BaseException) else str(result))
+                continue
+            for item in result.items:
+                key = item.subject_id or item.title
+                if key in seen or not matches_words(item.title, words):
+                    continue
+                seen.add(key)
+                matches.append(item)
+        if not matches and failed == len(reads):
+            raise ParcivError(f"{sections_text(sections)} could not be read")
+        note = ""
+        if not answered:  # Only worth saying when there was no search call to answer.
+            note = (f"{sections_text(sections)}: the first {SEARCH_PAGES} page(s) were scanned "
+                    "instead of a search call")
+            if failed:
+                note += f" ({failed} read(s) failed)"
+        return tuple(matches[:SEARCH_LIMIT]), note
+
+    async def search_catalogue(self, uid: int, api: ParcivApi, sections: tuple[str, ...],
+                               words: str) -> tuple[tuple[ParcivItem, ...], tuple[str, ...]]:
+        """Search every named family once, in parallel, and report what failed.
+
+        The six Moviebox sections share one family, so they cost one search call;
+        they are still scanned separately when that family has no search call. A
+        title listed in several families (Moviebox lists some films in more than
+        one) is kept once.
+        """
+        groups: dict[str, list[str]] = {}
+        for section in sections:
+            groups.setdefault(family_base(api, section), []).append(section)
+        results = await asyncio.gather(
+            *(self.search_family(uid, api, base, tuple(group), words)
+              for base, group in groups.items()),
+            return_exceptions=True)
+        items: list[ParcivItem] = []
+        notes: list[str] = []
+        seen: set[str] = set()
+        for (base, group), result in zip(groups.items(), results):
+            if not isinstance(result, tuple):
+                reason = str(result) if isinstance(result, ParcivError) else type(result).__name__
+                notes.append(f"{sections_text(tuple(group))}: {reason}")
+                LOG.warning("apitera search failed for %s: %s", base, type(result).__name__)
+                continue
+            found, note = result
+            if note:
+                notes.append(note)
+            for item in found:
+                key = item.subject_id or item.title
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(item)
+        return tuple(items[:SEARCH_LIMIT]), tuple(notes)
+
+    async def show_search(self, uid: int, peer, notice, words: str,
+                          sections: tuple[str, ...]) -> None:
+        """Edit `notice` into the search matches with the same buttons as /latest."""
+        api = ParcivApi(self.api_for(uid, "parciv"))
+        items, notes = await self.search_catalogue(uid, api, sections, words)
+        if not items:
+            reason = "; ".join(notes[:2]) or "nothing that matches came back"
+            await self.safe_edit(notice, f"🔎 Nothing matched {words!r} in "
+                                         f"{sections_text(sections)}: {reason}.")
+            return
+        keys = await self.dm_titles(peer)
+        token = secrets.token_hex(4)
+        self.auto_tokens[uid] = token
+        self.latest_panels[uid] = LatestPanel(peer, getattr(notice, "id", 0), token, items,
+                                              sections, 1, words=words)
+        await self.safe_edit(notice, self.search_panel_text(uid, items, keys, words, sections,
+                                                            notes),
+                             buttons=self.latest_buttons(uid, token, items, keys), parse_mode=None)
+
+    def search_panel_text(self, uid: int, items: tuple[ParcivItem, ...], keys: set[str],
+                          words: str, sections: tuple[str, ...],
+                          notes: tuple[str, ...] = ()) -> str:
+        """The /search reply: the matches, what the DM holds and the auto state."""
+        fresh = new_items(items, keys)
+        on = self.auto_enabled.get(uid, False)
+        scope = "every catalogue" if len(sections) == len(SEARCH_SECTIONS) else sections_text(sections)
+        lines = [f"🔎 apitera search — {words} · {scope}",
+                 "✅ = already in your DM · ⬇️ = not uploaded yet", ""]
+        lines += listing_lines(CataloguePage("", 1, items), keys, len(items))
+        lines += ["", f"⬇️ {len(fresh)} of {len(items)} match(es) are new. Every quality of a "
+                      "title is uploaded, named with its language and subtitle tags."]
+        if notes:
+            lines.append("⚠️ " + " · ".join(notes[:3]))
+        lines.append(f"🤖 Automatic: {'ON' if on else 'OFF'} · every "
+                     f"{interval_text(int(self.auto_interval))} · "
+                     f"{limit_text(self.auto_limits.get(uid, self.auto_limit_default))}")
+        return "\n".join(lines)
+
     async def parciv_link_flow(self, event, uid: int, peer, link: str, notice=None) -> None:
         """A hand-sent apitera link: a catalogue page lists, one item offers its qualities."""
         api = ParcivApi(self.api_for(uid, "parciv"))
@@ -2545,8 +2697,12 @@ class DownloaderBot:
             await event.answer("That listing expired. Send /latest again.", alert=True)
             return
         if action == "latest":
-            await event.answer("Refreshing…")
             self.auto_peers[uid] = panel.peer
+            if panel.words:  # A search panel: Refresh repeats the search.
+                await event.answer("Searching again…")
+                await self.show_search(uid, panel.peer, event, panel.words, panel.sections)
+                return
+            await event.answer("Refreshing…")
             await self.show_latest(uid, panel.peer, event, panel.sections, panel.page,
                                    self.auto_limit_default)
             return

@@ -23,7 +23,8 @@ import re
 from dataclasses import dataclass, field
 
 from .parciv import (AUTO_SECTIONS, DEFAULT_AUTO_LIMIT, MAX_AUTO_LIMIT, PARCIV_API_URL,
-                     SECTION_LABELS, ParcivItem, message_titles, titles_match, title_variants)
+                     PARCIV_SECTIONS, PARCIV_STREAM_SECTIONS, SECTION_LABELS, ParcivError,
+                     ParcivItem, message_titles, parse_sections, titles_match, title_variants)
 
 AUTO_INTERVAL_DEFAULT = 900  # Seconds between automatic checks.
 AUTO_INTERVAL_MIN = 60
@@ -154,9 +155,42 @@ def limit_text(limit: int) -> str:
     return f"{limit} item(s) per section"
 
 
+SEARCH_SECTIONS = tuple(PARCIV_SECTIONS) + tuple(
+    section for section in PARCIV_STREAM_SECTIONS if section not in PARCIV_SECTIONS)
+
+
+def parse_search(text: str) -> tuple[tuple[str, ...], str]:
+    """Read `/search [sections] <words>` (also `… sections=movies,anime`).
+
+    The first word is taken as a section list only when it names sections, so
+    `/search movies paw patrol` searches Moviebox movies while `/search paw
+    patrol` searches every family. The words are returned untouched.
+    """
+    line = " ".join(str(text or "").split())
+    line = re.sub(r"^/[a-z_]+(?:@[A-Za-z0-9_]+)?", "", line, count=1).strip()
+    named: tuple[str, ...] = ()
+    match = re.search(r"(?:^|\s)sections?=(\S.*)$", line)
+    if match:
+        wanted = match.group(1).strip()
+        line = line[: match.start()].strip()
+        try:
+            named = parse_sections(wanted)
+        except ParcivError:  # Not a section list after all: search for those words.
+            line = f"{line} {wanted}".strip()
+    if not named and line:
+        first, _, rest = line.partition(" ")
+        try:
+            found = parse_sections(first)
+        except ParcivError:
+            found = ()
+        if found and rest.strip():
+            named, line = found, rest.strip()
+    return (named or SEARCH_SECTIONS), line
+
+
 __all__ = [
     "AUTO_INTERVAL_DEFAULT", "AUTO_INTERVAL_MAX", "AUTO_INTERVAL_MIN", "LIST_ITEMS", "PAGE_DEFAULT",
     "CataloguePage", "ParcivBatch", "already_uploaded", "interval_text", "limit_text",
     "listing_lines", "new_items", "normalise_sections", "parse_interval", "parse_limit",
-    "past_titles", "sections_text", "DEFAULT_AUTO_LIMIT",
+    "parse_search", "past_titles", "sections_text", "DEFAULT_AUTO_LIMIT", "SEARCH_SECTIONS",
 ]
