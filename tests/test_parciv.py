@@ -747,7 +747,8 @@ class PostLookupTests(unittest.TestCase):
                                "link": "http://santol.whatbox.ca:29318/KuangWang2/06-360p.mp4"},
                               "donghua", api)
         self.assertIsNotNone(item)  # No id and no slug: the file link is its key.
-        self.assertEqual(item.subject_id, item.extra["media_url"])
+        self.assertEqual(item.subject_id, "")  # A URL is not an id; no lookup is asked.
+        self.assertEqual(item.extra["media_sources"][0].url, item.extra["media_url"])
         self.assertEqual(item.title, "Kuang Wang 2")
         # An item whose only handle is its API link keeps that link.
         linked = item_from_dict({"name": "X",

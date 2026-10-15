@@ -1082,11 +1082,11 @@ def item_from_dict(raw: dict, section: str, api: "ParcivApi | None" = None) -> P
     if not subject_id:
         # Anime/Donghua lists often carry only a slug, which their /post call needs.
         subject_id = slug
-    if not subject_id:
-        # A listing that hands the file (or the API link) over needs no id: it is its key.
-        subject_id = own_media or post_url
-    if not subject_id:
-        return None
+    if not subject_id and not (own_media or post_url):
+        return None  # Nothing to look up and no file: this entry cannot be used.
+    # An entry whose only handle is a link (a /videos row: title + file) keeps an empty
+    # subject id on purpose — a URL is not an id, and asking with it would be a wasted
+    # call. Such an entry is downloaded from its own link instead.
     year = _text(first(raw, "year", "release_year", "releaseYear", "released"), 8)
     # Every file this entry carries: a listing that gives several qualities is kept whole
     # instead of downloading whichever link happened to be first.
