@@ -578,13 +578,15 @@ async def fetch_parciv_json(session: aiohttp.ClientSession, url: str,
                                         params=params or {})
         except aiohttp.ClientResponseError as exc:
             transient = exc.status in (408, 425, 429) or exc.status >= 500
-            reason = f"HTTP {exc.status}"
+            error, reason = exc, f"HTTP {exc.status}"
         except (json.JSONDecodeError, ValueError) as exc:  # Non-JSON, or a truncated body.
-            transient, reason = True, type(exc).__name__
+            transient, error, reason = True, exc, type(exc).__name__
         except aiohttp.ClientConnectionError as exc:
-            transient, reason = True, type(exc).__name__
+            transient, error, reason = True, exc, type(exc).__name__
         if not transient or attempt == len(PARCIV_RETRY_DELAYS):
-            raise
+            # The original error, not a bare re-raise: this is outside the
+            # except block, so `raise` alone is a RuntimeError.
+            raise error
         LOG.info("apitera read attempt %d failed (%s); retrying in %ss", attempt + 1,
                  reason, PARCIV_RETRY_DELAYS[attempt])
         await asyncio.sleep(PARCIV_RETRY_DELAYS[attempt])
@@ -4938,11 +4940,16 @@ async def serve(token: str, api_id: int, api_hash: str) -> None:
         service = DownloaderBot(client, http, timeout=timeout, headers=headers, store=store)
         service._load_apitera_settings()
         service.register()
+        def health_payload(request):
+            return web.json_response(
+                {"status": "ok" if client.is_connected() else "disconnected",
+                 "store": service.store.snapshot() if service.store else {"backend": "none"}},
+                status=200 if client.is_connected() else 503)
+
         health = web.Application()
-        health.router.add_get("/healthz", lambda request: web.json_response(
-            {"status": "ok" if client.is_connected() else "disconnected",
-             "store": service.store.snapshot() if service.store else {"backend": "none"}},
-            status=200 if client.is_connected() else 503))
+        health.router.add_get("/healthz", health_payload)
+        # Some Koyeb services poll the root path; answer it the same way.
+        health.router.add_get("/", health_payload)
         runner = web.AppRunner(health)
         await runner.setup()
         stop = asyncio.Event()

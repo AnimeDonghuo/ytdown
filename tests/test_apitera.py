@@ -603,6 +603,19 @@ class RunParcivTests(BotCase):
             media = await self.service.parciv_media(7, ParcivApi(PARCIV_API_URL), item)
         self.assertEqual([(source.label, source.url) for source in media.sources], [("360p", link)])
 
+    async def test_a_lookup_that_stops_answering_fails_only_that_item(self):
+        # The upstream refusing one read (HTTP 502) fails that item in the
+        # summary; it must not kill the whole batch as an unexpected error.
+        batch = ParcivBatch(items=(movie_item(), movie_item(name="Sleep No More")),
+                            check_dm=False)
+        job = await self.job(batch)
+        with patch("ytdown.bot.fetch_parciv_media", new=AsyncMock(side_effect=refused(502))), \
+                patch("ytdown.bot.fetch_parciv_item", new=AsyncMock(side_effect=lambda s, a, i: i)):
+            await self.service.run_parciv(job)
+        summary = self.service.progress.call_args.args[1]
+        self.assertIn("2 failed", summary)
+        self.assertNotIn("unexpected", summary.lower())
+
     async def test_a_leech_link_is_never_looked_up(self):
         link = "https://api.parciv.workers.dev/donghua/stream?url=http%3A%2F%2Fsantol.whatbox.ca" \
                "%3A29318%2F2026%2FDonghua%2FKuangWang2%2F06-480p.mp4"
@@ -1428,6 +1441,61 @@ class QueueHealthTests(BotCase):
         line = next(l for l in logs.output if "Heartbeat" in l)
         self.assertIn("running 1", line)
         self.assertIn("queued 1", line)
+
+
+def refused(status: int):
+    # Both URL attributes: aiohttp's ClientResponseError.__str__ reads real_url.
+    return aiohttp.ClientResponseError(
+        request_info=SimpleNamespace(url="https://api.parciv.workers.dev/x",
+                                     real_url="https://api.parciv.workers.dev/x"),
+        history=(), status=status, message="refused")
+
+
+class RetryTests(unittest.IsolatedAsyncioTestCase):
+    """The apitera read retries transient failures and dies with the original error."""
+
+    async def read(self, side_effect):
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=side_effect)) as fetch, \
+                patch.object(bot, "PARCIV_RETRY_DELAYS", (0, 0)):
+            payload = await bot.fetch_parciv_json(MagicMock(), "https://api.parciv.workers.dev/x")
+        return fetch, payload
+
+    async def test_a_persistently_refused_read_raises_the_original_error(self):
+        # A bare `raise` outside the except block is a RuntimeError; the job
+        # must see the real HTTP 502 so it can fail the item, not the whole job.
+        with self.assertRaises(aiohttp.ClientResponseError) as caught:
+            with patch("ytdown.bot.fetch_json_api",
+                       new=AsyncMock(side_effect=[refused(502)] * 3)) as fetch, \
+                    patch.object(bot, "PARCIV_RETRY_DELAYS", (0, 0)):
+                await bot.fetch_parciv_json(MagicMock(), "https://api.parciv.workers.dev/x")
+        self.assertEqual(caught.exception.status, 502)
+        self.assertEqual(fetch.await_count, 3)
+
+    async def test_a_non_transient_refusal_is_not_retried(self):
+        with self.assertRaises(aiohttp.ClientResponseError) as caught:
+            with patch("ytdown.bot.fetch_json_api",
+                       new=AsyncMock(side_effect=[refused(403)] * 3)) as fetch, \
+                    patch.object(bot, "PARCIV_RETRY_DELAYS", (0, 0)):
+                await bot.fetch_parciv_json(MagicMock(), "https://api.parciv.workers.dev/x")
+        self.assertEqual(caught.exception.status, 403)
+        self.assertEqual(fetch.await_count, 1)
+
+    async def test_a_truncated_body_raises_its_own_error_after_the_retries(self):
+        with self.assertRaises(ValueError):
+            with patch("ytdown.bot.fetch_json_api",
+                       new=AsyncMock(side_effect=[ValueError("Expecting value")] * 3)) as fetch, \
+                    patch.object(bot, "PARCIV_RETRY_DELAYS", (0, 0)):
+                await bot.fetch_parciv_json(MagicMock(), "https://api.parciv.workers.dev/x")
+        self.assertEqual(fetch.await_count, 3)
+
+    async def test_a_transient_refusal_then_success_is_returned(self):
+        answer = {"status": "ok", "items": []}
+        with patch("ytdown.bot.fetch_json_api",
+                   new=AsyncMock(side_effect=[refused(502), answer])) as fetch, \
+                patch.object(bot, "PARCIV_RETRY_DELAYS", (0, 0)):
+            payload = await bot.fetch_parciv_json(MagicMock(), "https://api.parciv.workers.dev/x")
+        self.assertEqual(fetch.await_count, 2)
+        self.assertEqual(payload, answer)
 
 
 if __name__ == "__main__":
