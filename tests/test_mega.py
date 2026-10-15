@@ -2,6 +2,7 @@
 import asyncio
 import json
 import unittest
+from dataclasses import replace
 
 import aiohttp
 from types import SimpleNamespace
@@ -379,6 +380,26 @@ class MegaFlowTests(unittest.IsolatedAsyncioTestCase):
         # link is tried before the file counts as failed.
         self.assertEqual(attempts, ["https://samra-mega-api.onrender.com/api/download?file_id=kr0X0C6J&file_key=D5WTOPi5",
                                     "https://mega.nz/file/kr0X0C6J#D5WTOPi5"])
+        self.assertIn("Sent 1 file(s)", self.service.progress.call_args.args[1])
+
+    async def test_a_host_that_refuses_everything_gets_one_more_try(self):
+        listing = self.listing()
+        job = await self.job(selected=("File",))
+        job.listing = replace(listing, files=(listing.files[2],))
+        job.start = job.end = 1
+        attempts = []
+
+        async def fake_send(job, video, quality, url, index, total, source_file=None):
+            attempts.append(url)
+            if len(attempts) < 3:  # Both URLs refuse while the host is asleep.
+                raise aiohttp.ClientResponseError(None, (), status=502, message="Bad gateway")
+
+        self.service.send_stream = AsyncMock(side_effect=fake_send)
+        with patch("ytdown.bot.asyncio.sleep", new=AsyncMock()) as sleep:
+            await self.service.run_mega(job)
+        self.assertEqual(len(attempts), 3)  # download, stream, then the first one again.
+        self.assertEqual(attempts[-1], attempts[0])
+        sleep.assert_awaited_once()
         self.assertIn("Sent 1 file(s)", self.service.progress.call_args.args[1])
 
     async def test_an_oversized_file_is_refused_before_downloading(self):

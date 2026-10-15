@@ -94,6 +94,7 @@ SESSION_SECONDS = 1800
 SOCIAL_TIMEOUT = aiohttp.ClientTimeout(total=300, connect=30, sock_read=180)
 # The MEGA API is slow to wake, so each of its attempts gets room to finish.
 MEGA_TIMEOUT = aiohttp.ClientTimeout(total=180, connect=30)
+MEGA_DOWNLOAD_WAIT = 15  # Seconds before one last try at a MEGA download URL.
 MAX_MT_MB = 2000
 PART_BYTES = 512 * 1024
 MAX_PARTS = 4000
@@ -3226,8 +3227,18 @@ class DownloaderBot:
             video = Video(file.title, {choice: file.url}, thumbnail="")
             await self.progress(job, f"Downloading MEGA → Telegram ({file.path}).")
             urls = file.alternates()
-            for attempt, url in enumerate(urls):
+            # Every URL is tried once; when they all fail without a byte moving the
+            # whole host is probably asleep, so the first URL gets one more chance
+            # after a wait instead of the file being counted as failed.
+            attempts = [(url, 0) for url in urls]
+            if urls:
+                attempts.append((urls[0], MEGA_DOWNLOAD_WAIT))
+            for position, (url, wait) in enumerate(attempts):
                 try:
+                    if wait:
+                        await self.progress(
+                            job, f"The MEGA host is not answering; waiting {wait}s and retrying…")
+                        await asyncio.sleep(wait)
                     await self.send_stream(job, video, choice, url, index, job.item_total, file)
                     sent += 1
                     break
@@ -3242,8 +3253,8 @@ class DownloaderBot:
                         OSError) as exc:
                     # The API's download route can refuse a link while its streaming
                     # route still works, so the other URLs for the same file are tried.
-                    if attempt + 1 < len(urls) and not job.downloaded:
-                        LOG.info("MEGA link refused for %s (%s); trying the next URL",
+                    if position + 1 < len(attempts) and not job.downloaded:
+                        LOG.info("MEGA URL refused for %s (%s); trying the next one",
                                  file.filename, type(exc).__name__)
                         continue
                     LOG.warning("MEGA transfer failed for %s: %s", file.filename, type(exc).__name__)
