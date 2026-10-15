@@ -1020,7 +1020,15 @@ def parse_post(payload: object, item: "ParcivItem | None" = None,
     if isinstance(data, list):
         # A list is a catalogue (a `/videos` family answer): take this item's own entry.
         entries = [entry for entry in data if isinstance(entry, dict)]
-        raw = catalogue_entry(payload, item) or (entries[0] if entries else {})
+        entry = catalogue_entry(payload, item)
+        if entry is None:
+            # The answer is a catalogue and this title is not in it. Falling through
+            # to `entries[0]` would pair the listing's name with someone else's files.
+            names = [media_title(candidate) for candidate in entries if media_title(candidate)]
+            hint = f" (the API returned: {', '.join(names[:3])})" if names else ""
+            raise ParcivError(f"the answer is a list of {len(entries)} entries and lists "
+                              f"no entry for {item.title}{hint}")
+        raw = entry
     if not isinstance(raw, dict):
         raise ParcivError("The apitera answer for this episode was not usable.")
     sources = media_sources(raw) or media_sources_anywhere(raw)
@@ -1028,8 +1036,13 @@ def parse_post(payload: object, item: "ParcivItem | None" = None,
         raise ParcivError("The apitera answer for this episode listed no downloadable files.")
     duration = _int(first(raw, "duration", "seconds", "total_duration")) or max(
         (source.duration for source in sources), default=0)
+    title = media_title(raw, item.title if item else "")
+    # When a lookup shape answers with someone else's episode, refuse so the ladder
+    # keeps looking — the listing's name and the file the API hands over must agree.
+    if item is not None and title and item.title and not titles_match(title, item.name):
+        raise ParcivError(f"the answer is for {title!r}, not {item.title!r}")
     return ParcivMedia(
-        title=media_title(raw, item.title if item else ""),
+        title=title,
         poster=url_value(raw, "poster", "image", "thumbnail", "cover") or (item.poster if item else ""),
         summary=_text(first(raw, "desc", "description", "synopsis", "overview", "summary"), 900)
         or (item.summary if item else ""),

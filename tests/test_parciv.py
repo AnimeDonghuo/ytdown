@@ -600,6 +600,31 @@ class StreamLinkTests(unittest.TestCase):
                                    {"title": "Third Show", "url": other}]}, item)
         self.assertIn("lists no entry for Kuang Wang 2", str(caught.exception))
 
+    def test_an_answer_for_a_different_title_is_refused(self):
+        """A `/post?id=` whose server-side id points at another series is rejected.
+
+        The lookup ladder then tries the next shape instead of uploading the wrong file
+        under the listing's name — the data-mismatch case the user hit with Kuang Wang 2.
+        """
+        item = ParcivItem(subject_id="7788", name="Kuang Wang 2", section="donghua",
+                          extra={"slug": "kuang-wang-2"})
+        naruto = {"title": "Naruto Episode 01", "id": "7788",
+                  "url": "http://santol.whatbox.ca:29318/2026/Donghua/Naruto/01-720p.mp4"}
+        with self.assertRaises(ParcivError) as caught:
+            parse_post(naruto, item)
+        self.assertIn("not 'Kuang Wang 2'", str(caught.exception))
+        # A list of one entry that names someone else is refused for the same reason.
+        with self.assertRaises(ParcivError) as caught:
+            parse_post({"data": [naruto]}, item)
+        self.assertIn("not 'Kuang Wang 2'", str(caught.exception))
+        # …and the matching answer still goes through.
+        kuang = {"title": "Kuang Wang 2 Episode 06", "id": "7788",
+                 "url": "http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/06-480p.mp4"}
+        media = parse_post(kuang, item)
+        self.assertEqual(media.title, "Kuang Wang 2 Episode 06")
+        self.assertEqual([source.url for source in media.sources],
+                         ["http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/06-480p.mp4"])
+
     def test_every_quality_a_listing_entry_carries_is_kept(self):
         api = ParcivApi(PARCIV_API_URL)
         cdn = "http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/"
