@@ -937,8 +937,12 @@ class SearchTests(BotCase):
         self.assertIn("1. ⬇️ PAW Patrol: The Dino Movie (2026)", text)
         self.assertIn("⬇️ 1 of 1 match(es) are new", text)
         buttons = notice.edit.call_args.kwargs["buttons"]
-        self.assertEqual([button.text for row in buttons for button in row],
-                         ["⬇️ Download new (1)", "⬇️ Download all (1)", "🔁 Refresh", "▶️ Auto on"])
+        # Per-title select buttons (one row) and a Download all / Refresh pair.
+        button_texts = [button.text for row in buttons for button in row]
+        self.assertTrue(any("PAW Patrol" in text for text in button_texts),
+                        button_texts)
+        self.assertIn("⬇️ Download all", button_texts)
+        self.assertIn("🔁 Refresh", button_texts)
         urls = [call.args[1] for call in fetch.await_args_list]
         # One call per family: the six Moviebox sections share one search call.
         self.assertEqual(sorted(urls),
@@ -1166,6 +1170,97 @@ class AutoStatusTests(BotCase):
         result = await self.service.run_auto_check(7, note="Automatic check.", announce=True)
         self.assertIn("already queued or running", result)
         self.client.send_message.assert_not_awaited()
+
+
+class EpisodePickerTests(BotCase):
+    """`/search` → tap a donghua title → episode picker → download selected."""
+
+    async def test_tapping_a_donghua_title_opens_the_episode_picker(self):
+        # The search panel finds Kuang Wang 2.
+        donghua_latest = {"status": "ok", "data": {"list": [
+            {"subjectId": "7788", "name": "Kuang Wang 2", "year": "2026",
+             "episode": "Episode 06"}]}}
+        # The /videos?subjectId=7788 answer is a list of every episode.
+        donghua_videos = {"status": "ok", "data": [
+            {"title": "Kuang Wang 2", "id": "06-360p", "episode": "Episode 06",
+             "url": "http://cdn.example.com/06-360p.mp4"},
+            {"title": "Kuang Wang 2", "id": "06-480p", "episode": "Episode 06",
+             "url": "http://cdn.example.com/06-480p.mp4"},
+            {"title": "Kuang Wang 2", "id": "07-360p", "episode": "Episode 07",
+             "url": "http://cdn.example.com/07-360p.mp4"}]}
+        async def fake_fetch(session, url, *args, **kwargs):
+            if "/donghua/videos" in url and "subjectId=7788" in url:
+                return donghua_videos
+            if url.endswith("/donghua/latest"):
+                return donghua_latest
+            return {"status": "ok", "data": []}
+        notice = SimpleNamespace(id=21, edit=AsyncMock(), delete=AsyncMock())
+        self.client.iter_messages = MagicMock(return_value=FakeHistory([]))
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=fake_fetch)):
+            await self.service.handle_search(
+                self.event("/search donghua kuang wang 2", notice=notice),
+                "/search donghua kuang wang 2")
+            # Find the per-title row and read its token from the panel state.
+            panel = self.service.latest_panels[7]
+            self.assertEqual(panel.words, "kuang wang 2")
+            token = self.service.auto_tokens[7]
+            # Tap the title: the bot reads /donghua/videos?subjectId=7788 and
+            # builds the episode picker. The patch must still be active.
+            ep_event = SimpleNamespace(sender_id=7, is_private=True, message_id=99,
+                                       data=f"s:{token}:title:7788".encode(),
+                                       answer=AsyncMock(), edit=AsyncMock())
+            await self.service.callback(ep_event)
+        ep_panel = self.service.episode_panels[7]
+        self.assertIsNotNone(ep_panel)
+        self.assertTrue(ep_panel.title.startswith("Kuang Wang 2"))
+        self.assertEqual({item.subject_id for item in ep_panel.episodes},
+                         {"06-360p", "06-480p", "07-360p"})
+        # Tap two episodes and "Download selected (2)".
+        for ep_id in ("06-360p", "07-360p"):
+            await self.service.callback(SimpleNamespace(
+                sender_id=7, is_private=True, message_id=99,
+                data=f"s:{ep_panel.token}:ep:7788:{ep_id}".encode(),
+                answer=AsyncMock(), edit=AsyncMock()))
+        self.assertEqual(ep_panel.selected, {"06-360p", "07-360p"})
+        await self.service.callback(SimpleNamespace(
+            sender_id=7, is_private=True, message_id=99,
+            data=f"s:{ep_panel.token}:go".encode(),
+            answer=AsyncMock(), edit=AsyncMock()))
+        # The job was queued with exactly those two episodes.
+        jobs = [j for j in self.service.jobs.values()
+                if j.parciv and j.parciv.items]
+        self.assertEqual(len(jobs), 1)
+        queued = {item.subject_id for item in jobs[0].parciv.items}
+        self.assertEqual(queued, {"06-360p", "07-360p"})
+
+    async def test_tapping_a_movie_skips_the_episode_step(self):
+        # A movie search match: a single result, no episodes, no subject_id that
+        # belongs to an anime/donghua family. The tap should fall through to
+        # the existing quality picker, not the episode picker.
+        movies = {"status": "ok", "data": [{
+            "subjectId": MOVIE_ID, "name": "PAW Patrol: The Dino Movie",
+            "year": "2026"}]}
+        stream = {"status": "ok", "data": [{
+            "title": "PAW Patrol: The Dino Movie", "subjectId": MOVIE_ID,
+            "resources": [{"url": "http://cdn.example.com/360p.mp4",
+                           "quality": "360p"}]}]}
+        async def fake_fetch(session, url, *args, **kwargs):
+            if "/moviebox/stream" in url:
+                return stream
+            return movies
+        notice = SimpleNamespace(id=21, edit=AsyncMock(), delete=AsyncMock())
+        self.client.iter_messages = MagicMock(return_value=FakeHistory([]))
+        with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=fake_fetch)):
+            await self.service.handle_search(
+                self.event("/search paw patrol", notice=notice),
+                "/search paw patrol")
+            token = self.service.auto_tokens[7]
+            await self.service.callback(SimpleNamespace(
+                sender_id=7, is_private=True, message_id=99,
+                data=f"s:{token}:title:{MOVIE_ID}".encode(),
+                answer=AsyncMock(), edit=AsyncMock()))
+        # The episode picker is empty for movies — the existing quality flow ran.
+        self.assertNotIn(7, self.service.episode_panels)
 
 
 if __name__ == "__main__":

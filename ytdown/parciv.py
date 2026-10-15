@@ -185,6 +185,17 @@ class ParcivApi:
             raise ParcivError("This apitera entry carries no id to look up.")
         return candidates[0][1]
 
+    def videos_subject_id(self, section: str, subject_id: str) -> str:
+        """`<family>/videos?subjectId=<id>` — the per-title episode list.
+
+        The lookup ladder already builds this URL as one of its candidates, but
+        the search-result title picker wants it without the rest of the ladder:
+        the answer is the parent catalogue scoped to that title.
+        """
+        if section not in PARCIV_STREAM_SECTIONS:
+            raise ParcivError(f"videos_subject_id is only for anime/donghua, not {section!r}")
+        return f"{self.root}/{PARCIV_STREAM_SECTIONS[section]}/videos?subjectId={quote(str(subject_id))}"
+
 
 def normalize_section(value: str) -> str:
     """Accept `anime`, `moviebox/animation`, `tv-posts`… as the section they name."""

@@ -51,11 +51,12 @@ from .social import (MAX_SOCIAL_LINKS, SOCIAL_API_URL, SOCIAL_HOSTS, SocialBatch
 from .parciv import (AUTO_SECTIONS, DM_SCAN_LIMIT, MAX_AUTO_LIMIT, MAX_PARCIV_BYTES, PARCIV_API_URL,
                      PARCIV_SECTIONS, PARCIV_STREAM_SECTIONS, ParcivApi, ParcivError, ParcivItem,
                      ParcivMedia, ParcivSource, brief, download_parciv, family_base, file_title,
-                     is_downloadable_url, is_parciv_media_endpoint, leech_link_file,
+                     find_dicts, is_downloadable_url, is_parciv_media_endpoint, item_from_dict,
+                     leech_link_file,
                      link_media, matches_words, media_sources_anywhere,
                      merged_media, parse_catalogue, parse_detail, parse_parciv_source, parse_post,
                      parse_sections, parse_stream, pick_media, quality_label, search_url_for,
-                     title_variants)
+                     titles_match, title_variants)
 from .apitera import (AUTO_INTERVAL_DEFAULT, AUTO_INTERVAL_MIN, CataloguePage, ParcivBatch,
                       already_uploaded, interval_text, limit_text, listing_lines, new_items,
                       describe_payload, normalise_sections, parse_interval, parse_limit,
@@ -260,6 +261,30 @@ class LatestPanel:
     page: int = 1
     words: str = ""  # Set on a search panel: Refresh repeats the search, not the listing.
     url: str = ""  # Set when the panel came from a link: Refresh re-reads that link.
+
+
+@dataclass
+class EpisodePanel:
+    """The episode picker shown when a /search match has more than one episode.
+
+    ``title`` is the parent title (Kuang Wang 2), ``title_id`` is the parent's
+    own subject_id (used in the button data so the toggle can verify the panel),
+    ``episodes`` is the per-episode items the catalogue returned, and
+    ``selected`` is the set of episode ids the user has ticked so far.
+    ``parent_token`` is the search-panel token that opened this one, so the
+    "back" button returns to the search results.
+    """
+
+    peer: object
+    message_id: int
+    token: str = field(default_factory=lambda: secrets.token_hex(4))
+    title: str = ""
+    title_id: str = ""
+    section: str = ""
+    episodes: tuple[ParcivItem, ...] = ()
+    selected: set[str] = field(default_factory=set)
+    page: int = 0  # Episode list pages, 50 per page.
+    parent_token: str = ""
     created: float = field(default_factory=time.monotonic)
 
 
@@ -877,9 +902,11 @@ Pipelines bounded saveBigFilePart/saveFilePart requests from the HTTP stream,
 
 class DownloaderBot:
     def __init__(self, client: TelegramClient, session: aiohttp.ClientSession, *,
-                 timeout: aiohttp.ClientTimeout | None = None, headers: dict | None = None):
+                 timeout: aiohttp.ClientTimeout | None = None, headers: dict | None = None,
+                 store: "Store | None" = None):
         self.client = client
         self.http = session
+        self.store = store  # Optional persistent store; ``None`` keeps state in memory only.
         self.timeout = timeout or aiohttp.ClientTimeout(total=240, connect=20)
         self.headers = headers or {"User-Agent": "ytdown-telegram-bot/1.0"}
         self.selections: dict[int, Selection] = {}
@@ -902,6 +929,7 @@ class DownloaderBot:
         self.auto_last: dict[int, float] = {}
         self.auto_tokens: dict[int, str] = {}
         self.latest_panels: dict[int, LatestPanel] = {}
+        self.episode_panels: dict[int, EpisodePanel] = {}  # Per-user episode pickers.
         self.auto_interval = float(env_int("PARCIV_AUTO_INTERVAL", AUTO_INTERVAL_DEFAULT,
                                            AUTO_INTERVAL_MIN, 24 * 3600))
         self.auto_limit_default = env_int("PARCIV_AUTO_LIMIT", 3, 1, MAX_AUTO_LIMIT)
@@ -965,6 +993,7 @@ class DownloaderBot:
         endpoint = normalize_api_endpoint(raw)
         self.api_overrides.setdefault(uid, {})[service] = endpoint
         self.awaiting_api.discard(uid)
+        self._save_apitera_settings(uid)  # Persist the override through a redeploy.
         router = self.routers.get(uid)
         if router is not None:  # Keep site-aware routing on the new host.
             router.api_hosts = self.api_hosts_for(uid)
@@ -2112,6 +2141,25 @@ class DownloaderBot:
                      Button.inline("Cancel", data=f"s:{selection.token}:cancel".encode())])
         return rows
 
+    def search_panel_keyboard(self, token: str, items: tuple["ParcivItem", ...]) -> list:
+        """Per-title buttons for a /search reply.
+
+        Each match is a row on its own (subject_id, with a short label) so the user
+        can pick one title to inspect. The bottom row keeps the bulk-download
+        buttons so a /search reply still downloads everything in one tap.
+        """
+        rows: list[list] = []
+        for index, item in enumerate(items[:8], 1):  # Cap per-row buttons to 8 titles.
+            label = f"{index}. {item.title[:32]}"
+            if item.section:
+                label += f" ({item.section})"
+            rows.append([Button.inline(f"🎬 {label}",
+                                       data=f"s:{token}:title:{item.subject_id}".encode())])
+        # Bulk actions and refresh on the last two rows.
+        rows.append([Button.inline("⬇️ Download all", data=f"s:{token}:all".encode()),
+                     Button.inline("🔁 Refresh", data=f"s:{token}:refresh".encode())])
+        return rows
+
     async def on_link(self, event) -> None:
         uid = event.sender_id
         now = time.monotonic()
@@ -2398,6 +2446,7 @@ class DownloaderBot:
                 self.start_auto_watch(uid)
             else:
                 self.stop_auto_watch(uid)
+            self._save_apitera_settings(uid)
             await event.respond(self.auto_status_text(uid), parse_mode=None)
             return
         if head in ("now", "check", "run"):
@@ -2414,6 +2463,7 @@ class DownloaderBot:
         if head == "sections":
             if not tail or tail.lower() in ("default", "all", "reset"):
                 self.auto_sections[uid] = AUTO_SECTIONS
+                self._save_apitera_settings(uid)
                 await event.respond(f"Automatic sections: {sections_text(AUTO_SECTIONS)}.")
                 return
             try:
@@ -2422,6 +2472,7 @@ class DownloaderBot:
                 await event.respond(str(exc))
                 return
             self.auto_sections[uid] = sections
+            self._save_apitera_settings(uid)
             await event.respond(f"Automatic sections: {sections_text(sections)}.")
             return
         if head == "limit":
@@ -2431,6 +2482,7 @@ class DownloaderBot:
                 return
             try:
                 self.auto_limits[uid] = parse_limit(tail)
+                self._save_apitera_settings(uid)
             except ValueError as exc:
                 await event.respond(f"{exc} Use /auto limit <1-{MAX_AUTO_LIMIT}>.")
                 return
@@ -2443,6 +2495,7 @@ class DownloaderBot:
                 return
             try:
                 self.auto_interval = float(parse_interval(tail))
+                self._save_apitera_settings(uid)
             except ValueError as exc:
                 await event.respond(f"{exc} Use /auto every 15m.")
                 return
@@ -2450,6 +2503,7 @@ class DownloaderBot:
                 self.stop_auto_watch(uid)
                 self.auto_enabled[uid] = True
                 self.start_auto_watch(uid)
+                self._save_apitera_settings(uid)
             await event.respond(f"Automatic pace: every {interval_text(int(self.auto_interval))}.")
             return
         await event.respond("Use /auto, /auto on|off, /auto now, /auto sections movies,anime, "
@@ -2586,7 +2640,7 @@ class DownloaderBot:
             reason = "; ".join(problems[:2]) or "the API answered nothing"
             await self.safe_edit(notice, f"No catalogue entries came back: {reason}.")
             return
-        keys = await self.dm_titles(peer)
+        keys = await self.dm_titles(peer, uid=uid)
         token = self.apitera_token(uid)
         self.latest_panels[uid] = LatestPanel(peer, getattr(notice, "id", 0), token, items,
                                               sections, page)
@@ -2752,7 +2806,7 @@ class DownloaderBot:
         items = parse_catalogue(payload, section, api)
         if not items:
             raise ParcivError("That apitera URL listed no items.")
-        keys = await self.dm_titles(peer)
+        keys = await self.dm_titles(peer, uid=uid)
         token = self.apitera_token(uid)
         self.latest_panels[uid] = LatestPanel(peer, getattr(notice, "id", 0), token, items,
                                               (section,), page, url=url)
@@ -2761,8 +2815,9 @@ class DownloaderBot:
             items = tuple(item for item in items if matches_words(item.title, words)) or items
         text = (self.search_panel_text(uid, items, keys, words, (section,)) if words
                 else self.latest_panel_text(uid, items, keys, (section,), page))
-        await self.safe_edit(notice, text, buttons=self.latest_buttons(uid, token, items, keys),
-                             parse_mode=None)
+        keyboard = (self.search_panel_keyboard(token, items) if words
+                    else self.latest_buttons(uid, token, items, keys))
+        await self.safe_edit(notice, text, buttons=keyboard, parse_mode=None)
 
     async def show_search(self, uid: int, peer, notice, words: str,
                           sections: tuple[str, ...]) -> None:
@@ -2774,13 +2829,13 @@ class DownloaderBot:
             await self.safe_edit(notice, f"🔎 Nothing matched {words!r} in "
                                          f"{sections_text(sections)}: {reason}.")
             return
-        keys = await self.dm_titles(peer)
+        keys = await self.dm_titles(peer, uid=uid)
         token = self.apitera_token(uid)
         self.latest_panels[uid] = LatestPanel(peer, getattr(notice, "id", 0), token, items,
                                               sections, 1, words=words)
         await self.safe_edit(notice, self.search_panel_text(uid, items, keys, words, sections,
                                                             notes),
-                             buttons=self.latest_buttons(uid, token, items, keys), parse_mode=None)
+                             buttons=self.search_panel_keyboard(token, items), parse_mode=None)
 
     def search_panel_text(self, uid: int, items: tuple[ParcivItem, ...], keys: set[str],
                           words: str, sections: tuple[str, ...],
@@ -2995,7 +3050,7 @@ class DownloaderBot:
                                    self.auto_limit_default)
             return
         if action in ("go", "all"):
-            keys = await self.dm_titles(panel.peer) if action == "go" else set()
+            keys = await self.dm_titles(panel.peer, uid=uid) if action == "go" else set()
             items = new_items(panel.items, keys) if action == "go" else panel.items
             if not items:
                 await event.answer("Nothing new to download.", alert=True)
@@ -3005,6 +3060,236 @@ class DownloaderBot:
             await event.answer(f"Queued {len(items)} title(s)")
             await self.queue_parciv_job(uid, panel.peer, batch, notice=event,
                                         note="From the /latest listing.")
+
+    async def search_action(self, event, uid: int, parts: list[str]) -> None:
+        """The buttons on a /search reply: pick a title, choose episodes, or download all.
+
+        The format is ``s:<token>:<verb>:<args...>``. Verbs:
+
+        * ``title:<subject_id>`` - open the title's episode picker (donghua/anime) or
+          the existing quality picker (movie/tv).
+        * ``ep:<subject_id>:<ep_id>`` - toggle an episode in the current selection.
+        * ``go`` - queue every selected episode for download.
+        * ``all`` - download every match in the panel.
+        * ``refresh`` - re-run the original search.
+        * ``back`` - return to the search panel from an episode picker.
+        """
+        if not parts:
+            return
+        verb = parts[0]
+        panel = self.latest_panels.get(uid)
+        if verb in ("title", "ep", "go", "all", "refresh", "back") and panel is None:
+            await event.answer("That listing expired. Send /search again.", alert=True)
+            return
+        if verb == "title" and len(parts) == 2:
+            await self._open_title_picker(event, uid, panel, parts[1])
+            return
+        if verb == "back":
+            await event.answer("Back to the list")
+            await self.show_search(uid, panel.peer, event, panel.words, panel.sections)
+            return
+        if verb == "all":
+            keys = await self.dm_titles(panel.peer, uid=uid)
+            batch = ParcivBatch(items=panel.items, check_dm=True,
+                                source_url=self.api_for(uid, "parciv"),
+                                sections=panel.sections)
+            await event.answer(f"Queued {len(panel.items)} title(s)")
+            await self.queue_parciv_job(uid, panel.peer, batch, notice=event,
+                                        note=f"From /search {panel.words}.")
+            return
+        if verb == "refresh":
+            await event.answer("Searching again…")
+            await self.show_search(uid, panel.peer, event, panel.words, panel.sections)
+            return
+        if verb == "ep" and len(parts) == 3:
+            await self._toggle_episode(event, uid, parts[1], parts[2])
+            return
+        if verb == "go":
+            ep_panel = self.episode_panels.get(uid)
+            if ep_panel is None or not ep_panel.selected:
+                await event.answer("Tick the episodes you want first.", alert=True)
+                return
+            selected_items = tuple(item for item in ep_panel.episodes
+                                   if item.subject_id in ep_panel.selected)
+            if not selected_items:
+                await event.answer("Selection expired. Pick episodes again.", alert=True)
+                return
+            batch = ParcivBatch(items=selected_items, check_dm=True,
+                                source_url=self.api_for(uid, "parciv"),
+                                sections=(ep_panel.section,))
+            await event.answer(f"Queued {len(selected_items)} episode(s)")
+            await self.queue_parciv_job(uid, ep_panel.peer, batch, notice=event,
+                                        note=f"From {ep_panel.title}.")
+            return
+        if verb in ("eprev", "enext"):
+            ep_panel = self.episode_panels.get(uid)
+            if ep_panel is None:
+                await event.answer("Episode picker expired.", alert=True)
+                return
+            if verb == "eprev" and ep_panel.page > 0:
+                ep_panel.page -= 1
+            elif verb == "enext":
+                if (ep_panel.page + 1) * 50 < len(ep_panel.episodes):
+                    ep_panel.page += 1
+            await self._render_episode_panel(event, uid)
+            return
+        await event.answer("Unknown action.", alert=True)
+
+    async def _open_title_picker(self, event, uid: int, panel: "LatestPanel",
+                                  subject_id: str) -> None:
+        """A search row was tapped: show its episodes (donghua/anime) or its qualities.
+
+        The catalogue is read once with the search panel's sections to keep the
+        token compatible with what was tapped. The result is one of three:
+
+        * The match is a donghua/anime title with multiple episodes → build an
+          ``EpisodePanel`` and show it.
+        * The match is a single title (movie or one-episode show) → fall through
+          to ``parciv_item_selection`` which shows the quality picker.
+        * The match has no subject id → the same path as the second case.
+        """
+        match = next((item for item in panel.items if item.subject_id == subject_id), None)
+        if match is None:
+            await event.answer("That match expired. Send /search again.", alert=True)
+            return
+        # Movies and TV (Moviebox sections): there is no episode picker. Send the
+        # user straight to the quality picker the same way a /parciv link does.
+        if not match.section or match.section in PARCIV_SECTIONS:
+            item = ParcivItem(subject_id=match.subject_id, name=match.name, section=match.section,
+                              year=match.year, poster=match.poster, episode=match.episode,
+                              langs=match.langs, summary=match.summary,
+                              extra=dict(match.extra))
+            await event.answer(f"Reading {match.title}…")
+            await self.parciv_item_selection(event, uid, panel.peer,
+                                            ParcivApi(self.api_for(uid, "parciv")), item,
+                                            notice=event)
+            return
+        # Donghua / Anime: try to read the per-title episode list.
+        api = ParcivApi(self.api_for(uid, "parciv"))
+        session = self.http_for(uid)
+        await event.answer(f"Reading {match.title}…")
+        try:
+            payload = await fetch_parciv_json(session, api.videos_subject_id(match.section,
+                                                                              subject_id))
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+            await self.safe_edit(event, f"Could not read {match.title} "
+                                        f"({type(exc).__name__}).")
+            return
+        try:
+            media = parse_post(payload, match)
+        except ParcivError as exc:
+            await self.safe_edit(event, f"{match.title}: {exc}")
+            return
+        # ``parse_post`` returned one ``ParcivMedia`` for the matched entry; its
+        # sources come from that single file. The episode picker wants every
+        # episode of the title, so re-read the same answer and pick every entry
+        # that shares this title.
+        entries = list(find_dicts(payload))
+        episode_items: list[ParcivItem] = []
+        for raw in entries:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                item = item_from_dict(raw, match.section, api)
+            except Exception:  # noqa: BLE001 — the reader is best-effort here.
+                continue
+            if item is None:
+                continue
+            if not titles_match(item.name, match.name):
+                continue
+            episode_items.append(item)
+        if not episode_items:
+            # The catalogue returned no episodes (or the answer was a single entry
+            # the reader already collapsed). Fall back to the quality picker.
+            item = ParcivItem(subject_id=match.subject_id, name=match.name,
+                              section=match.section, year=match.year, poster=match.poster,
+                              episode=match.episode, langs=match.langs, summary=match.summary,
+                              extra=dict(match.extra))
+            await self.parciv_item_selection(event, uid, panel.peer, api, item, notice=event)
+            return
+        # Sort episodes by their episode label, so a button list reads in order.
+        episode_items.sort(key=lambda item: (item.episode or "", item.subject_id or ""))
+        token = secrets.token_hex(4)
+        self.auto_tokens[uid] = token
+        self.episode_panels[uid] = EpisodePanel(peer=panel.peer,
+                                                message_id=getattr(event, "message_id", 0)
+                                                            or getattr(event, "id", 0),
+                                                token=token, title=match.title,
+                                                title_id=match.subject_id or "",
+                                                section=match.section,
+                                                episodes=tuple(episode_items),
+                                                parent_token=panel.token)
+        await self._render_episode_panel(event, uid)
+
+    async def _toggle_episode(self, event, uid: int, subject_id: str, ep_id: str) -> None:
+        """Toggle an episode id in the current selection and re-render the panel."""
+        panel = self.episode_panels.get(uid)
+        if panel is None:
+            await event.answer("Episode picker expired. Pick the title again.", alert=True)
+            return
+        # The toggle action uses the title's subject_id (so a series of buttons
+        # can share one picker); ``ep_id`` is the episode's own id.
+        if not panel.title_id or subject_id != panel.title_id:
+            # Defensive: a stray button from another picker.
+            await event.answer("Episode picker expired. Pick the title again.", alert=True)
+            return
+        if ep_id in panel.selected:
+            panel.selected.discard(ep_id)
+            await event.answer("Removed")
+        else:
+            panel.selected.add(ep_id)
+            await event.answer(f"{len(panel.selected)} selected")
+        await self._render_episode_panel(event, uid)
+
+    async def _render_episode_panel(self, event, uid: int) -> None:
+        """Edit ``event`` into the episode picker: the list, the ticks, and the Go button.
+
+        The picker paginates at 50 episodes per page; the page number is held in
+        ``EpisodePanel.page``. Each row is one episode; the bottom row is the
+        "Download selected" / "Back" pair.
+        """
+        panel = self.episode_panels.get(uid)
+        if panel is None:
+            return
+        per_page = 50
+        start = panel.page * per_page
+        page_items = panel.episodes[start:start + per_page]
+        lines = [f"🎬 {panel.title}", "✅ = picked, ▫️ = not picked", ""]
+        for index, item in enumerate(page_items, start + 1):
+            mark = "✅" if item.subject_id in panel.selected else "▫️"
+            ep = item.episode or f"Episode {index}"
+            langs = f" · {', '.join(item.langs)}" if item.langs else ""
+            lines.append(f"{index}. {mark} {ep}{langs}")
+        # Page navigation when the catalogue has more than ``per_page`` entries.
+        if panel.page > 0 or len(panel.episodes) > start + per_page:
+            prev_next = []
+            if panel.page > 0:
+                prev_next.append(Button.inline("◀ Prev",
+                                               data=f"s:{panel.token}:eprev".encode()))
+            if len(panel.episodes) > start + per_page:
+                prev_next.append(Button.inline("Next ▶",
+                                               data=f"s:{panel.token}:enext".encode()))
+            nav_row = prev_next or []
+        else:
+            nav_row = []
+        rows: list[list] = []
+        for index, item in enumerate(page_items, start):
+            mark = "✅" if item.subject_id in panel.selected else "▫️"
+            ep = item.episode or f"Episode {index + 1}"
+            label = f"{mark} {ep[:40]}"
+            rows.append([Button.inline(label,
+                                       data=f"s:{panel.token}:ep:{panel.title_id}:{item.subject_id}".encode())])
+        if nav_row:
+            rows.append(nav_row)
+        rows.append([Button.inline(f"⬇️ Download selected ({len(panel.selected)})",
+                                   data=f"s:{panel.token}:go".encode()),
+                     Button.inline("🔙 Back to search",
+                                   data=f"s:{panel.token}:back".encode())])
+        text = "\n".join(lines)
+        try:
+            await event.edit(text, buttons=rows, parse_mode=None)
+        except (RPCError, ValueError, OSError):
+            pass
 
     async def callback(self, event) -> None:
         uid = event.sender_id
@@ -3034,6 +3319,14 @@ class DownloaderBot:
                 await event.answer("Proxy panel expired. Send /proxy again.", alert=True)
                 return
             await self.proxy_action(event, uid, parts[2])
+            return
+        if parts[0] == "a":
+            if (not event.is_private or len(parts) != 3 or self.auto_tokens.get(uid) != parts[1]
+                    or parts[2] not in ("on", "off", "now", "latest", "go", "all")):
+                await event.answer("These apitera buttons expired. Send /auto or /latest again.",
+                                   alert=True)
+                return
+            await self.auto_action(event, uid, parts[2])
             return
         if parts[0] == "a":
             if (not event.is_private or len(parts) != 3 or self.auto_tokens.get(uid) != parts[1]
@@ -3102,6 +3395,14 @@ class DownloaderBot:
         selection = self.selections.get(uid)
         if (not event.is_private or len(parts) < 3 or not selection or parts[1] != selection.token
                 or time.monotonic() - selection.created > SESSION_SECONDS):
+            # The quality-picker selection expired. The /search panel uses the
+            # same ``s:`` prefix, so check for it before telling the user the
+            # selection is gone.
+            if (len(parts) >= 3 and parts[2] in ("title", "ep", "go", "all",
+                                                  "refresh", "back", "eprev", "enext")
+                    and self.auto_tokens.get(uid) == parts[1]):
+                await self.search_action(event, uid, parts[2:])
+                return
             await event.answer("This selection expired. Send the link again.", alert=True)
             if selection and time.monotonic() - selection.created > SESSION_SECONDS:
                 self.selections.pop(uid, None)
@@ -3577,21 +3878,81 @@ class DownloaderBot:
 
     # ------------------------------------------------------------- apitera
 
-    async def dm_titles(self, peer, limit: int = DM_SCAN_LIMIT) -> set[str]:
-        """The titles this DM already holds, so an automatic run uploads nothing twice."""
+    async def dm_titles(self, peer, limit: int = DM_SCAN_LIMIT,
+                        uid: int | None = None) -> set[str]:
+        """The titles this DM already holds, so an automatic run uploads nothing twice.
+
+        The persistent store is added on top of the live DM scan: a redeploy that
+        happens after a successful upload still recognises the title as already
+        uploaded, so the watcher does not re-upload it. The scan is always run
+        too — a file deleted from the DM should be re-uploaded if it reappears
+        in the catalogue.
+        """
         try:
             messages = [message async for message in self.client.iter_messages(peer, limit=limit)]
         except (RPCError, OSError, ValueError, TypeError) as exc:
             # Without the history the check cannot run; the job still uploads what it found.
             LOG.warning("Could not read the DM history for the apitera check: %s", type(exc).__name__)
-            return set()
-        keys = past_titles(messages)
+            keys = set()
+        else:
+            keys = past_titles(messages)
+        if self.store is not None and uid is not None:
+            stored = self.store.uploaded_keys(uid)
+            if stored:
+                keys |= stored
         LOG.info("apitera: %d title form(s) already in this chat", len(keys))
         return keys
 
     def parciv_busy(self, uid: int) -> bool:
         """True while this user has an apitera batch queued or running."""
         return any(job.user_id == uid and job.parciv for job in self.jobs.values())
+
+    def _save_apitera_settings(self, uid: int) -> None:
+        """Persist this user's apitera settings through the store, when one is wired.
+
+        Called whenever ``/auto``, ``/change``, ``/changeapi`` or the panel buttons
+        change a setting. The store is best-effort: a failed write is logged and
+        the in-memory state is still authoritative for the running session.
+        """
+        if self.store is None or not uid:
+            return
+        overrides = {key: value for key, value in (self.api_overrides.get(uid) or {}).items()
+                     if isinstance(value, str) and value}
+        # The peer is a Telethon InputPeer; not JSON-serialisable, so we keep it
+        # in memory only. The watcher re-resolves it from the user's last message
+        # on the next /auto on if the process restarts.
+        payload = {
+            "auto_enabled": bool(self.auto_enabled.get(uid)),
+            "sections": list(self.auto_sections.get(uid, ())),
+            "limit": int(self.auto_limits.get(uid, self.auto_limit_default)),
+            "interval": int(self.auto_interval),
+            "api_overrides": overrides,
+        }
+        self.store.put_settings(uid, payload)
+
+    def _load_apitera_settings(self) -> None:
+        """Populate the in-memory maps from the store, on startup.
+
+        The watcher is not started here — the user has to send ``/auto on`` (or
+        tap the button) again after a redeploy, because we do not know where to
+        upload until the user tells us. Settings without an enabled watcher are
+        still useful: ``/latest`` and ``/search`` pick up the right sections and
+        API override from the first reply.
+        """
+        if self.store is None:
+            return
+        for uid, payload in self.store.snapshot_user_settings().items():
+            if payload.get("auto_enabled"):
+                self.auto_enabled[uid] = True
+            if payload.get("sections"):
+                self.auto_sections[uid] = tuple(payload["sections"])
+            if payload.get("limit"):
+                self.auto_limits[uid] = int(payload["limit"])
+            if payload.get("interval"):
+                self.auto_interval = float(payload["interval"])
+            if payload.get("api_overrides"):
+                self.api_overrides[uid] = dict(payload["api_overrides"])
+
 
     async def read_catalogue(self, uid: int, api: ParcivApi, sections: tuple[str, ...],
                              limit: int, page: int = 1) -> tuple[list[CataloguePage], list[str]]:
@@ -3661,7 +4022,7 @@ class DownloaderBot:
             raise ParcivError("The apitera batch is missing; send the link again.")
         uid = job.user_id
         api = ParcivApi(parciv_endpoint(job.api_endpoint))
-        dm_keys = await self.dm_titles(job.peer) if batch.check_dm else set()
+        dm_keys = await self.dm_titles(job.peer, uid=uid) if batch.check_dm else set()
         sent = skipped = failed = too_large = 0
         reasons: list[str] = []
         job.item_total = len(batch.items)
@@ -3738,6 +4099,10 @@ class DownloaderBot:
                     sent += 1
                     if batch.check_dm:
                         dm_keys |= title_variants(media.title)
+                    if self.store is not None:
+                        # Persist every title that went out, so the watcher does not
+                        # re-upload the same file after a redeploy.
+                        self.store.mark_uploaded(uid, media.title)
                 except ParcivError as exc:
                     failed += 1
                     reasons.append(f"{media.title} {source.label}: {exc}")
@@ -3880,7 +4245,7 @@ class DownloaderBot:
             reason = "; ".join(problems[:2]) or "no entries"
             result = f"Nothing to upload: {reason}."
         else:
-            keys = await self.dm_titles(peer)
+            keys = await self.dm_titles(peer, uid=uid)
             fresh = new_items(items, keys)
             if not fresh:
                 result = f"Nothing new: all {len(items)} listed title(s) are already in your DM."
@@ -4298,13 +4663,21 @@ async def serve(token: str, api_id: int, api_hash: str) -> None:
     timeout = aiohttp.ClientTimeout(total=240, connect=20)
     connector = aiohttp.TCPConnector(resolver=PublicResolver())
     headers = {"User-Agent": "ytdown-telegram-bot/1.0"}
+    # Persistent state across restarts: the MongoDB store, when ``MONGODB_URL``
+    # is set, remembers which titles each user already has so the watcher does
+    # not re-upload the same file after a redeploy.
+    from .store import Store
+    store = Store()
+    await store.start()
     async with aiohttp.ClientSession(timeout=timeout, connector=connector,
                                      headers=headers) as http:
-        service = DownloaderBot(client, http, timeout=timeout, headers=headers)
+        service = DownloaderBot(client, http, timeout=timeout, headers=headers, store=store)
+        service._load_apitera_settings()
         service.register()
         health = web.Application()
         health.router.add_get("/healthz", lambda request: web.json_response(
-            {"status": "ok" if client.is_connected() else "disconnected"},
+            {"status": "ok" if client.is_connected() else "disconnected",
+             "store": service.store.snapshot() if service.store else {"backend": "none"}},
             status=200 if client.is_connected() else 503))
         runner = web.AppRunner(health)
         await runner.setup()
@@ -4327,6 +4700,7 @@ async def serve(token: str, api_id: int, api_hash: str) -> None:
                                  *(j.task for j in service.jobs.values() if j.task), return_exceptions=True)
             await service.close()
             await client.disconnect()
+            await store.close()
             await runner.cleanup()
 
 
