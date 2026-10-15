@@ -57,8 +57,8 @@ from .parciv import (AUTO_SECTIONS, DM_SCAN_LIMIT, MAX_AUTO_LIMIT, MAX_PARCIV_BY
                      parse_stream, pick_media, search_url_for, title_variants)
 from .apitera import (AUTO_INTERVAL_DEFAULT, AUTO_INTERVAL_MIN, CataloguePage, ParcivBatch,
                       already_uploaded, interval_text, limit_text, listing_lines, new_items,
-                      normalise_sections, parse_interval, parse_limit, parse_search, past_titles,
-                      sections_text, SEARCH_SECTIONS)
+                      describe_payload, normalise_sections, parse_interval, parse_limit,
+                      parse_search, past_titles, sections_text, SEARCH_SECTIONS)
 from .metrics import ContainerMetrics, human_size
 from .media import MediaProbe, thumbnail_jpeg, usable_still
 from .proxy import (CHECK_TARGETS, KNOWN_TARGETS, MAX_PROXIES, MIN_LATENCY_MS, SERVICE_KEYS, TOO_FAST,
@@ -1743,6 +1743,7 @@ class DownloaderBot:
                 "/auto [on|off|now|sections|limit <n>|every <15m>] — automatic apitera uploads\n"
                 "/latest [movies,anime,donghua] [count] [page=2] — browse the catalogue now\n"
                 "/search [movies,anime] <words> — find a title in every apitera catalogue\n"
+                "/debug <apitera URL> — show what that endpoint really answers\n"
                 "/parciv <apitera link or subject id> — read and queue one item\n"
                 "/proxy — proxy mode ON/OFF, pool status, re-check or clear the pool\n"
                 "/limits — size and queue limits\n/help — these instructions\n\n"
@@ -1788,6 +1789,8 @@ class DownloaderBot:
             await self.handle_latest(event, text)
         elif command in ("/search", "/find"):
             await self.handle_search(event, text)
+        elif command in ("/debug", "/apidebug"):
+            await self.handle_debug(event, text)
         elif command == "/parciv":
             await self.handle_parciv(event, text)
         elif command in ("/status", "/queue"):
@@ -2446,6 +2449,33 @@ class DownloaderBot:
             return
         await event.respond("Use /auto, /auto on|off, /auto now, /auto sections movies,anime, "
                             f"/auto limit <1-{MAX_AUTO_LIMIT}>, or /auto every 15m.")
+
+    async def handle_debug(self, event, text: str) -> None:
+        """`/debug <apitera url>` — show the structure one endpoint really answers with."""
+        argument = text.partition(" ")[2].strip()
+        if not argument:
+            await event.respond(
+                "Send /debug <apitera URL> and I will show what that endpoint really "
+                "answers: its keys, the lists it holds and the first two entries.\n"
+                "Useful ones:\n"
+                + "\n".join(f"• https://api.parciv.workers.dev/{family}/latest"
+                             for family in ("moviebox/movies", "anime", "donghua", "iptv")),
+                parse_mode=None)
+            return
+        try:
+            url = parse_parciv_source(argument.split()[0])
+        except ValueError as exc:
+            await event.respond(str(exc))
+            return
+        notice = await event.respond(f"Reading {url} …")
+        try:
+            payload = await fetch_parciv_json(self.http_for(event.sender_id), url)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+            detail = " ".join(str(exc).split()) or type(exc).__name__
+            await self.safe_edit(notice, f"Could not read that URL: {detail[:150]}")
+            return
+        lines = describe_payload(payload, url)
+        await self.safe_edit(notice, "\n".join(lines), parse_mode=None)
 
     async def handle_latest(self, event, text: str) -> None:
         """`/latest [sections] [count] [page=2]` — browse page 1 of the catalogue by hand."""
@@ -3569,9 +3599,11 @@ class DownloaderBot:
                 media = await self.parciv_media(uid, api, item)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
                 failed += 1
-                # Our own readers and the ladder explain themselves; a bare library
-                # name is only for the cases that have nothing to say.
-                detail = str(exc) if str(exc) and len(str(exc)) < 160 else type(exc).__name__
+                # Our own readers and the ladder explain themselves; the reason is
+                # shortened, never replaced by a bare library name.
+                detail = " ".join(str(exc).split()) or type(exc).__name__
+                if len(detail) > 140:
+                    detail = detail[:139].rstrip() + "…"
                 reasons.append(f"{item.title}: {detail}")
                 LOG.warning("apitera lookup failed for %s: %s", item.title, detail)
                 continue
@@ -3656,6 +3688,13 @@ class DownloaderBot:
         if own and media_file_url(own):
             # The listing (or a leech link) handed over the file itself: no lookup.
             return leech_link_media(own, item)
+        inline = item.extra.get("raw")
+        if isinstance(inline, dict):
+            try:
+                # Some listings carry their media list inline (servers/videos/…).
+                return parse_post(inline, item)
+            except (ParcivError, ValueError):
+                pass
         session = self.http_for(uid)
         try:
             if item.section not in PARCIV_STREAM_SECTIONS:

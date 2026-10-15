@@ -348,6 +348,51 @@ class LeechLinkTests(BotCase):
         self.assertIn("🔎 apitera — page 1 of Anime", notice.edit.call_args.args[0])
 
 
+class DebugTests(BotCase):
+    """`/debug <url>`: what an endpoint really answers, so a wrong guess is visible."""
+
+    async def test_a_listing_is_described_with_its_keys_and_samples(self):
+        payload = {"status": "ok", "data": [
+            {"title": "Kuang Wang 2", "slug": "kuang-wang-2", "episode": "Episode 06",
+             "url": "http://santol.whatbox.ca:29318/Donghua/KuangWang2/06-360p.mp4"},
+            {"title": "Dark Machine", "slug": "dark-machine"}]}
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        with patch("ytdown.bot.fetch_parciv_json", new=AsyncMock(return_value=payload)) as fetch:
+            await self.service.handle_debug(
+                self.event("/debug https://api.parciv.workers.dev/donghua/latest", notice=notice),
+                "/debug https://api.parciv.workers.dev/donghua/latest")
+        self.assertEqual(fetch.await_args.args[1], "https://api.parciv.workers.dev/donghua/latest")
+        text = notice.edit.call_args.args[0]
+        self.assertIn("📋 https://api.parciv.workers.dev/donghua/latest", text)
+        self.assertIn("item keys: title, slug, episode, url", text)
+        self.assertIn("url: http://santol.whatbox.ca:29318/Donghua/KuangWang2/06-360p.mp4", text)
+        self.assertIn("item 2:", text)
+        self.assertLess(len(text.splitlines()), 30)
+
+    async def test_without_a_url_it_suggests_the_families(self):
+        event = self.event("/debug")
+        await self.service.handle_debug(event, "/debug")
+        self.assertIn("Send /debug <apitera URL>", event.respond.call_args.args[0])
+        self.assertIn("https://api.parciv.workers.dev/donghua/latest",
+                      event.respond.call_args.args[0])
+
+    async def test_another_site_is_refused(self):
+        event = self.event("/debug https://example.com/x")
+        await self.service.handle_debug(event, "/debug https://example.com/x")
+        self.assertIn("apitera", event.respond.call_args.args[0])
+        self.assertNotIn("https://example.com/x", event.respond.call_args.args[0])
+
+    async def test_an_error_answer_is_shown_as_its_own_message(self):
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        with patch("ytdown.bot.fetch_parciv_json",
+                   new=AsyncMock(side_effect=bot.ApiJsonError(
+                       "answered non-JSON (HTTP 200): <!DOCTYPE html>", "", 0))):
+            await self.service.handle_debug(
+                self.event(notice=notice), "/debug https://api.parciv.workers.dev/anime/latest")
+        self.assertIn("Could not read that URL", notice.edit.call_args.args[0])
+        self.assertIn("HTTP 200", notice.edit.call_args.args[0])
+
+
 class JsonAnswerTests(unittest.IsolatedAsyncioTestCase):
     """An HTML answer from a wrong call shape must be recognisable, not a bare error."""
 
@@ -503,6 +548,20 @@ class RunParcivTests(BotCase):
         self.assertIn("Uploaded 0 file(s) from apitera", summary)
         self.assertIn("1 failed", summary)
         self.assertIn("403", summary)
+
+    async def test_a_failed_lookup_reason_is_shortened_not_replaced_by_a_class_name(self):
+        batch = ParcivBatch(items=(movie_item(),), qualities=("360p",), check_dm=False)
+        job = await self.job(batch)
+        long_reason = "no lookup call for X answered with media (" + "; ".join(
+            f"shape {index}: the API answered without media" for index in range(6)) + ")"
+        with patch("ytdown.bot.fetch_parciv_item", new=AsyncMock(side_effect=lambda s, a, i: i)), \
+                patch("ytdown.bot.fetch_parciv_media",
+                      new=AsyncMock(side_effect=ParcivError(long_reason))):
+            await self.service.run_parciv(job)
+        summary = self.service.progress.call_args.args[1]
+        self.assertIn("no lookup call for X answered with media", summary)
+        self.assertIn("…", summary)
+        self.assertNotIn("ParcivError", summary)
 
     async def test_a_lookup_failure_does_not_stop_the_other_items(self):
         batch = ParcivBatch(items=(movie_item(name="First"), movie_item(name="Second", subject_id="2")),

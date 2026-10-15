@@ -157,8 +157,10 @@ class ParcivApi:
         own = item.extra.get("url", "")
         if own:
             add("api url", f"{base}/post?url={quote(own, safe='')}")
+        if item.subject_id:
+            add("subject id param", f"{base}/post?subjectId={quote(item.subject_id)}")
         add("detail", f"{base}/detail?id={quote(item.subject_id)}")
-        return tuple(candidates)
+        return tuple(candidates[:7])
 
     def post(self, section: str, item: "ParcivItem") -> str:
         """The episode-detail call for one Anime/Donghua entry (the first shape)."""
@@ -324,6 +326,31 @@ def file_title(url: object) -> str:
     folder = parts[-2] if len(parts) > 1 else ""
     text = " ".join(dict.fromkeys(part for part in (folder, stem) if part))
     return (text or stem or "apitera file")[:120]
+
+
+def find_media_url(value: object, depth: int = 0) -> str:
+    """The first media-file URL anywhere in this answer, whatever the key is called.
+
+    These families' listings are not consistent between builds: the file has turned
+    up as ``url``, ``link``, ``play``, inside ``servers`` or inside ``episodes``. So
+    the whole entry is scanned instead of trusting one key name — which is exactly
+    how a leech bot gets to the file.
+    """
+    if depth > 5:  # Deep enough for `episodes[] → servers[] → url`.
+        return ""
+    if isinstance(value, str):
+        return value if media_file_url(value) else ""
+    if isinstance(value, dict):
+        for entry in value.values():
+            found = find_media_url(entry, depth + 1)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for entry in value[:12]:
+            found = find_media_url(entry, depth + 1)
+            if found:
+                return found
+    return ""
 
 
 def leech_link_media(url: str, item: "ParcivItem") -> ParcivMedia:
@@ -866,13 +893,12 @@ def item_from_dict(raw: dict, section: str, api: "ParcivApi | None" = None) -> P
     if not name:
         return None
     slug = _text(first(raw, "slug", "post_slug", "postSlug", "permalink"), 120)
-    subject_id = _text(first(raw, "subjectId", "subject_id", "id", "postId", "animeId", "donghuaId",
-                             "slugId"), 40)
-    if not subject_id:
-        # Anime/Donghua lists often carry only a slug, which their /post call needs.
-        subject_id = slug
-    if not subject_id:
-        return None
+    # The file itself, when this answer hands it over (any key name, a few levels deep).
+    own_media = (media_url(raw, "media", "mediaUrl", "play_url", "playUrl", "video_url",
+                           "videoUrl")
+                 or find_media_url(raw))
+    if own_media and any(host in own_media for host in PARCIV_HOSTS):
+        own_media = ""  # An API link is a lookup call, not the file.
     post_url = url_value(raw, "url", "link", "endpoint", "href")
     if post_url and not post_url.startswith(api.root if api else "https://"):
         post_url = ""
@@ -880,9 +906,18 @@ def item_from_dict(raw: dict, section: str, api: "ParcivApi | None" = None) -> P
         path = _text(first(raw, "path", "endpoint_path", "permalink_path"), 200)
         if path.startswith("/") and api is not None:
             post_url = f"{api.root}{path}"
-        slug = _text(first(raw, "slug", "post_slug", "postSlug"), 120)
         if not post_url and slug and api is not None and section in PARCIV_STREAM_SECTIONS:
             post_url = f"{api.root}/{section}/post?slug={quote(slug)}"
+    subject_id = _text(first(raw, "subjectId", "subject_id", "id", "postId", "animeId", "donghuaId",
+                             "slugId"), 40)
+    if not subject_id:
+        # Anime/Donghua lists often carry only a slug, which their /post call needs.
+        subject_id = slug
+    if not subject_id:
+        # A listing that hands the file (or the API link) over needs no id: it is its key.
+        subject_id = own_media or post_url
+    if not subject_id:
+        return None
     year = _text(first(raw, "year", "release_year", "releaseYear", "released"), 8)
     extra = {key: _text(raw.get(key), 60) for key in
              ("postId", "post_id", "episodeId", "id", "subjectId") if raw.get(key) not in (None, "")}
@@ -890,9 +925,9 @@ def item_from_dict(raw: dict, section: str, api: "ParcivApi | None" = None) -> P
         extra["slug"] = slug  # The /post call of these families often wants the slug.
     if post_url:
         extra["url"] = post_url  # Some builds answer /post?url=<their own link>.
-    own_media = media_url(raw, "media", "mediaUrl", "play_url", "playUrl", "video_url", "videoUrl")
-    if own_media and not any(host in own_media for host in PARCIV_HOSTS):
+    if own_media:
         extra["media_url"] = own_media  # The listing handed the file itself over.
+    extra["raw"] = raw  # Kept whole: many listings carry the media list inline.
     return ParcivItem(
         subject_id=subject_id,
         name=name,

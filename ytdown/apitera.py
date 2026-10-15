@@ -24,7 +24,8 @@ from dataclasses import dataclass, field
 
 from .parciv import (AUTO_SECTIONS, DEFAULT_AUTO_LIMIT, MAX_AUTO_LIMIT, PARCIV_API_URL,
                      PARCIV_SECTIONS, PARCIV_STREAM_SECTIONS, SECTION_LABELS, ParcivError,
-                     ParcivItem, message_titles, parse_sections, titles_match, title_variants)
+                     ParcivItem, find_dicts, message_titles, parse_sections, titles_match,
+                     title_variants, unwrap)
 
 AUTO_INTERVAL_DEFAULT = 900  # Seconds between automatic checks.
 AUTO_INTERVAL_MIN = 60
@@ -141,6 +142,45 @@ def new_items(items: tuple[ParcivItem, ...], keys: set[str]) -> tuple[ParcivItem
     return tuple(item for item in items if not already_uploaded(item.title, keys))
 
 
+def describe_payload(payload: object, url: str = "", status: str = "") -> list[str]:
+    """A short structural summary of one API answer: keys, sizes and sample values.
+
+    This is what `/debug` shows: enough to see how an endpoint names its files and
+    ids, including when a listing carries the media URL itself.
+    """
+    lines = [f"📋 {url}"]
+    if status:
+        lines.append(status)
+    data = unwrap(payload)
+    if isinstance(data, dict):
+        lines.append("top keys: " + ", ".join(list(data)[:12]))
+    inner = data
+    lists: list[tuple[str, list]] = []
+    if isinstance(inner, dict):
+        for key, value in inner.items():
+            if isinstance(value, list) and value:
+                lists.append((key, value))
+    items = find_dicts(data)
+    if lists:
+        for key, value in lists[:4]:
+            lines.append(f"{key}: list of {len(value)}")
+    if not items:
+        lines.append("no list of objects in this answer" if not lists else
+                     "the lists hold no objects")
+        return lines[:14]
+    lines.append("item keys: " + ", ".join(list(items[0])[:14]))
+    for position, raw in enumerate(items[:2], 1):
+        lines.append(f"item {position}:")
+        for key in list(raw)[:9]:
+            value = raw[key]
+            if isinstance(value, (dict, list)):
+                sample = f"<{type(value).__name__} of {len(value)}>"
+            else:
+                sample = " ".join(str(value).split())
+            lines.append(f"  {key}: {sample[:80]}")
+    return lines[:26]
+
+
 def sections_text(sections: tuple[str, ...]) -> str:
     return ", ".join(SECTION_LABELS.get(section, section) for section in sections)
 
@@ -191,6 +231,7 @@ def parse_search(text: str) -> tuple[tuple[str, ...], str]:
 __all__ = [
     "AUTO_INTERVAL_DEFAULT", "AUTO_INTERVAL_MAX", "AUTO_INTERVAL_MIN", "LIST_ITEMS", "PAGE_DEFAULT",
     "CataloguePage", "ParcivBatch", "already_uploaded", "interval_text", "limit_text",
-    "listing_lines", "new_items", "normalise_sections", "parse_interval", "parse_limit",
+    "describe_payload", "listing_lines", "new_items", "normalise_sections", "parse_interval",
+    "parse_limit",
     "parse_search", "past_titles", "sections_text", "DEFAULT_AUTO_LIMIT", "SEARCH_SECTIONS",
 ]

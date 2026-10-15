@@ -555,7 +555,9 @@ class PostLookupTests(unittest.TestCase):
         item = ParcivItem(subject_id="kamen-rider-kiva", name="Kamen Rider Kiva", section="anime",
                           extra={"slug": "kamen-rider-kiva-movie"})
         labels = [label for label, _ in api.post_candidates("anime", item)]
-        self.assertEqual(labels, ["slug", "subject id", "detail"])
+        self.assertEqual(labels, ["slug", "subject id", "subject id param", "detail"])
+        self.assertEqual(api.post_candidates("anime", item)[2][1],
+                         "https://api.parciv.workers.dev/anime/post?subjectId=kamen-rider-kiva")
         self.assertEqual(api.post_candidates("anime", item)[0][1],
                          "https://api.parciv.workers.dev/anime/post?slug=kamen-rider-kiva-movie")
         self.assertEqual(api.post("anime", item), api.post_candidates("anime", item)[0][1])
@@ -617,6 +619,38 @@ class PostLookupTests(unittest.TestCase):
         self.assertEqual(media.langs, ("Japanese",))
         self.assertEqual([(source_.label, source_.url) for source_ in media.sources],
                          [("360p", source)])
+
+    def test_a_listing_that_hands_the_file_over_needs_no_lookup(self):
+        from ytdown.parciv import find_media_url
+        api = ParcivApi(PARCIV_API_URL)
+        raw = {"title": "Kuang Wang 2", "slug": "kuang-wang-2", "year": "2026",
+               "url": "http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/06-360p.mp4"}
+        item = item_from_dict(raw, "donghua", api)
+        self.assertEqual(item.extra["media_url"], raw["url"])
+        self.assertEqual(item.extra["raw"], raw)  # Kept whole for inline media lists.
+        # …and the same file under an unexpected key, a few levels deep.
+        nested = {"name": "Dark Machine", "id": "4455",
+                  "episodes": [{"episode": "01", "servers": [
+                      {"label": "360p", "url": "http://santol.whatbox.ca:29318/Dark/01-360p.mp4"}]}]}
+        self.assertEqual(item_from_dict(nested, "donghua", api).extra["media_url"],
+                         "http://santol.whatbox.ca:29318/Dark/01-360p.mp4")
+        self.assertEqual(find_media_url({"play": {"file": "http://x.example.com/06-480p.mp4"}}),
+                         "http://x.example.com/06-480p.mp4")
+        self.assertEqual(find_media_url({"poster": "https://pbcdnw.aoneroom.com/p.jpg"}), "")
+
+    def test_a_listing_with_only_a_file_link_is_still_one_item(self):
+        api = ParcivApi(PARCIV_API_URL)
+        item = item_from_dict({"name": "Kuang Wang 2", "episode": "06",
+                               "link": "http://santol.whatbox.ca:29318/KuangWang2/06-360p.mp4"},
+                              "donghua", api)
+        self.assertIsNotNone(item)  # No id and no slug: the file link is its key.
+        self.assertEqual(item.subject_id, item.extra["media_url"])
+        self.assertEqual(item.title, "Kuang Wang 2")
+        # An item whose only handle is its API link keeps that link.
+        linked = item_from_dict({"name": "X",
+                                 "url": "https://api.parciv.workers.dev/anime/post?slug=x"},
+                                "anime", api)
+        self.assertTrue(linked.post_url.endswith("/anime/post?slug=x"))
 
     def test_a_json_answer_naming_a_link_is_read(self):
         self.assertEqual(json_media_link({"status": "ok", "url":
