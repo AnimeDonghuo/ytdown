@@ -4,6 +4,7 @@ import json
 import os
 import re
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1334,6 +1335,99 @@ class EpisodePickerTests(BotCase):
                 answer=AsyncMock(), edit=AsyncMock()))
         # The episode picker is empty for movies — the existing quality flow ran.
         self.assertNotIn(7, self.service.episode_panels)
+
+
+class QueueHealthTests(BotCase):
+    """A frozen transfer must free the queue by itself, never jam the bot."""
+
+    def make_job(self, batch, uid=7):
+        job = Job(uid, "peer", 21, Source("parciv", PARCIV_API_URL), ("All",), None, parciv=batch)
+        self.service.jobs[job.token] = job
+        return job
+
+    async def test_a_stalled_job_is_stopped_and_the_queue_keeps_going(self):
+        calls = []
+
+        async def frozen_then_fine(job):
+            calls.append(job)
+            if len(calls) == 1:
+                await asyncio.Event().wait()  # The first transfer never moves a byte.
+
+        self.service.run_parciv = frozen_then_fine
+        self.service.job_stall = 0.3
+        batch = ParcivBatch(items=(movie_item(),), check_dm=False)
+        first = self.make_job(batch)
+        second = self.make_job(batch, uid=8)
+        for job in (first, second):
+            job.task = asyncio.create_task(self.service.run_job(job))
+        with patch.object(bot, "JOB_WATCH_SECONDS", 0.02):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and second.state != "finished":
+                await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)  # Let the background stall notice land.
+        self.assertTrue(first.stalled, "the watchdog must mark the stalled job")
+        self.assertTrue(first.task.done(), "the stalled job's task must unwind")
+        self.assertEqual(second.state, "finished", "the queue must free itself")
+        texts = " ".join(str(call) for call in self.service.progress.await_args_list)
+        self.assertIn("stalled", texts, "the user must be told why the file was not sent")
+
+    async def test_a_frozen_part_upload_fails_fast_and_resets_the_connection(self):
+        class StubClient:
+            def __init__(self):
+                self.attempts = 0
+                self.resets = 0
+
+            async def __call__(self, request):
+                self.attempts += 1
+                await asyncio.Event().wait()  # The Telegram socket stops answering.
+
+            async def disconnect(self):
+                self.resets += 1
+
+        class StubContent:
+            def __init__(self, data):
+                self.data = data
+
+            async def readexactly(self, count):
+                return self.data[:count]
+
+        client = StubClient()
+        data = b"\x00" * bot.PART_BYTES
+        reader = bot.HTTPReader(SimpleNamespace(content=StubContent(data)), len(data), None, None)
+        with patch.object(bot, "PART_UPLOAD_TIMEOUT", 0.1), \
+                patch.object(bot, "PART_RETRY_DELAY", 0.01):
+            with self.assertRaises(ValueError):
+                await bot.upload_parts(client, reader, len(data), "video.mp4", 1,
+                                       on_stall=client.disconnect)
+        self.assertEqual(client.attempts, 3, "every attempt times out, then it fails")
+        self.assertGreaterEqual(client.resets, 1, "the dead connection is reset")
+
+    async def test_a_cancel_landing_as_the_update_finishes_is_not_swallowed(self):
+        # wait_for has a trap: if the task is cancelled after the inner call
+        # finished but before its wakeup ran, the "inner future already done"
+        # branch returns the result and the cancellation is dropped. A job
+        # cancelled at a status update must still unwind. The sleeps below put
+        # the cancel exactly in that window (FIFO call_soon ordering).
+        job = Job(7, "peer", 21, Source("parciv", PARCIV_API_URL), ("All",), None)
+        task = asyncio.create_task(self.service.bounded_progress(job, "hello"))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0.1)
+        self.assertTrue(task.done())
+        self.assertTrue(task.cancelled(), "wait_for must not swallow the cancel")
+
+    def test_the_heartbeat_keeps_a_line_in_the_service_log(self):
+        running = Job(7, "peer", 21, Source("parciv", PARCIV_API_URL), ("All",), None)
+        running.state = "running"
+        self.service.jobs[running.token] = running
+        queued = Job(8, "peer", 22, Source("parciv", PARCIV_API_URL), ("All",), None)
+        self.service.jobs[queued.token] = queued
+        with self.assertLogs("ytdown.bot", level="INFO") as logs:
+            self.service.heartbeat_tick()
+        line = next(l for l in logs.output if "Heartbeat" in l)
+        self.assertIn("running 1", line)
+        self.assertIn("queued 1", line)
 
 
 if __name__ == "__main__":

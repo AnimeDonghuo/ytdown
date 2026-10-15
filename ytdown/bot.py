@@ -107,6 +107,15 @@ PART_BYTES = 512 * 1024
 MAX_PARTS = 4000
 SPOOL_MB = 64  # For rare providers that do not send Content-Length.
 REPORT_SECONDS = 12  # Automatic edits: keep well below Telegram flood limits.
+# Queue health: a transfer whose bytes stop moving is dead, not slow. The
+# watchdog stops it after this long, so one frozen job can never hold the
+# single download slot (and every job behind it) until a service restart.
+JOB_STALL_DEFAULT_MINUTES = 10
+JOB_WATCH_SECONDS = 30  # How often the watchdog measures each job's progress.
+HEARTBEAT_SECONDS = 15 * 60  # A periodic log line proves the service is alive.
+PART_UPLOAD_TIMEOUT = 45.0  # Seconds a Telegram part upload may run before it is dead.
+PART_RETRY_DELAY = 1.0  # Pause after resetting the connection before re-sending a part.
+UNWIND_TIMEOUT = 10.0  # Telegram teardown updates must not hang the job's release.
 # Every inline-button family the bot makes: s selections, j jobs, m modes, d dashboards,
 # p proxy, a apitera. A missing letter here is a button that silently does nothing.
 CALLBACK_PATTERN = rb"^(s|j|m|d|p|a):"
@@ -310,12 +319,14 @@ class Job:
     total_bytes: int = 0
     downloaded: int = 0
     uploaded: int = 0
+    stalled: bool = False  # Set by the watchdog when it stops a dead transfer.
     speed: float = 0.0
     sample_bytes: int = 0
     sample_at: float = field(default_factory=time.monotonic)
     next_edit: float = 0.0
     edit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     reporter: asyncio.Task | None = None
+    watchdog: asyncio.Task | None = None
     rate_limit_until: float = 0.0
     api_endpoint: str = API_URL
     last_manual: float = 0.0
@@ -810,8 +821,14 @@ class HTTPReader:
 
 
 async def upload_parts(client, reader: HTTPReader, size: int, filename: str,
-                       in_flight: int, on_upload=None, on_flood=None):
-    """Pipeline 1–3 MTProto parts, using the correct small/big file protocol."""
+                       in_flight: int, on_upload=None, on_flood=None, on_stall=None):
+    """Pipeline 1–3 MTProto parts, using the correct small/big file protocol.
+
+    ``on_stall`` drops the Telegram connection when a part stops answering:
+    that almost always means the socket was black-holed (a NAT table dropped
+    it without a FIN), and Telethon keeps writing to a dead pipe until it is
+    closed, so the fresh connection the next attempt opens is the fix.
+    """
     file_id = helpers.generate_random_long()
     parts = (size + PART_BYTES - 1) // PART_BYTES
     if parts > MAX_PARTS:
@@ -827,7 +844,10 @@ async def upload_parts(client, reader: HTTPReader, size: int, filename: str,
             try:
                 request = (SaveBigFilePartRequest(file_id, index, parts, data) if is_big else
                            SaveFilePartRequest(file_id, index, data))
-                if not await client(request):
+                # Bounded: a part upload on a black-holed socket must fail in
+                # seconds, not freeze the job (and the whole download queue)
+                # until the service is restarted.
+                if not await asyncio.wait_for(client(request), timeout=PART_UPLOAD_TIMEOUT):
                     raise ValueError(f"Telegram rejected upload part {index}.")
                 confirmed += len(data)
                 if on_upload:
@@ -841,6 +861,16 @@ async def upload_parts(client, reader: HTTPReader, size: int, filename: str,
                 await asyncio.sleep(exc.seconds + 1)
                 if on_flood:
                     on_flood(0)
+            except asyncio.TimeoutError:
+                if attempt == 2:
+                    raise ValueError(f"Telegram stopped answering while uploading part "
+                                     f"{index + 1} of {parts}.") from None
+                if on_stall:
+                    try:
+                        await asyncio.wait_for(on_stall(), timeout=5)
+                    except Exception:
+                        pass
+                await asyncio.sleep(PART_RETRY_DELAY)
 
     try:
         for index in range(parts):
@@ -867,7 +897,8 @@ async def upload_parts(client, reader: HTTPReader, size: int, filename: str,
 async def upload_stream(client: TelegramClient, session: aiohttp.ClientSession, url: str,
                         filename: str, max_bytes: int, *, on_total=None, on_download=None,
                         on_upload=None, on_flood=None, on_data=None, in_flight: int = 2,
-                        expected_size: int = 0, headers: dict | None = None):
+                        expected_size: int = 0, headers: dict | None = None,
+                        on_stall=None):
     """Download from CDN while uploading MTProto parts. Never store a 2 GB file on Koyeb.
 
 Pipelines bounded saveBigFilePart/saveFilePart requests from the HTTP stream,
@@ -897,7 +928,8 @@ Pipelines bounded saveBigFilePart/saveFilePart requests from the HTTP stream,
                     on_total(size)
                 reader = HTTPReader(response, size, on_download, on_data)
                 handle = await upload_parts(client, reader, size, filename,
-                                            max(1, min(3, in_flight)), on_upload, on_flood)
+                                            max(1, min(3, in_flight)), on_upload, on_flood,
+                                            on_stall)
                 if reader.remaining or await response.content.read(1):
                     raise ValueError("The download size did not match Content-Length.")
                 return handle
@@ -966,6 +998,11 @@ class DownloaderBot:
         self.playlist_limit = env_int("MAX_RANGE_VIDEOS", MAX_RANGE_VIDEOS, 1, MAX_RANGE_VIDEOS)
         self.in_flight = env_int("UPLOAD_IN_FLIGHT", 2, 1, 3)
         self.metrics = ContainerMetrics()
+        # A job whose bytes stop moving for this long is stopped: a live
+        # transfer always moves download or upload bytes, so a frozen one is
+        # dead and must not hold the slot (and the queue) until a restart.
+        self.job_stall = float(env_int("JOB_STALL_MINUTES", JOB_STALL_DEFAULT_MINUTES,
+                                       1, 24 * 60)) * 60
         # Proxy pools are per user: each user brings (and checks) their own list.
         self.pools: dict[int, ProxyPool] = {}
         self.routers: dict[int, ProxyRouter] = {}
@@ -3562,6 +3599,115 @@ class DownloaderBot:
                     return
                 await self.turn.wait()
 
+    async def reset_connection(self) -> None:
+        """Drop the MTProto connection so the next request opens a fresh one.
+
+        A part upload that stops answering usually means the socket was
+        black-holed (a NAT table dropped it without a FIN); Telethon keeps
+        talking to the dead pipe until it is closed.
+        """
+        try:
+            await self.client.disconnect()
+        except Exception:
+            LOG.warning("Could not reset the Telegram connection", exc_info=True)
+
+    async def bounded_progress(self, job: Job, text: str,
+                               timeout: float = UNWIND_TIMEOUT) -> None:
+        """A status update that cannot hang the job's release.
+
+        Teardown happens while the job's task is unwinding, and Telegram itself
+        may be the thing that is stuck: an unbounded edit here would keep the
+        download slot held for as long as the connection stays dead.
+
+        ``wait_for`` has a trap: if this task is cancelled at the same instant
+        the inner call finishes, its "inner future already done" branch returns
+        the result and the cancellation is silently dropped — the job would
+        keep running where it must unwind. The pending-cancellation count is
+        checked afterwards so a swallowed cancel is re-raised.
+        """
+        task = asyncio.current_task()
+        requested = task.cancelling() if task is not None else 0
+        try:
+            await asyncio.wait_for(self.progress(job, text, force=True), timeout=timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.warning("Status update for job %s was not delivered", job.token)
+        finally:
+            if task is not None and task.cancelling() > requested:
+                raise asyncio.CancelledError
+
+    async def stall_notice(self, job: Job, text: str) -> None:
+        """Tell the user a transfer was stopped — itself bounded and
+        cancel-safe, for the same reasons as :meth:`bounded_progress`."""
+        task = asyncio.current_task()
+        requested = task.cancelling() if task is not None else 0
+        try:
+            await asyncio.wait_for(self.progress(job, text, force=True), timeout=UNWIND_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.warning("Stall notice for job %s was not delivered", job.token)
+        finally:
+            if task is not None and task.cancelling() > requested:
+                raise asyncio.CancelledError
+
+    async def job_watchdog(self, job: Job) -> None:
+        """Stop a job whose bytes stop moving, so one dead transfer cannot hold
+        the download slot — and every job behind it — until a service restart.
+
+        A black-holed CDN socket (or a dead Telegram connection) raises no
+        error: the transfer just stops moving. Byte movement is the only
+        reliable sign of life, so this watchdog measures it and cancels the
+        job's task; the job's own unwind (stop events, finally block,
+        archive) then frees the slot and the queue, and the user reads why
+        the file was not sent.
+        """
+        activity = job.downloaded + job.uploaded
+        moved = time.monotonic()
+        while True:
+            await asyncio.sleep(JOB_WATCH_SECONDS)
+            if job.state != "running":
+                # The stall clock only runs while the job holds the slot: a
+                # job waiting behind a long transfer is queued, not stalled.
+                activity = job.downloaded + job.uploaded
+                moved = time.monotonic()
+                continue
+            now = time.monotonic()
+            current = job.downloaded + job.uploaded
+            if current != activity:
+                activity, moved = current, now
+                continue
+            if now - moved < self.job_stall:
+                continue
+            job.stalled = True
+            LOG.error("Job %s (user %s, item %d/%d, %s %s) made no progress for "
+                      "%d minute(s); stopping it so the queue can continue",
+                      job.token, job.user_id, job.item_index, job.item_total,
+                      (job.title[:48] or "?"), job.quality or "-",
+                      int(self.job_stall // 60))
+            if job.task is not None and not job.task.done():
+                job.task.cancel()
+            return
+
+    def heartbeat_tick(self) -> None:
+        """One heartbeat line; the loop in :meth:`heartbeat` sleeps between ticks."""
+        running = sum(1 for job in self.jobs.values() if job.state == "running")
+        queued = sum(1 for job in self.jobs.values() if job.state == "queued")
+        LOG.info("Heartbeat: %d job(s) (running %d, queued %d) · %s",
+                 len(self.jobs), running, queued, self.metrics.describe())
+
+    async def heartbeat(self) -> None:
+        """Keep a periodic line in the service log so a frozen bot is obvious.
+
+        The download pipeline used to fail silently — a job frozen with no
+        error, no log and no reply until the service was restarted. A missing
+        heartbeat is now the first sign that something is stuck.
+        """
+        while True:
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+            self.heartbeat_tick()
+
     async def fresh_terabox_file(self, job: Job, item: TeraboxFile) -> TeraboxFile:
         listing = job.listing
         if listing and listing.expires_at and listing.expires_at <= time.time() + 120:
@@ -3589,22 +3735,30 @@ class DownloaderBot:
         sent = missing = too_large = unknown_size = failed = 0
         skip_reasons: list[str] = []  # Shown in the final summary, not only in the logs.
         job.reporter = asyncio.create_task(self.report_loop(job))
+        job.watchdog = asyncio.create_task(self.job_watchdog(job))
         try:
-            await self.progress(job, f"Queued: {', '.join(job.selected)}. Use /status or /cancel.", force=True)
+            # Bounded: a stuck Telegram connection must not freeze the job here,
+            # before it has even taken the slot.
+            await self.bounded_progress(
+                job, f"Queued: {', '.join(job.selected)}. Use /status or /cancel.")
             await self.wait_turn(job)
             async with self.slot:
                 await self.progress(job, "Starting…")
                 if job.source.kind == "dailymotion":
                     await self.run_dailymotion(job)
+                    job.state = "finished"
                     return
                 if job.parciv:
                     await self.run_parciv(job)
+                    job.state = "finished"
                     return
                 if job.source.kind == "social":
                     await self.run_social(job)
+                    job.state = "finished"
                     return
                 if job.source.kind == "mega":
                     await self.run_mega(job)
+                    job.state = "finished"
                     return
                 if job.source.kind == "playlist":
                     await self.progress(job, f"Reading playlist entries {job.start}-{job.end}…")
@@ -3729,25 +3883,44 @@ class DownloaderBot:
                             break
                 job.state = "finished"
                 detail = f" ({'; '.join(skip_reasons[:6])})" if skip_reasons else ""
-                await self.progress(job, f"Finished. Sent {sent}; unavailable {missing}; over size limit {too_large}; "
-                                         f"missing size header (>64 MiB) {unknown_size}; failed {failed}{detail}.",
-                                    force=True)
+                await self.bounded_progress(
+                    job, f"Finished. Sent {sent}; unavailable {missing}; over size limit "
+                         f"{too_large}; missing size header (>64 MiB) {unknown_size}; "
+                         f"failed {failed}{detail}.")
         except asyncio.CancelledError:
             job.state = "finished"
             job.rate_limit_until = 0
-            await self.progress(job, "Cancelled. Already uploaded files remain in the chat.", force=True)
+            if job.stalled:
+                # A separate, bounded task: the stall may be inside Telethon
+                # itself, and the slot must be released no matter what.
+                minutes = max(1, int(self.job_stall // 60))
+                asyncio.create_task(self.stall_notice(
+                    job, f"This transfer stalled (no progress for {minutes} minute(s)) and "
+                         "was stopped to keep the queue moving. Please send the link again."))
+            else:
+                await self.bounded_progress(
+                    job, "Cancelled. Already uploaded files remain in the chat.")
         except (ValueError, asyncio.TimeoutError) as exc:
             job.state = "finished"
-            await self.progress(job, f"Could not load the selected entries: {exc}", force=True)
+            await self.bounded_progress(job, f"Could not load the selected entries: {exc}")
         except Exception:
             job.state = "finished"
             LOG.exception("Unexpected job failure")
-            await self.progress(job, "Job failed unexpectedly. Please try again later.", force=True)
+            await self.bounded_progress(job, "Job failed unexpectedly. Please try again later.")
         finally:
+            if job.watchdog:
+                job.watchdog.cancel()
+                await asyncio.gather(job.watchdog, return_exceptions=True)
             if job.reporter:
                 job.reporter.cancel()
                 await asyncio.gather(job.reporter, return_exceptions=True)
-            await self.archive_job(job)
+            try:
+                await asyncio.wait_for(self.archive_job(job), timeout=UNWIND_TIMEOUT)
+            except asyncio.TimeoutError:
+                LOG.error("Job %s teardown timed out waiting on Telegram; the queue "
+                          "continues anyway", job.token)
+            except Exception:
+                LOG.warning("Could not archive job %s", job.token, exc_info=True)
 
     async def run_mega(self, job: Job) -> None:
         """One MEGA file or a folder range: stream each file straight to Telegram.
@@ -3907,7 +4080,7 @@ class DownloaderBot:
                                        on_total=on_total, on_download=on_download,
                                        on_upload=on_upload, on_flood=on_flood,
                                        on_data=probe.add, in_flight=self.in_flight,
-                                       headers=headers)
+                                       headers=headers, on_stall=self.reset_connection)
         info = await probe.inspect()
         if media.thumbnail:
             cover = await thumbnail_jpeg(session, media.thumbnail)
@@ -4638,7 +4811,8 @@ class DownloaderBot:
                                            on_upload=on_upload, on_flood=on_flood,
                                            on_data=probe.add if probe else None,
                                            in_flight=self.in_flight,
-                                           expected_size=source_file.size if source_file else 0)
+                                           expected_size=source_file.size if source_file else 0,
+                                           on_stall=self.reset_connection)
         except BaseException:
             if thumb_task:
                 thumb_task.cancel()
@@ -4778,16 +4952,19 @@ async def serve(token: str, api_id: int, api_hash: str) -> None:
                 loop.add_signal_handler(name, stop.set)
             except NotImplementedError:
                 pass
+        heartbeat_task = asyncio.create_task(service.heartbeat())
         try:
             await client.start(bot_token=token)
             await start_health(runner, env_int("PORT", 8000, 1, 65535))
             LOG.info("MTProto bot connected")
             await stop.wait()
         finally:
+            heartbeat_task.cancel()
             for task in list(service.lookups.values()) + [j.task for j in service.jobs.values() if j.task]:
                 task.cancel()
-            await asyncio.gather(*list(service.lookups.values()),
-                                 *(j.task for j in service.jobs.values() if j.task), return_exceptions=True)
+            await asyncio.gather(heartbeat_task, *list(service.lookups.values()),
+                                 *(j.task for j in service.jobs.values() if j.task),
+                                 return_exceptions=True)
             await service.close()
             await client.disconnect()
             await store.close()
