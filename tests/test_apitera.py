@@ -1,12 +1,14 @@
 """apitera in the bot: /latest, /search, /auto, /parciv and the upload runner."""
 import asyncio
 import os
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 
+import ytdown.bot as bot
 from ytdown.apitera import SEARCH_SECTIONS, CataloguePage, ParcivBatch, parse_search
 from ytdown.bot import (DEFAULT_APIS, DownloaderBot, Job, MODE_LABELS, is_media_link,
                         normalize_api_endpoint)
@@ -606,6 +608,136 @@ class SearchTests(BotCase):
         batch = self.service.queue_parciv_job.call_args.args[2]
         self.assertEqual(len(batch.items), 3)
         self.assertEqual(batch.sections, ("movies", "anime"))
+
+
+class ButtonTests(BotCase):
+    """Every inline button the bot makes has to reach its callback handler."""
+
+    def test_the_callback_filter_covers_every_button_family(self):
+        source = open(os.path.join(os.path.dirname(bot.__file__), "bot.py")).read()
+        families = set(re.findall(r'data=f"([a-z]+):', source))
+        families |= set(re.findall(r'data=\"([a-z]+):', source))
+        self.assertTrue(families)
+        pattern = bot.CALLBACK_PATTERN.decode()
+        for family in sorted(families):
+            self.assertIn(family, pattern, f"{family}: buttons would be ignored by the filter")
+        # The filter is only useful if register() really installs it.
+        self.assertIn("events.CallbackQuery(pattern=CALLBACK_PATTERN)", source)
+
+    async def test_the_apitera_buttons_are_dispatched(self):
+        self.service.auto_tokens[7] = "tok"
+        click = SimpleNamespace(sender_id=7, data=b"a:tok:now", is_private=True, message_id=21,
+                                answer=AsyncMock(), edit=AsyncMock(),
+                                get_input_chat=AsyncMock(return_value="peer"))
+        self.service.auto_peers[7] = "peer"
+        self.service.run_auto_check = AsyncMock(return_value="Nothing new: 0 listed title(s).")
+        await self.service.callback(click)
+        self.assertTrue(click.answer.await_count)
+
+    async def test_a_button_opens_the_status_in_the_message_it_sits_on(self):
+        batch = ParcivBatch(items=(movie_item(),), check_dm=False)
+        click = SimpleNamespace(sender_id=7, id=987654, message_id=21, peer="peer",
+                                answer=AsyncMock(), edit=AsyncMock())
+        job = await self.service.queue_parciv_job(7, "peer", batch, notice=click)
+        self.assertEqual(job.message_id, 21)   # Not the callback's query id.
+        self.service.jobs.pop(job.token, None)
+        job.task.cancel()
+        await asyncio.gather(job.task, return_exceptions=True)
+
+
+class AutoStatusTests(BotCase):
+    """The automatic check shows the normal download status, and one thing at a time."""
+
+    async def test_the_watcher_message_becomes_the_download_status(self):
+        sent = SimpleNamespace(id=77, edit=AsyncMock(), delete=AsyncMock())
+        self.client.send_message = AsyncMock(return_value=sent)
+        self.service.auto_peers[7] = "peer"
+        self.service.auto_sections[7] = ("movies",)
+        with patch("ytdown.bot.fetch_parciv_catalogue",
+                   new=AsyncMock(return_value=CataloguePage("movies", 1,
+                                                            parse_catalogue(MOVIES, "movies")))), \
+                patch("ytdown.bot.fetch_parciv_media",
+                      new=AsyncMock(side_effect=ParcivError("no stream in this test"))), \
+                patch("ytdown.bot.fetch_parciv_item", new=AsyncMock(side_effect=lambda s, a, i: i)):
+            result = await self.service.run_auto_check(7, note="Automatic check.", announce=True)
+            self.assertIn("Queued 3 new title(s)", result)
+            self.assertEqual(self.client.send_message.await_args.args[1],
+                             "🔎 Automatic apitera check: reading Moviebox movies…")
+            job = next(iter(self.service.jobs.values()))
+            self.assertEqual(job.message_id, 77)  # The check's message is the job's status.
+            await asyncio.gather(job.task, return_exceptions=True)
+        # The status card was rendered into that very message.
+        texts = [call.args[2] for call in self.client.edit_message.await_args_list]
+        self.assertTrue(any(text.startswith("🎬") for text in texts), texts)
+        sent.delete.assert_not_awaited()
+
+    async def test_a_check_with_nothing_to_do_removes_its_message(self):
+        sent = SimpleNamespace(id=77, edit=AsyncMock(), delete=AsyncMock())
+        self.client.send_message = AsyncMock(return_value=sent)
+        self.service.auto_peers[7] = "peer"
+        self.service.auto_sections[7] = ("movies",)
+        with patch("ytdown.bot.fetch_parciv_catalogue",
+                   new=AsyncMock(return_value=CataloguePage("movies", 1, parse_catalogue(MOVIES,
+                                                                                        "movies")))):
+            result = await self.service.run_auto_check(7, note="Automatic check.", announce=True)
+        self.assertIn("Queued", result)
+        self.service.jobs.clear()
+
+    async def test_the_first_automatic_check_runs_straight_away(self):
+        self.service.auto_interval = 3600
+        self.service.auto_enabled[7] = True
+        self.service.auto_peers[7] = "peer"
+        self.service.run_auto_check = AsyncMock(return_value="nothing")
+        task = asyncio.create_task(self.service.auto_watch(7))
+        await asyncio.sleep(0.05)
+        self.assertGreaterEqual(self.service.run_auto_check.await_count, 1)
+        self.assertTrue(self.service.run_auto_check.await_args.kwargs["announce"])
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        self.service.auto_enabled[7] = False
+
+    async def test_two_batches_never_download_at_the_same_time(self):
+        order = []
+
+        def fake_download(url, out_dir, on_bytes, stop, **kwargs):
+            order.append(("start", url))
+            path = os.path.join(out_dir, "stream.mp4")
+            with open(path, "wb") as handle:
+                handle.write(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * (2 * 1024 * 1024))
+            order.append(("end", url))
+            return path
+
+        async def slow_media(session, api, item):
+            order.append(("lookup", item.title))
+            return movie_media()
+
+        chunks = (ParcivBatch(items=(movie_item(name="One", subject_id="1"),), check_dm=False,
+                              qualities=("360p",)),
+                  ParcivBatch(items=(movie_item(name="Two", subject_id="2"),), check_dm=False,
+                              qualities=("360p",)))
+        with patch("ytdown.bot.fetch_parciv_media", new=slow_media), \
+                patch("ytdown.bot.fetch_parciv_item", new=AsyncMock(side_effect=lambda s, a, i: i)), \
+                patch("ytdown.bot.download_parciv", new=fake_download), \
+                patch("ytdown.bot.thumbnail_jpeg", new=AsyncMock(return_value=None)):
+            jobs = [await self.service.queue_parciv_job(7, "peer", batch) for batch in chunks]
+            await asyncio.gather(*(job.task for job in jobs), return_exceptions=True)
+        self.assertEqual(order[0][0], "lookup")
+        self.assertIn("One", order[0][1])
+        # Every step of the first batch happens before any step of the second.
+        first = max(position for position, (_, name) in enumerate(order) if "One" in name)
+        second = min(position for position, (_, name) in enumerate(order) if "Two" in name)
+        self.assertLess(first, second)
+        self.assertEqual([kind for kind, _ in order].count("lookup"), 2)
+
+    async def test_a_watcher_check_while_a_batch_runs_queues_nothing(self):
+        job = Job(7, "peer", 21, Source("parciv", PARCIV_API_URL), ("All",), None,
+                  parciv=ParcivBatch(items=(movie_item(),)))
+        self.service.jobs[job.token] = job
+        self.service.auto_peers[7] = "peer"
+        self.client.send_message = AsyncMock()
+        result = await self.service.run_auto_check(7, note="Automatic check.", announce=True)
+        self.assertIn("already queued or running", result)
+        self.client.send_message.assert_not_awaited()
 
 
 if __name__ == "__main__":

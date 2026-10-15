@@ -41,8 +41,9 @@ from .dailymotion import (DAILYMOTION_API_URL, MAX_API_BYTES, MAX_MANIFEST_BYTES
                           proxy_manifest, read_bounded)
 from .rumble import (RUMBLE_API_URL, RumbleError, extract_rumble, normalize_rumble,
                      parse_rumble_source)
-from .mega import (MAX_MEGA_LINKS, MEGA_API_URL, MEGA_HOSTS, MegaError, MegaFile, MegaListing,
-                   find_mega_links, mega_source, merge_listings, normalize_mega, parse_mega_source,
+from .mega import (MAX_MEGA_LINKS, MEGA_API_URL, MEGA_HOSTS, MEGA_RETRY_DELAYS, MegaError, MegaFile,
+                   MegaListing, find_mega_links, mega_source, merge_listings, normalize_mega,
+                   parse_mega_source,
                    video_choice)
 from .social import (MAX_SOCIAL_LINKS, SOCIAL_API_URL, SOCIAL_HOSTS, SocialBatch, SocialChoice,
                      SocialDownload, SocialError, SocialMedia, find_social_links, normalize_social,
@@ -91,11 +92,16 @@ SESSION_SECONDS = 1800
 # 2,047 MiB would need 4,094 parts and can fail near the end of an upload.
 # The Instagram/Facebook API scrapes the platform and routinely answers late.
 SOCIAL_TIMEOUT = aiohttp.ClientTimeout(total=300, connect=30, sock_read=180)
+# The MEGA API is slow to wake, so each of its attempts gets room to finish.
+MEGA_TIMEOUT = aiohttp.ClientTimeout(total=180, connect=30)
 MAX_MT_MB = 2000
 PART_BYTES = 512 * 1024
 MAX_PARTS = 4000
 SPOOL_MB = 64  # For rare providers that do not send Content-Length.
 REPORT_SECONDS = 12  # Automatic edits: keep well below Telegram flood limits.
+# Every inline-button family the bot makes: s selections, j jobs, m modes, d dashboards,
+# p proxy, a apitera. A missing letter here is a button that silently does nothing.
+CALLBACK_PATTERN = rb"^(s|j|m|d|p|a):"
 MANUAL_REFRESH_SECONDS = 2
 MAX_RANGE_VIDEOS = 150
 MAX_DISCOVER = 5000
@@ -448,10 +454,37 @@ async def fetch_terabox(session: aiohttp.ClientSession, url: str,
     return normalize_terabox(await fetch_json_api(session, endpoint, url, 4_000_000))
 
 
-async def fetch_mega(session: aiohttp.ClientSession, url: str,
-                     endpoint: str = MEGA_API_URL) -> MegaListing:
-    """A MEGA file or folder link: the API returns the whole folder tree."""
-    return normalize_mega(await fetch_json_api(session, endpoint, url, 8_000_000))
+async def fetch_mega(session: aiohttp.ClientSession, url: str, endpoint: str = MEGA_API_URL,
+                     on_wait=None) -> MegaListing:
+    """A MEGA file or folder link: the API returns the whole folder tree.
+
+    The API is a free host that sleeps when idle: the first call after a quiet
+    spell can take a long time, time out or answer 502 while the service wakes
+    up. Those transient failures are retried with growing waits instead of being
+    handed to the user at once, and ``on_wait(attempt, delay, attempts)`` (an
+    optional async callable) reports each wait so the bot can say so.
+    """
+    attempts = len(MEGA_RETRY_DELAYS) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            payload = await fetch_json_api(session, endpoint, url, 8_000_000,
+                                           timeout=MEGA_TIMEOUT)
+            return normalize_mega(payload)
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError, MegaError) as exc:
+            if attempt == attempts:
+                raise
+            delay = MEGA_RETRY_DELAYS[attempt - 1]
+            LOG.info("MEGA API attempt %d of %d failed (%s); retrying in %ss",
+                     attempt, attempts, type(exc).__name__, delay)
+            if on_wait is not None:
+                await on_wait(attempt, delay, attempts)
+            await asyncio.sleep(delay)
+
+
+def mega_wait_text(attempt: int, delay: int, attempts: int) -> str:
+    """What the user reads while the MEGA API is not answering yet."""
+    return (f"⏳ The MEGA API is not answering yet (try {attempt} of {attempts}). It sleeps when "
+            f"idle and can take a minute to wake — waiting {delay}s and asking again…")
 
 
 async def fetch_parciv_json(session: aiohttp.ClientSession, url: str,
@@ -1413,7 +1446,7 @@ class DownloaderBot:
 
     def register(self) -> None:
         self.client.add_event_handler(self.on_message, events.NewMessage(incoming=True))
-        self.client.add_event_handler(self.callback, events.CallbackQuery(pattern=rb"^(s|j|m|d|p):"))
+        self.client.add_event_handler(self.callback, events.CallbackQuery(pattern=CALLBACK_PATTERN))
 
     def job_buttons(self, job: Job):
         if job.state == "finished":
@@ -1439,7 +1472,8 @@ class DownloaderBot:
         title = clean[:95] or ("Playlist" if job.source.kind == "playlist" else
                                "Terabox files" if job.source.kind.startswith("terabox") else
                                "Dailymotion video" if job.source.kind == "dailymotion" else
-                               "Rumble video" if job.source.kind == "rumble" else "YouTube video")
+                               "Rumble video" if job.source.kind == "rumble" else
+                               "apitera batch" if job.source.kind == "parciv" else "YouTube video")
         quality = (f" [{'MP3' if youtube and job.quality == AUDIO else job.quality}]" if job.quality else "") + (
             f" {tag}" if tag else "")
         status = (f"Telegram rate limit: waiting {human_eta(job.rate_limit_until - now)}"
@@ -1872,16 +1906,24 @@ class DownloaderBot:
         found = {video_choice(file) for file in files}
         return tuple(kind for kind in order if kind in found)
 
-    async def read_mega_links(self, uid: int, links: tuple[str, ...], endpoint: str
-                              ) -> tuple[MegaListing, list[str]]:
+    def mega_waiter(self, notice):
+        """A callback that keeps the user informed while the MEGA API wakes up."""
+        async def waited(attempt: int, delay: int, attempts: int) -> None:
+            await self.safe_edit(notice, mega_wait_text(attempt, delay, attempts))
+
+        return waited
+
+    async def read_mega_links(self, uid: int, links: tuple[str, ...], endpoint: str,
+                              on_wait=None) -> tuple[MegaListing, list[str]]:
         """Read several MEGA links at once and merge them into one listing.
 
         One link the API cannot read never sinks the batch: the other links are
         still listed, and the prompt names the ones that were skipped.
         """
         session = self.http_for(uid)
-        results = await asyncio.gather(*(fetch_mega(session, link, endpoint) for link in links),
-                                       return_exceptions=True)
+        results = await asyncio.gather(
+            *(fetch_mega(session, link, endpoint, on_wait=on_wait) for link in links),
+            return_exceptions=True)
         listings: list[MegaListing] = []
         labels: list[str] = []
         broken: list[str] = []
@@ -2138,10 +2180,12 @@ class DownloaderBot:
                 endpoint = self.api_for(uid, "mega")
                 if len(links) > 1:
                     notice = await event.respond(f"Reading {len(links)} MEGA links through the API…")
-                    listing, broken = await self.read_mega_links(uid, links, endpoint)
+                    listing, broken = await self.read_mega_links(uid, links, endpoint,
+                                                                 on_wait=self.mega_waiter(notice))
                 else:
                     notice = await event.respond("Reading this MEGA link through the API…")
-                    listing, broken = await fetch_mega(self.http_for(uid), source.url, endpoint), []
+                    listing, broken = await fetch_mega(self.http_for(uid), source.url, endpoint,
+                                                       on_wait=self.mega_waiter(notice)), []
                 if self.modes.get(uid, "youtube") != mode:
                     await notice.edit("Mode changed. Send your link again.")
                     return
@@ -3381,7 +3425,9 @@ class DownloaderBot:
                 await self.client.send_message(peer, text)
             return None
         if notice is not None:
-            message_id = getattr(notice, "id", 0)
+            # A Message carries `.id`; a button click carries the message it came
+            # from in `.message_id` (its own `.id` is the query id, not a message).
+            message_id = getattr(notice, "message_id", 0) or getattr(notice, "id", 0)
         else:
             sent = await self.client.send_message(peer, f"🤖 apitera: {batch.plan_line()}")
             message_id = sent.id
@@ -3552,8 +3598,15 @@ class DownloaderBot:
                  job.total_bytes, "yes" if thumb else "no")
         return message
 
-    async def run_auto_check(self, uid: int, *, notice=None, note: str = "") -> str:
-        """Read the catalogue and queue one batch for the titles the DM does not hold."""
+    async def run_auto_check(self, uid: int, *, notice=None, note: str = "",
+                             announce: bool = False) -> str:
+        """Read the catalogue and queue one batch for the titles the DM does not hold.
+
+        With `announce` (the watcher) the check opens one message of its own: when
+        a batch is queued that message becomes the batch's usual download status
+        ("🎬 title, Video 1/3, progress…"), and when there is nothing to do it is
+        removed again, so a check every 15 minutes leaves no clutter.
+        """
         if self.parciv_busy(uid):
             return "An apitera batch is already queued or running. /cancel stops it."
         peer = self.auto_peers.get(uid)
@@ -3561,6 +3614,9 @@ class DownloaderBot:
             return "Send /auto on first, so the bot knows where to upload."
         sections = normalise_sections(self.auto_sections.get(uid, ()))
         limit = self.auto_limits.get(uid, self.auto_limit_default)
+        if announce and notice is None:
+            notice = await self.client.send_message(
+                peer, f"🔎 Automatic apitera check: reading {sections_text(sections)}…")
         api = ParcivApi(self.api_for(uid, "parciv"))
         pages, problems = await self.read_catalogue(uid, api, sections, limit)
         items = tuple(item for page in pages for item in page.items)
@@ -3580,21 +3636,34 @@ class DownloaderBot:
                           f"({len(items) - len(fresh)} already in your DM).") if job else (
                     "The queue is full; the next automatic check will retry.")
         if notice is not None and "Queued" not in result:
-            await self.safe_edit(notice, result)
+            if announce and result.startswith("Nothing"):
+                await self.drop_notice(notice)  # A clean chat beats a "nothing" every 15 minutes.
+            else:
+                await self.safe_edit(notice, result)
         return result
+
+    async def drop_notice(self, notice) -> None:
+        """Remove one of the bot's own messages; failing to is harmless."""
+        try:
+            await notice.delete()
+        except (RPCError, AttributeError, TypeError, ValueError) as exc:
+            LOG.info("Could not remove an apitera notice: %s", type(exc).__name__)
 
     async def auto_watch(self, uid: int) -> None:
         """The watcher behind `/auto on`: check, upload what is missing, wait, repeat."""
         LOG.info("apitera auto watch started for user %s (every %s)", uid,
                  interval_text(int(self.auto_interval)))
+        first = True  # The first check runs straight away; /auto on should do something.
         while True:
-            await asyncio.sleep(self.auto_interval)
+            if not first:
+                await asyncio.sleep(self.auto_interval)
+            first = False
             if not self.auto_enabled.get(uid) or uid in self.auto_running:
                 continue
             self.auto_running.add(uid)
             try:
                 self.auto_last[uid] = time.monotonic()
-                message = await self.run_auto_check(uid, note="Automatic check.")
+                message = await self.run_auto_check(uid, note="Automatic check.", announce=True)
                 LOG.info("apitera automatic check for user %s: %s", uid, message)
             except asyncio.CancelledError:
                 raise

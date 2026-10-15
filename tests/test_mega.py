@@ -1,9 +1,13 @@
 """MEGA links: the API's folder listing, the range flow, and the download path."""
 import asyncio
+import json
 import unittest
+
+import aiohttp
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import ytdown.bot as bot
 from ytdown.bot import DownloaderBot, Job, MODE_LABELS, is_media_link, normalize_api_endpoint
 from ytdown.core import Source
 from ytdown.mega import (MAX_MEGA_LINKS, MEGA_API_URL, MegaError, MegaFile, MegaListing, find_mega_links,
@@ -425,6 +429,65 @@ class MegaFlowTests(unittest.IsolatedAsyncioTestCase):
         from ytdown.bot import normalize_api_endpoint
         with self.assertRaisesRegex(ValueError, "not a MEGA file"):
             normalize_api_endpoint(FOLDER_URL)
+
+
+class MegaPatienceTests(unittest.IsolatedAsyncioTestCase):
+    """The MEGA API sleeps when idle: the bot waits and says so instead of failing."""
+
+    async def test_a_sleeping_api_is_retried_and_reported(self):
+        waits = []
+        payload = {"success": True, "files": [
+            {"file_id": "AAA11111", "name": "Woke up clip.mp4", "size_bytes": 4096,
+             "download_url": "https://samra-mega-api.onrender.com/api/download?file_id=AAA11111",
+             "direct_mega_link": "https://mega.nz/file/AAA11111#k1"}]}
+        responses = [aiohttp.ClientConnectionError("connection reset"),
+                     json.JSONDecodeError("bad json", "", 0), payload]
+
+        async def fake(session, endpoint, url="", max_bytes=0, timeout=None, params=None):
+            answer = responses.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        async def waited(attempt, delay, attempts):
+            waits.append((attempt, delay, attempts))
+
+        with patch("ytdown.bot.fetch_json_api", new=fake), \
+                patch("ytdown.bot.asyncio.sleep", new=AsyncMock()) as sleep:
+            listing = await bot.fetch_mega(MagicMock(), "https://mega.nz/file/abc#key", on_wait=waited)
+        self.assertEqual(listing.files[0].filename, "Woke up clip.mp4")
+        self.assertEqual([attempt for attempt, _, _ in waits],
+                         [1, 2])  # Two waits, then the answer.
+        self.assertEqual(len(bot.MEGA_RETRY_DELAYS), 4)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list],
+                         list(bot.MEGA_RETRY_DELAYS[:2]))
+        self.assertIn("not answering yet", bot.mega_wait_text(2, 10, 5))
+        self.assertIn("waiting 10s", bot.mega_wait_text(2, 10, 5))
+
+    async def test_the_last_attempt_hands_the_api_reason_to_the_user(self):
+        calls = []
+
+        async def fake(session, endpoint, url="", max_bytes=0, timeout=None, params=None):
+            calls.append(url)
+            return {"success": False, "error": "MEGA API could not resolve this link."}
+
+        with patch("ytdown.bot.fetch_json_api", new=fake), \
+                patch("ytdown.bot.asyncio.sleep", new=AsyncMock()) as sleep:
+            with self.assertRaises(MegaError) as caught:
+                await bot.fetch_mega(MagicMock(), "https://mega.nz/file/abc#key")
+        self.assertIn("could not resolve", str(caught.exception))
+        self.assertEqual(sleep.await_count, len(bot.MEGA_RETRY_DELAYS))
+
+    async def test_the_bots_own_refusals_are_not_retried(self):
+        """A safety or link check must fail at once, not sleep through the ladder."""
+        async def fake(session, endpoint, url="", max_bytes=0, timeout=None, params=None):
+            raise ValueError("API redirected to an unsafe address.")
+
+        with patch("ytdown.bot.fetch_json_api", new=fake), \
+                patch("ytdown.bot.asyncio.sleep", new=AsyncMock()) as sleep:
+            with self.assertRaises(ValueError):
+                await bot.fetch_mega(MagicMock(), "https://mega.nz/file/abc#key")
+        sleep.assert_not_awaited()
 
 
 if __name__ == "__main__":

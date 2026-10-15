@@ -19,6 +19,10 @@ MEGA_API_URL = "https://samra-mega-api.onrender.com/api/info"
 MEGA_HOSTS = ("mega.nz", "mega.io", "mega.co.nz")
 MAX_MEGA_FILES = 2000
 MAX_MEGA_LINKS = 10  # How many links one message may carry before the bot says that is too many.
+# The API runs on a free host that sleeps when idle, so the first call after a
+# quiet spell can time out or answer 502 while the service wakes up. These are
+# the waits before each retry: five attempts, about a minute and a half in all.
+MEGA_RETRY_DELAYS = (5, 10, 20, 30)
 LINK_RE = re.compile(r"https?://[^\s<>\"']+")
 VIDEO_SUFFIXES = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts", ".flv", ".wmv")
 
