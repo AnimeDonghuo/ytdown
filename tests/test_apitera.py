@@ -360,6 +360,37 @@ class RunParcivTests(BotCase):
         self.assertIn("Uploaded 2 file(s)", summary)
         self.assertIn("1 failed", summary)
 
+    async def test_the_download_is_given_the_api_and_family_for_its_fallback(self):
+        batch = ParcivBatch(items=(movie_item(section="donghua"),), qualities=("360p",),
+                            check_dm=False)
+        job = await self.job(batch)
+        calls = []
+
+        def fake_download(url, out_dir, on_bytes, stop, **kwargs):
+            calls.append((url, kwargs))
+            path = os.path.join(out_dir, "stream.mp4")
+            with open(path, "wb") as handle:
+                handle.write(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * (2 * 1024 * 1024))
+            return path
+
+        with patch("ytdown.bot.fetch_parciv_media", new=AsyncMock(return_value=movie_media())), \
+                patch("ytdown.bot.fetch_parciv_item", new=AsyncMock(side_effect=lambda s, a, i: i)), \
+                patch("ytdown.bot.download_parciv", new=fake_download), \
+                patch("ytdown.bot.thumbnail_jpeg", new=AsyncMock(return_value=None)):
+            await self.service.run_parciv(job)
+        _, kwargs = calls[0]
+        # A Donghua item must leech through the Donghua family, like the API's own URL.
+        self.assertEqual(kwargs["section"], "donghua")
+        self.assertEqual(kwargs["api"].root, "https://api.parciv.workers.dev")
+        self.assertFalse(kwargs["dash"])
+
+    async def test_a_parciv_job_never_leaches_through_another_service_api(self):
+        from ytdown.bot import DEFAULT_APIS, parciv_endpoint
+        self.assertEqual(parciv_endpoint(DEFAULT_APIS["youtube"]), DEFAULT_APIS["parciv"])
+        self.assertEqual(parciv_endpoint(""), DEFAULT_APIS["parciv"])
+        own = "https://my-worker.example.workers.dev/moviebox"
+        self.assertEqual(parciv_endpoint(own), own)
+
     async def test_the_proxy_and_cookie_headers_are_passed_to_the_download(self):
         batch = ParcivBatch(items=(movie_item(),), qualities=("360p",), check_dm=False)
         job = await self.job(batch)

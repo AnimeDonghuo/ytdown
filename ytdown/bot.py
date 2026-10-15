@@ -455,6 +455,20 @@ async def fetch_terabox(session: aiohttp.ClientSession, url: str,
     return normalize_terabox(await fetch_json_api(session, endpoint, url, 4_000_000))
 
 
+def parciv_endpoint(endpoint: str) -> str:
+    """The apitera API a parciv job must use.
+
+    A job carries the endpoint it was queued with, but a job built without one (or
+    with another service's default) must never be used to leech through: apitera
+    URLs are built from this base, so falling back to the built-in API is the only
+    safe answer.
+    """
+    host = urlsplit(str(endpoint or "")).netloc.lower()
+    others = {urlsplit(url).netloc.lower() for service, url in DEFAULT_APIS.items()
+              if service != "parciv"}
+    return endpoint if host and host not in others else DEFAULT_APIS["parciv"]
+
+
 async def fetch_mega(session: aiohttp.ClientSession, url: str, endpoint: str = MEGA_API_URL,
                      on_wait=None) -> MegaListing:
     """A MEGA file or folder link: the API returns the whole folder tree.
@@ -3473,7 +3487,7 @@ class DownloaderBot:
         if not isinstance(batch, ParcivBatch):
             raise ParcivError("The apitera batch is missing; send the link again.")
         uid = job.user_id
-        api = ParcivApi(job.api_endpoint or DEFAULT_APIS["parciv"])
+        api = ParcivApi(parciv_endpoint(job.api_endpoint))
         dm_keys = await self.dm_titles(job.peer) if batch.check_dm else set()
         sent = skipped = failed = too_large = 0
         reasons: list[str] = []
@@ -3532,7 +3546,8 @@ class DownloaderBot:
                         path = await asyncio.to_thread(
                             download_parciv, source.url, tmpdir, on_bytes, stop,
                             proxy=proxy.url if proxy else None, headers=source.headers,
-                            label=source.label,
+                            label=source.label, api=api, section=item.section,
+                            dash=source.dash,
                             duration=media.duration or source.duration, title=media.title)
                     except asyncio.CancelledError:
                         stop.set()  # Stops the worker thread at its next progress callback.

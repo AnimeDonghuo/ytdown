@@ -18,17 +18,24 @@ The uploader works from these readers: one title, every quality it offers, the a
 language tags it reported and the subtitle language, in the same ``media_name`` shape the
 rest of the bot uses, e.g. ``PAW Patrol_ The Dino Movie [Hindi] [Eng Sub] [360p].mp4``.
 
-Nothing is downloaded until a job runs: the catalogue is only read, and the media URL is
-handed to yt-dlp at upload time (the CDN links are signed and expire).
+Nothing is downloaded until a job runs: the catalogue is only read, and the media URLs are
+fetched at upload time (the CDN links are signed and expire). One source is tried three ways,
+in this order: a plain HTTP copy (these CDNs list progressive MP4s, and a copy cannot fail in
+a post-processor or need ffmpeg), yt-dlp (manifests and the odd source a copy cannot take),
+and the API's own leech call ``…/<family>/stream?url=<source>`` — the route that still works
+when a CDN refuses the bot, or when only the worker can reach that host.
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import threading
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, replace
 from typing import Iterable
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlparse, urlsplit
 
 import yt_dlp
 
@@ -171,6 +178,15 @@ def search_url_for(base: str, words: str) -> str:
 def search_url(api: "ParcivApi", section: str, words: str) -> str:
     """That section's family search call (see `search_url_for`)."""
     return search_url_for(family_base(api, section), words)
+
+
+def leech_url(api: "ParcivApi", section: str, url: str) -> str:
+    """The API's own copy of one source: `…/<family>/stream?url=<encoded>`.
+
+    The worker fetches that URL itself, which is the route that still works when a
+    CDN refuses the bot directly (or when only the worker can reach that host).
+    """
+    return f"{family_base(api, section)}/stream?url={quote(str(url), safe='')}"
 
 
 def parse_parciv_source(raw: str) -> str:
@@ -433,10 +449,45 @@ def find_dicts(payload: object, keys: tuple[str, ...] = LIST_KEYS) -> list[dict]
 
 
 def url_value(raw: dict, *keys: str) -> str:
-    """The first public HTTPS URL among these keys."""
+    """The first public HTTPS URL among these keys (covers, subtitles, API links)."""
     for key in keys:
         value = _text(raw.get(key), 2048)
         if public_https_url(value):
+            return value
+    return ""
+
+
+def public_media_url(value: object) -> bool:
+    """True for a URL the bot may copy media from.
+
+    apitera's CDNs hand out plain ``http://`` sources on their own ports (the
+    ``santol.whatbox.ca:29318`` kind), so media URLs are held to a weaker rule than
+    the API endpoints: any public host, http or https, but never a local or private
+    address and never with credentials in it.
+    """
+    if not isinstance(value, str) or len(value) > 2048:
+        return False
+    try:
+        parsed = urlparse(value)
+        host = parsed.hostname
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not host or parsed.username or parsed.password:
+        return False
+    low = host.lower()
+    if low == "localhost" or low.endswith((".localhost", ".local")):
+        return False
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return "." in host and all(host.split("."))
+
+
+def media_url(raw: dict, *keys: str) -> str:
+    """The first media URL among these keys (see `public_media_url`)."""
+    for key in keys:
+        value = _text(raw.get(key), 2048)
+        if public_media_url(value):
             return value
     return ""
 
@@ -599,7 +650,7 @@ class ParcivMedia:
 
 def source_from_dict(raw: dict, dash: bool = False) -> ParcivSource | None:
     """Read one media entry of a ``streams``/``resources``/``videos`` list."""
-    url = url_value(raw, "url", "link", "src", "file", "stream_url", "streamUrl", "download_url")
+    url = media_url(raw, "url", "link", "src", "file", "stream_url", "streamUrl", "download_url")
     if not url:
         return None
     label = quality_label(first(raw, "resolution", "label", "quality", "height", "name"),
@@ -823,9 +874,99 @@ def ffmpeg_ready() -> bool:
     return all(which(tool) for tool in ("ffmpeg", "ffprobe"))
 
 
-def download_parciv(url: str, out_dir: str, on_bytes, stop: threading.Event,
-                    proxy: str | None = None, headers: Iterable[tuple[str, str]] = (),
-                    label: str = "", duration: int = 0, title: str = "") -> str:
+LEECH_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
+LEECH_CHUNK = 256 * 1024
+LEECH_SUFFIXES = (".mp4", ".mkv", ".webm", ".ts", ".m4v", ".mov", ".avi", ".flv", ".mp3", ".m4a")
+# Content types that mean "this is a page or a manifest, not the video".
+REFUSED_TYPES = ("text/", "application/json", "application/xml", "+xml", "mpegurl")
+
+
+def unwrap_reason(text: str, label: str) -> str:
+    """Drop one nested "<label> could not be downloaded (…)" wrapper from a reason."""
+    prefix = f"{label} "
+    if not text.startswith(prefix):
+        return text
+    inner = text[len(prefix):]
+    body = inner[:-1] if inner.endswith(".") else inner
+    head, _, tail = body.partition("(")
+    if not tail.endswith(")"):
+        return text
+    if head.strip() == "could not be downloaded":
+        return tail[:-1].strip()
+    if head.strip() == "did not come back as a video":
+        return f"not a video ({tail[:-1].strip()})"
+    return text
+
+
+def brief(exc: object, limit: int = 70) -> str:
+    """One short line for an error, so several routes fit in one message."""
+    text = " ".join(str(exc).split()) or type(exc).__name__
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def leech_parciv(url: str, out_dir: str, on_bytes, stop: threading.Event,
+                 proxy: str | None = None, headers: Iterable[tuple[str, str]] = (),
+                 label: str = "", duration: int = 0, timeout: int = 60) -> str:
+    """Copy one progressive source with a single HTTP GET: no yt-dlp, no ffmpeg.
+
+    The apitera CDNs list plain MP4s, and a plain copy cannot trip over a
+    post-processor. Answers that are not media (an HTML or JSON refusal, a playlist
+    manifest) are refused here, so the caller can try the next route, and a partial
+    file is removed so the next route starts clean.
+    """
+    suffix = os.path.splitext(urlsplit(url).path)[1].lower()
+    if suffix not in LEECH_SUFFIXES:
+        suffix = ".mp4"
+    path = os.path.join(out_dir, f"stream{suffix}")
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    request = urllib.request.Request(url, headers={"User-Agent": LEECH_UA, **dict(headers)})
+    try:
+        try:
+            response = opener.open(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            raise ParcivError(f"HTTP {exc.code} {exc.reason}".strip()) from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise ParcivError(brief(exc)) from exc
+        with response:
+            kind = str(response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if any(bad in kind for bad in REFUSED_TYPES):
+                raise ParcivError(f"the answer is {kind or 'not media'}, not a video")
+            try:
+                total = int(response.headers.get("Content-Length") or 0)
+            except ValueError:
+                total = 0
+            done = 0
+            with open(path, "wb") as handle:
+                while True:
+                    if stop.is_set():
+                        raise DownloadCancelled("Cancelled")
+                    chunk = response.read(LEECH_CHUNK)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    done += len(chunk)
+                    on_bytes(done, total)
+        if total and done < total:
+            raise ParcivError(f"the connection stopped after {done} of {total} bytes")
+        problem = media_problem(path, duration)
+        if problem:
+            raise ParcivError(f"did not come back as a video ({problem})")
+        return path
+    except BaseException:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+
+
+def download_with_ytdlp(url: str, out_dir: str, on_bytes, stop: threading.Event,
+                        proxy: str | None = None, headers: Iterable[tuple[str, str]] = (),
+                        label: str = "", duration: int = 0, title: str = "") -> str:
     """Blocking yt-dlp download of one apitera stream; returns the media path.
 
     ``on_bytes(done, total)`` is called from the worker thread and setting ``stop``
@@ -877,3 +1018,50 @@ def download_parciv(url: str, out_dir: str, on_bytes, stop: threading.Event,
     if problem:
         raise ParcivError(f"{label or 'This quality'} did not come back as a video ({problem}).")
     return path
+
+
+def download_parciv(url: str, out_dir: str, on_bytes, stop: threading.Event,
+                    proxy: str | None = None, headers: Iterable[tuple[str, str]] = (),
+                    label: str = "", duration: int = 0, title: str = "",
+                    api: "ParcivApi | None" = None, section: str = "",
+                    dash: bool = False) -> str:
+    """Download one apitera source, trying every route that reaches it.
+
+    1. **A plain HTTP copy** of the source URL: the CDNs list progressive MP4s, so one
+       GET is the fastest route and the only one that cannot fail in a yt-dlp
+       post-processor or need ffmpeg (some hosts have none).
+    2. **yt-dlp**, for manifests (DASH/HLS) and the odd source a plain copy cannot take.
+    3. **The API's own leech** (``…/<family>/stream?url=``): the worker fetches the
+       source itself — the route to use when yt-dlp fails and the CDN refuses the bot.
+
+    Every route's reason is kept, so the user reads why the file could not be fetched
+    instead of one bare library name.
+    """
+    label = label or "This quality"
+    plain = str(url).split("?")[0].lower()
+    manifest = dash or plain.endswith((".mpd", ".m3u8", ".mpd/"))
+    reasons: list[str] = []
+    if not manifest:
+        try:
+            return leech_parciv(url, out_dir, on_bytes, stop, proxy=proxy, headers=headers,
+                                label=label, duration=duration)
+        except DownloadCancelled:
+            raise
+        except ParcivError as exc:
+            reasons.append(f"direct copy: {brief(exc)}")
+    try:
+        return download_with_ytdlp(url, out_dir, on_bytes, stop, proxy=proxy, headers=headers,
+                                   label=label, duration=duration, title=title)
+    except DownloadCancelled:
+        raise
+    except ParcivError as exc:
+        reasons.append(f"yt-dlp: {brief(unwrap_reason(str(exc), label))}")
+    if api is not None and section and not manifest:
+        try:
+            return leech_parciv(leech_url(api, section, url), out_dir, on_bytes, stop,
+                                proxy=proxy, headers=headers, label=label, duration=duration)
+        except DownloadCancelled:
+            raise
+        except ParcivError as exc:
+            reasons.append(f"via the API: {brief(exc)}")
+    raise ParcivError(f"{label} could not be downloaded ({'; '.join(reasons)}).")

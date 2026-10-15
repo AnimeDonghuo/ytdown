@@ -4,17 +4,20 @@ import shutil
 import tempfile
 import threading
 import unittest
+import urllib.error
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from ytdown.dailymotion import DownloadCancelled
 from ytdown.apitera import (already_uploaded, listing_lines, new_items, parse_interval, parse_limit,
                             past_titles, interval_text)
 from ytdown.parciv import (AUTO_SECTIONS, PARCIV_API_URL, ParcivApi, ParcivError, ParcivItem,
                             family_base, matches_words, search_url,  # noqa: F401 (used below)
-                           download_parciv, is_parciv_media_endpoint, message_titles,
+                           download_parciv, download_with_ytdlp, is_parciv_media_endpoint,
+                           leech_parciv, leech_url, media_url, message_titles, public_media_url,
                            normalize_section, parse_catalogue, parse_detail, parse_parciv_source,
                            parse_post, parse_sections, parse_stream, pick_media, quality_label,
-                           size_of, title_key, titles_match)
+                           size_of, source_from_dict, title_key, titles_match)
 
 # The real answers, trimmed: /moviebox/movies page 1 and /moviebox/stream?id=….
 MOVIES = {"page": 1, "results": [
@@ -345,7 +348,7 @@ class HelperTests(unittest.TestCase):
 
 
 class DownloadTests(unittest.TestCase):
-    """yt-dlp is mocked; what matters here is the options, the checks and the errors."""
+    """The yt-dlp route: its options, checks and errors (yt-dlp itself is mocked)."""
 
     def setUp(self):
         self.out = tempfile.mkdtemp(prefix="ytdown-parciv-test-")
@@ -367,7 +370,7 @@ class DownloadTests(unittest.TestCase):
 
         fake.YoutubeDL.return_value.__enter__.return_value.download.side_effect = download
         with patch("ytdown.parciv.yt_dlp", fake):
-            path = download_parciv("https://cdn.example.com/a.mp4", self.out, lambda *a: None,
+            path = download_with_ytdlp("https://cdn.example.com/a.mp4", self.out, lambda *a: None,
                                    threading.Event(), headers=(("Cookie", "CloudFront-Policy=x"),),
                                    proxy="http://127.0.0.1:8080", label="360p")
         self.assertTrue(path.endswith("stream.mp4"))
@@ -382,7 +385,7 @@ class DownloadTests(unittest.TestCase):
             lambda urls: self.write(body=b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 4096))
         with patch("ytdown.parciv.yt_dlp", fake):
             with self.assertRaises(ParcivError) as caught:
-                download_parciv("https://cdn.example.com/a.mp4", self.out, lambda *a: None,
+                download_with_ytdlp("https://cdn.example.com/a.mp4", self.out, lambda *a: None,
                                 threading.Event(), label="360p", duration=5800)
         self.assertIn("only 4108 bytes", str(caught.exception))
 
@@ -395,7 +398,7 @@ class DownloadTests(unittest.TestCase):
         fake.YoutubeDL.return_value.__enter__.return_value.download.side_effect = download
         with patch("ytdown.parciv.yt_dlp", fake):
             with self.assertRaises(ParcivError) as caught:
-                download_parciv("https://cdn.example.com/a.mp4", self.out, lambda *a: None,
+                download_with_ytdlp("https://cdn.example.com/a.mp4", self.out, lambda *a: None,
                                 threading.Event(), label="360p")
         self.assertIn("360p", str(caught.exception))
         self.assertIn("not a video", str(caught.exception))
@@ -406,7 +409,7 @@ class DownloadTests(unittest.TestCase):
             RuntimeError("HTTP Error 403: Forbidden"))
         with patch("ytdown.parciv.yt_dlp", fake):
             with self.assertRaises(ParcivError) as caught:
-                download_parciv("https://cdn.example.com/a.mp4", self.out, lambda *a: None,
+                download_with_ytdlp("https://cdn.example.com/a.mp4", self.out, lambda *a: None,
                                 threading.Event(), label="1080p")
         self.assertIn("1080p", str(caught.exception))
         self.assertIn("403", str(caught.exception))
@@ -414,7 +417,7 @@ class DownloadTests(unittest.TestCase):
     def test_a_dash_stream_needs_ffmpeg(self):
         with patch("ytdown.parciv.ffmpeg_ready", return_value=False):
             with self.assertRaises(ParcivError) as caught:
-                download_parciv("https://sacdn.hakunaymatata.com/dash/index_web.mpd", self.out,
+                download_with_ytdlp("https://sacdn.hakunaymatata.com/dash/index_web.mpd", self.out,
                                 lambda *a: None, threading.Event(), label="1080p DASH")
         self.assertIn("ffmpeg", str(caught.exception))
 
@@ -433,8 +436,217 @@ class DownloadTests(unittest.TestCase):
         fake.YoutubeDL.return_value.__enter__.return_value.download.side_effect = download
         with patch("ytdown.parciv.yt_dlp", fake):
             with self.assertRaises(DownloadCancelled):
-                download_parciv("https://cdn.example.com/a.mp4", self.out, lambda *a: None, stop)
+                download_with_ytdlp("https://cdn.example.com/a.mp4", self.out, lambda *a: None, stop)
         self.assertTrue(stop.is_set())
+
+
+class StandInCdn:
+    """A tiny stand-in CDN: it answers the routes the tests ask it for."""
+
+    def __init__(self):
+        import http.server
+
+        self.seen: list[str] = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"  # One connection per answer keeps the tests quiet.
+
+            def log_message(self, *args):  # Keep the test output quiet.
+                pass
+
+            def do_GET(self):
+                outer.seen.append(self.path)
+                if self.path.startswith("/video") or "/stream?" in self.path:
+                    body = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * (2 * 1024 * 1024)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "video/mp4")
+                elif self.path.startswith("/page"):
+                    body = b"<html>hotlink protection</html>"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                elif self.path.startswith("/manifest"):
+                    body = b"#EXTM3U\n#EXT-X-VERSION:3\n"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                else:
+                    body = b"no"
+                    self.send_response(403)
+                    self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class LeechTests(unittest.TestCase):
+    """One source, three routes: a plain copy, yt-dlp, and the API's own leech."""
+
+    def setUp(self):
+        self.out = tempfile.mkdtemp(prefix="ytdown-parciv-leech-")
+        self.addCleanup(shutil.rmtree, self.out, ignore_errors=True)
+        self.cdn = StandInCdn()
+        self.addCleanup(self.cdn.stop)
+        self.stop = threading.Event()
+        self.progress = []
+
+    def on_bytes(self, done, total):
+        self.progress.append((done, total))
+
+    def test_the_media_urls_allow_the_plain_http_sources_these_cdns_hand_out(self):
+        # The exact source shape the user hit: http, a custom port, no TLS.
+        self.assertTrue(public_media_url("http://santol.whatbox.ca:29318/2026/Donghua/"
+                                         "KuangWang2/06-360p.mp4"))
+        self.assertTrue(public_media_url("https://bcdnt.hakunaymatata.com/bt/360.mp4"))
+        self.assertFalse(public_media_url("http://127.0.0.1:8080/a.mp4"))
+        self.assertFalse(public_media_url("http://localhost/a.mp4"))
+        self.assertFalse(public_media_url("http://user:pw@example.com/a.mp4"))
+        self.assertFalse(public_media_url("http://192.168.1.5/a.mp4"))
+        self.assertFalse(public_media_url("http://[::1]/a.mp4"))
+        parsed = source_from_dict({"url": "http://santol.whatbox.ca:29318/x/06-360p.mp4",
+                                   "resolution": "360p"})
+        self.assertEqual(parsed.url, "http://santol.whatbox.ca:29318/x/06-360p.mp4")
+        self.assertEqual(parsed.label, "360p")
+        # The API's own calls keep the strict rule: https only.
+        self.assertEqual(media_url({"poster": "http://example.com/p.jpg"}), "")
+
+    def test_the_api_leech_url_is_built_from_the_family(self):
+        api = ParcivApi(PARCIV_API_URL)
+        source = "http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/06-360p.mp4"
+        self.assertEqual(leech_url(api, "donghua", source),
+                         "https://api.parciv.workers.dev/donghua/stream?url=http%3A%2F%2F"
+                         "santol.whatbox.ca%3A29318%2F2026%2FDonghua%2FKuangWang2%2F06-360p.mp4")
+        self.assertEqual(leech_url(api, "anime", "https://x.example.com/a.mp4"),
+                         "https://api.parciv.workers.dev/anime/stream?url=https%3A%2F%2F"
+                         "x.example.com%2Fa.mp4")
+        self.assertEqual(leech_url(api, "movies", "https://x.example.com/a.mp4"),
+                         "https://api.parciv.workers.dev/moviebox/stream?url=https%3A%2F%2F"
+                         "x.example.com%2Fa.mp4")
+        # A user's own endpoint keeps its own base.
+        own = ParcivApi("https://example.com/api/moviebox")
+        self.assertEqual(leech_url(own, "kids", "https://x.example.com/a.mp4"),
+                         "https://example.com/api/moviebox/stream?url=https%3A%2F%2F"
+                         "x.example.com%2Fa.mp4")
+
+    def test_a_plain_mp4_is_copied_without_yt_dlp(self):
+        fake = MagicMock()
+        with patch("ytdown.parciv.yt_dlp", fake):
+            path = download_parciv(self.cdn.url("/video/360.mp4"), self.out, self.on_bytes, self.stop,
+                                   label="360p")
+        self.assertTrue(path.endswith("stream.mp4"))
+        self.assertEqual(os.path.getsize(path), 2097164)
+        fake.YoutubeDL.assert_not_called()          # No post-processor can get in the way.
+        self.assertEqual(self.progress[-1], (2097164, 2097164))
+        self.assertEqual(self.cdn.seen, ["/video/360.mp4"])
+
+    def test_an_html_answer_is_not_saved_and_yt_dlp_gets_the_next_try(self):
+        fake = MagicMock()
+
+        def download(urls):
+            with open(os.path.join(self.out, "stream.mp4"), "wb") as handle:
+                handle.write(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * (2 * 1024 * 1024))
+
+        fake.YoutubeDL.return_value.__enter__.return_value.download.side_effect = download
+        with patch("ytdown.parciv.yt_dlp", fake):
+            path = download_parciv(self.cdn.url("/page/360.mp4"), self.out, self.on_bytes, self.stop,
+                                   label="360p")
+        self.assertTrue(path.endswith("stream.mp4"))
+        fake.YoutubeDL.assert_called_once()
+        self.assertEqual(self.cdn.seen, ["/page/360.mp4"])
+
+    def test_a_manifest_is_left_to_yt_dlp(self):
+        fake = MagicMock()
+
+        def download(urls):
+            with open(os.path.join(self.out, "stream.mp4"), "wb") as handle:
+                handle.write(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * (2 * 1024 * 1024))
+
+        fake.YoutubeDL.return_value.__enter__.return_value.download.side_effect = download
+        with patch("ytdown.parciv.yt_dlp", fake):
+            path = download_parciv(self.cdn.url("/manifest/index.m3u8"), self.out, self.on_bytes,
+                                   self.stop, label="360p")
+        self.assertTrue(path.endswith("stream.mp4"))
+        fake.YoutubeDL.assert_called_once()
+        self.assertEqual(self.cdn.seen, [])          # The playlist was never copied blindly.
+
+    def test_yt_dlp_failing_hands_the_source_to_the_api(self):
+        api = ParcivApi(self.cdn.url("/moviebox"))
+        fake = MagicMock()
+        fake.YoutubeDL.return_value.__enter__.return_value.download.side_effect = (
+            RuntimeError("Postprocessing: ffmpeg not found"))
+        with patch("ytdown.parciv.yt_dlp", fake):
+            path = download_parciv(self.cdn.url("/refused/06-360p.mp4"), self.out, self.on_bytes,
+                                   self.stop, label="360p", api=api, section="donghua")
+        self.assertTrue(path.endswith("stream.mp4"))
+        self.assertEqual(os.path.getsize(path), 2097164)
+        # The direct copy was refused, yt-dlp failed, and the worker's leech route worked.
+        self.assertEqual(self.cdn.seen[0], "/refused/06-360p.mp4")
+        self.assertEqual(len(self.cdn.seen), 2)
+        self.assertTrue(self.cdn.seen[1].startswith("/donghua/stream?url="), self.cdn.seen)
+        self.assertIn("refused", self.cdn.seen[1])
+        # leech_url encodes the source: the worker must not see it as its own query.
+        self.assertIn("url=http%3A%2F%2F127.0.0.1", self.cdn.seen[1])
+
+    def test_every_route_reason_reaches_the_user(self):
+        fake = MagicMock()
+        fake.YoutubeDL.return_value.__enter__.return_value.download.side_effect = (
+            RuntimeError("Postprocessing: ffmpeg not found"))
+        dead_api = ParcivApi("http://127.0.0.1:1/")  # Its leech route cannot be reached.
+        with patch("ytdown.parciv.yt_dlp", fake):
+            with self.assertRaises(ParcivError) as caught:
+                download_parciv(self.cdn.url("/refused/06.mp4"), self.out, self.on_bytes, self.stop,
+                                label="360p", api=dead_api, section="donghua")
+        message = str(caught.exception)
+        self.assertIn("360p could not be downloaded", message)
+        self.assertIn("direct copy: HTTP 403", message)
+        self.assertIn("yt-dlp: ", message)
+        self.assertIn("ffmpeg", message)
+        self.assertIn("via the API: ", message)
+        self.assertEqual(message.count("could not be downloaded"), 1)  # Not nested twice.
+        self.assertLess(len(message), 320)
+
+    def test_a_cancelled_copy_stops_without_trying_again(self):
+        fake = MagicMock()
+        self.stop.set()
+        with patch("ytdown.parciv.yt_dlp", fake):
+            with self.assertRaises(DownloadCancelled):
+                download_parciv(self.cdn.url("/video/720.mp4"), self.out, self.on_bytes, self.stop)
+        fake.YoutubeDL.assert_not_called()
+        self.assertEqual(os.listdir(self.out), [])  # Nothing half-written is left behind.
+
+    def test_a_refused_answer_leaves_no_file_for_the_next_route(self):
+        with self.assertRaises(ParcivError) as caught:
+            leech_parciv(self.cdn.url("/refused/06.mp4"), self.out, self.on_bytes, self.stop)
+        self.assertIn("403", str(caught.exception))
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_the_direct_copy_can_go_through_a_proxy(self):
+        seen: list[str] = []
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                raise urllib.error.URLError("proxy refused")
+
+        with patch("ytdown.parciv.urllib.request.build_opener") as build:
+            build.return_value = FakeOpener()
+            with self.assertRaises(ParcivError):
+                leech_parciv(self.cdn.url("/video/360.mp4"), self.out, self.on_bytes, self.stop,
+                             proxy="http://127.0.0.1:9999")
+        proxy_handler = build.call_args.args[0]
+        self.assertEqual(proxy_handler.proxies, {"http": "http://127.0.0.1:9999",
+                                                "https": "http://127.0.0.1:9999"})
+        self.assertEqual(seen, [])
 
 
 class SearchTests(unittest.TestCase):
