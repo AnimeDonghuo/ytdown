@@ -1,5 +1,6 @@
 """apitera in the bot: /latest, /search, /auto, /parciv and the upload runner."""
 import asyncio
+import json
 import os
 import re
 import unittest
@@ -239,6 +240,126 @@ class AutoTests(BotCase):
         await asyncio.gather(task, return_exceptions=True)
         self.assertGreaterEqual(self.service.run_auto_check.await_count, 1)
         self.assertIn(7, self.service.auto_last)
+
+
+POST_PAYLOAD = {"data": {"title": "Kamen Rider Kiva: You Can Also Be Kiva", "duration": 1500,
+                          "resources": [{"url": "http://santol.whatbox.ca:29318/Kiva/06-360p.mp4",
+                                         "resolution": "360p", "duration": 1500}]}}
+
+
+class LookupLadderTests(BotCase):
+    """An Anime/Donghua item is looked up with every plausible shape until one answers."""
+
+    async def test_the_first_refused_shape_is_followed_by_the_next(self):
+        item = ParcivItem(subject_id="kamen-rider-kiva", name="Kamen Rider Kiva", section="anime",
+                          extra={"slug": "kamen-rider-kiva-movie"})
+        asked = []
+
+        async def answers(session, url, *args, **kwargs):
+            asked.append(url)
+            if "/post?slug=" in url:
+                raise bot.ApiJsonError("answered non-JSON (HTTP 200): <html>Not found</html>",
+                                       "", 0)
+            return POST_PAYLOAD
+
+        with patch("ytdown.bot.fetch_parciv_json", new=answers):
+            media = await bot.fetch_parciv_post(None, ParcivApi(PARCIV_API_URL), item)
+        self.assertEqual(media.title, "Kamen Rider Kiva: You Can Also Be Kiva")
+        self.assertEqual([source.label for source in media.sources], ["360p"])
+        self.assertEqual(asked[0], "https://api.parciv.workers.dev/anime/post?slug=kamen-rider-kiva-movie")
+        self.assertEqual(asked[1], "https://api.parciv.workers.dev/anime/post?id=kamen-rider-kiva")
+
+    async def test_every_shape_failing_names_each_reason(self):
+        item = ParcivItem(subject_id="dark", name="Dark Machine", section="donghua",
+                          extra={"slug": "dark-machine"})
+
+        async def answers(session, url, *args, **kwargs):
+            if "slug=" in url:
+                return {"message": "no media here"}          # Answers, but without media.
+            raise bot.ApiJsonError("answered non-JSON (HTTP 200): <html>nope</html>", "", 0)
+
+        with patch("ytdown.bot.fetch_parciv_json", new=answers):
+            with self.assertRaises(ParcivError) as caught:
+                await bot.fetch_parciv_post(None, ParcivApi(PARCIV_API_URL), item)
+        message = str(caught.exception)
+        self.assertIn("no lookup call for Dark Machine answered with media", message)
+        self.assertIn("slug: The apitera answer", message)
+        self.assertIn("subject id: answered non-JSON (HTTP 200)", message)
+        self.assertIn("detail: ", message)
+
+    async def test_a_stream_item_never_waits_for_the_moviebox_detail_call(self):
+        item = movie_item(section="donghua")
+        with patch("ytdown.bot.fetch_parciv_item", new=AsyncMock()) as detail, \
+                patch("ytdown.bot.fetch_parciv_post", new=AsyncMock(return_value=movie_media())):
+            media = await self.service.parciv_media(7, ParcivApi(PARCIV_API_URL), item)
+        detail.assert_not_awaited()
+        self.assertEqual(media.title, "PAW Patrol: The Dino Movie")
+
+    async def test_a_moviebox_item_still_reads_its_detail_first(self):
+        item = movie_item()
+        with patch("ytdown.bot.fetch_parciv_item", new=AsyncMock(side_effect=lambda s, a, i: i)) as detail, \
+                patch("ytdown.bot.fetch_parciv_media", new=AsyncMock(return_value=movie_media())):
+            await self.service.parciv_media(7, ParcivApi(PARCIV_API_URL), item)
+        self.assertTrue(detail.await_count)
+
+
+class JsonAnswerTests(unittest.IsolatedAsyncioTestCase):
+    """An HTML answer from a wrong call shape must be recognisable, not a bare error."""
+
+    class Response:
+        def __init__(self, body, status=200):
+            self.body, self.status = body, status
+            self.headers = {}
+            self.content_length = len(body)
+            self.url = "https://api.parciv.workers.dev/anime/post?id=1"
+
+        def raise_for_status(self):
+            if self.status >= 400:
+                raise aiohttp.ClientResponseError(None, (), status=self.status)
+
+        class Content:
+            def __init__(self, body):
+                self.body = body
+
+            async def read(self, size):
+                return self.body[:size]
+
+        @property
+        def content(self):
+            return JsonAnswerTests.Response.Content(self.body)
+
+    class Get:
+        def __init__(self, response):
+            self.response = response
+
+        async def __aenter__(self):
+            return self.response
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class Session:
+        def __init__(self, response):
+            self.response = response
+
+        def get(self, *args, **kwargs):
+            return JsonAnswerTests.Get(self.response)
+
+    async def test_a_non_json_answer_names_the_status_and_the_body(self):
+        session = self.Session(self.Response(b"<html><body>Not Found</body></html>"))
+        with self.assertRaises(bot.ApiJsonError) as caught:
+            await bot.fetch_json_api(session, "https://api.parciv.workers.dev/anime/post?id=1")
+        message = str(caught.exception)
+        self.assertIn("HTTP 200", message)
+        self.assertIn("Not Found", message)
+        self.assertLess(len(message), 200)
+        # It is still a JSONDecodeError, so the YouTube retry logic keeps working.
+        self.assertIsInstance(caught.exception, json.JSONDecodeError)
+
+    async def test_a_json_answer_is_returned_as_usual(self):
+        session = self.Session(self.Response(b'{"data": {"ok": true}}'))
+        payload = await bot.fetch_json_api(session, "https://api.parciv.workers.dev/anime/latest")
+        self.assertEqual(payload, {"data": {"ok": True}})
 
 
 class RunParcivTests(BotCase):

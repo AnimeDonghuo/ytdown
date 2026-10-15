@@ -1,4 +1,5 @@
 """apitera readers: the catalogue, the stream/post answers, names and title matching."""
+import json
 import os
 import shutil
 import tempfile
@@ -17,7 +18,8 @@ from ytdown.parciv import (AUTO_SECTIONS, PARCIV_API_URL, ParcivApi, ParcivError
                            leech_parciv, leech_url, media_url, message_titles, public_media_url,
                            normalize_section, parse_catalogue, parse_detail, parse_parciv_source,
                            parse_post, parse_sections, parse_stream, pick_media, quality_label,
-                           size_of, source_from_dict, title_key, titles_match)
+                           item_from_dict, json_media_link, size_of, source_from_dict, title_key,
+                           titles_match)
 
 # The real answers, trimmed: /moviebox/movies page 1 and /moviebox/stream?id=….
 MOVIES = {"page": 1, "results": [
@@ -468,6 +470,15 @@ class StandInCdn:
                     body = b"<html>hotlink protection</html>"
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
+                elif self.path.startswith("/api-link"):
+                    body = json.dumps({"status": "ok",
+                                       "url": outer.url("/video/06-360p.mp4")}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                elif self.path.startswith("/api-empty"):
+                    body = json.dumps({"status": "error", "message": "no link"}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
                 elif self.path.startswith("/manifest"):
                     body = b"#EXTM3U\n#EXT-X-VERSION:3\n"
                     self.send_response(200)
@@ -534,6 +545,68 @@ def fake_popen(factory):
         return factory(args)
 
     return popen, calls
+
+
+class PostLookupTests(unittest.TestCase):
+    """The Anime/Donghua lookup ladder: every shape of the call, best guess first."""
+
+    def test_a_slug_listing_asks_with_the_slug_first(self):
+        api = ParcivApi(PARCIV_API_URL)
+        item = ParcivItem(subject_id="kamen-rider-kiva", name="Kamen Rider Kiva", section="anime",
+                          extra={"slug": "kamen-rider-kiva-movie"})
+        labels = [label for label, _ in api.post_candidates("anime", item)]
+        self.assertEqual(labels, ["slug", "subject id", "detail"])
+        self.assertEqual(api.post_candidates("anime", item)[0][1],
+                         "https://api.parciv.workers.dev/anime/post?slug=kamen-rider-kiva-movie")
+        self.assertEqual(api.post("anime", item), api.post_candidates("anime", item)[0][1])
+
+    def test_an_id_listing_asks_with_the_id(self):
+        api = ParcivApi(PARCIV_API_URL)
+        item = ParcivItem(subject_id="4455", name="Dark Machine", section="donghua",
+                          extra={"postId": "9001"})
+        self.assertEqual(api.post_candidates("donghua", item)[0],
+                         ("id", "https://api.parciv.workers.dev/donghua/post?id=9001"))
+
+    def test_a_link_the_listing_handed_over_is_tried_first(self):
+        api = ParcivApi(PARCIV_API_URL)
+        link = "https://api.parciv.workers.dev/anime/post?slug=dark-machine"
+        item = ParcivItem(subject_id="dark-machine", name="Dark Machine", section="anime",
+                          post_url=link, extra={"slug": "dark-machine"})
+        candidates = api.post_candidates("anime", item)
+        self.assertEqual(candidates[0], ("its own link", link))
+        self.assertEqual(len({url for _, url in candidates}), len(candidates))  # No repeats.
+
+    def test_an_api_url_the_listing_gave_is_used_as_the_url_shape(self):
+        api = ParcivApi(PARCIV_API_URL)
+        own = "https://api.parciv.workers.dev/anime/post?slug=dark-machine"
+        item = ParcivItem(subject_id="dark-machine", name="Dark Machine", section="anime",
+                          extra={"url": own})
+        shapes = dict((label, url) for label, url in api.post_candidates("anime", item))
+        self.assertEqual(shapes["api url"],
+                         "https://api.parciv.workers.dev/anime/post?url="
+                         "https%3A%2F%2Fapi.parciv.workers.dev%2Fanime%2Fpost%3Fslug%3Ddark-machine")
+
+    def test_a_listing_entry_keeps_its_slug_url_and_own_media_link(self):
+        raw = {"name": "Dark Machine: The Animation", "id": "4455",
+               "slug": "dark-machine-2026",
+               "url": "https://api.parciv.workers.dev/anime/post?slug=dark-machine-2026",
+               "mediaUrl": "http://santol.whatbox.ca:29318/2026/Donghua/DarkMachine/01-360p.mp4",
+               "poster": "https://pbcdnw.aoneroom.com/p.jpg"}
+        item = item_from_dict(raw, "donghua", ParcivApi(PARCIV_API_URL))
+        self.assertEqual(item.extra["slug"], "dark-machine-2026")
+        self.assertEqual(item.extra["url"], raw["url"])
+        self.assertEqual(item.extra["media_url"], raw["mediaUrl"])
+        # An API-host URL is not media, and a media URL is not a lookup call.
+        self.assertNotIn("poster", item.extra)
+
+    def test_a_json_answer_naming_a_link_is_read(self):
+        self.assertEqual(json_media_link({"status": "ok", "url":
+                                          "http://santol.whatbox.ca:29318/x/06-360p.mp4"}),
+                         "http://santol.whatbox.ca:29318/x/06-360p.mp4")
+        self.assertEqual(json_media_link({"data": {"streams": [
+            {"link": "https://cdn.example.com/a.mp4"}]}}), "https://cdn.example.com/a.mp4")
+        self.assertEqual(json_media_link({"url": "javascript:alert(1)"}), "")
+        self.assertEqual(json_media_link({"message": "no link here"}), "")
 
 
 class LeechTests(unittest.TestCase):
@@ -640,6 +713,22 @@ class LeechTests(unittest.TestCase):
         self.assertIn("yt-dlp: ", message)
         self.assertIn("via the API: ", message)
         self.assertLess(len(message), 420)
+
+    def test_a_leech_answer_that_is_a_link_is_followed(self):
+        # The stand-in CDN lives on 127.0.0.1, which the public-host rule rightly refuses;
+        # that rule has its own test, so it is relaxed here to test the link follow itself.
+        with patch("ytdown.parciv.public_media_url", lambda value: str(value).startswith("http")):
+            path = download_parciv(self.cdn.url("/api-link/06-360p.mp4"), self.out, self.on_bytes,
+                                   self.stop, label="360p")
+        self.assertEqual(os.path.getsize(path), 2097164)
+        # The API answered with JSON naming the file, exactly as a leech bot handles it.
+        self.assertEqual(self.cdn.seen, ["/api-link/06-360p.mp4", "/video/06-360p.mp4"])
+
+    def test_a_json_message_without_a_link_is_refused(self):
+        with self.assertRaises(ParcivError) as caught:
+            leech_parciv(self.cdn.url("/api-empty/06.mp4"), self.out, self.on_bytes, self.stop)
+        self.assertIn("JSON message", str(caught.exception))
+        self.assertEqual(os.listdir(self.out), [])
 
     def test_the_api_leech_url_is_built_from_the_family(self):
         api = ParcivApi(PARCIV_API_URL)

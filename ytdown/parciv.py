@@ -28,6 +28,8 @@ when a CDN refuses the bot, or when only the worker can reach that host.
 from __future__ import annotations
 
 import ipaddress
+import json
+import logging
 import os
 import re
 import shutil
@@ -44,6 +46,8 @@ import yt_dlp
 
 from .core import public_https_url
 from .dailymotion import DownloadCancelled, media_problem, short_reason
+
+LOG = logging.getLogger(__name__)
 
 PARCIV_API_URL = "https://api.parciv.workers.dev/moviebox"  # The API builder's own default.
 PARCIV_HOSTS = ("api.parciv.workers.dev",)
@@ -118,18 +122,50 @@ class ParcivApi:
     def stream(self, subject_id: str) -> str:
         return f"{self.moviebox}/stream?id={quote(str(subject_id))}"
 
-    def post(self, section: str, item: "ParcivItem") -> str:
-        """The episode-detail call for one Anime/Donghua entry."""
-        if item.post_url:
-            return item.post_url
+    def post_candidates(self, section: str, item: "ParcivItem") -> tuple[tuple[str, str], ...]:
+        """Every plausible media call for one Anime/Donghua entry, best guess first.
+
+        The API builder's menu is not identical between builds: the same episode has
+        been served as ``/post?slug=``, ``/post?id=`` and ``/post?url=``, and asking
+        with the wrong one answers 200 with something that is not media at all. The
+        bot therefore asks each shape until one answers with media — the same thing a
+        person does by hand — instead of trusting a single guess.
+        """
         base = f"{self.root}/{section}"
+        seen: set[str] = set()
+        candidates: list[tuple[str, str]] = []
+
+        def add(label: str, url: str) -> None:
+            if url and url not in seen:
+                seen.add(url)
+                candidates.append((label, url))
+
+        if item.post_url:  # A link the user sent, or one the listing handed over.
+            add("its own link", item.post_url)
+        for key in ("slug", "post_slug", "postSlug"):
+            value = item.extra.get(key, "")
+            if value:
+                add("slug", f"{base}/post?slug={quote(str(value))}")
+                break
         for key in ("postId", "post_id", "episodeId", "id"):
             value = item.extra.get(key, "")
             if value:
-                return f"{base}/post?id={quote(str(value))}"
+                add("id", f"{base}/post?id={quote(str(value))}")
+                break
         if item.subject_id:
-            return f"{base}/post?id={quote(item.subject_id)}"
-        raise ParcivError("This apitera entry carries no id to look up.")
+            add("subject id", f"{base}/post?id={quote(item.subject_id)}")
+        own = item.extra.get("url", "")
+        if own:
+            add("api url", f"{base}/post?url={quote(own, safe='')}")
+        add("detail", f"{base}/detail?id={quote(item.subject_id)}")
+        return tuple(candidates)
+
+    def post(self, section: str, item: "ParcivItem") -> str:
+        """The episode-detail call for one Anime/Donghua entry (the first shape)."""
+        candidates = self.post_candidates(section, item)
+        if not candidates:
+            raise ParcivError("This apitera entry carries no id to look up.")
+        return candidates[0][1]
 
 
 def normalize_section(value: str) -> str:
@@ -800,11 +836,11 @@ def item_from_dict(raw: dict, section: str, api: "ParcivApi | None" = None) -> P
     name = media_title(raw)  # Cleans the API's "_360P" style suffixes as well.
     if not name:
         return None
+    slug = _text(first(raw, "slug", "post_slug", "postSlug", "permalink"), 120)
     subject_id = _text(first(raw, "subjectId", "subject_id", "id", "postId", "animeId", "donghuaId",
                              "slugId"), 40)
     if not subject_id:
         # Anime/Donghua lists often carry only a slug, which their /post call needs.
-        slug = _text(first(raw, "slug", "post_slug", "postSlug", "permalink"), 120)
         subject_id = slug
     if not subject_id:
         return None
@@ -821,6 +857,13 @@ def item_from_dict(raw: dict, section: str, api: "ParcivApi | None" = None) -> P
     year = _text(first(raw, "year", "release_year", "releaseYear", "released"), 8)
     extra = {key: _text(raw.get(key), 60) for key in
              ("postId", "post_id", "episodeId", "id", "subjectId") if raw.get(key) not in (None, "")}
+    if slug:
+        extra["slug"] = slug  # The /post call of these families often wants the slug.
+    if post_url:
+        extra["url"] = post_url  # Some builds answer /post?url=<their own link>.
+    own_media = media_url(raw, "media", "mediaUrl", "play_url", "playUrl", "video_url", "videoUrl")
+    if own_media and not any(host in own_media for host in PARCIV_HOSTS):
+        extra["media_url"] = own_media  # The listing handed the file itself over.
     return ParcivItem(
         subject_id=subject_id,
         name=name,
@@ -976,15 +1019,44 @@ def aria2_parciv(url: str, out_dir: str, on_bytes, stop: threading.Event,
         raise
 
 
+JSON_LINK_KEYS = ("url", "link", "stream", "streamUrl", "stream_url", "download",
+                  "downloadUrl", "download_url", "file", "src", "location", "video")
+LEECH_HOPS = 2  # How many link answers one copy follows before it gives up.
+
+
+def json_media_link(payload: object, depth: int = 0) -> str:
+    """The first media URL an API's JSON answer names (leech routes often answer so)."""
+    if depth > 4:
+        return ""
+    if isinstance(payload, dict):
+        for key in JSON_LINK_KEYS:
+            value = payload.get(key)
+            if isinstance(value, str) and public_media_url(value):
+                return value
+        for value in payload.values():
+            found = json_media_link(value, depth + 1)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for entry in payload[:10]:
+            found = json_media_link(entry, depth + 1)
+            if found:
+                return found
+    return ""
+
+
 def leech_parciv(url: str, out_dir: str, on_bytes, stop: threading.Event,
                  proxy: str | None = None, headers: Iterable[tuple[str, str]] = (),
-                 label: str = "", duration: int = 0, timeout: int = 60) -> str:
+                 label: str = "", duration: int = 0, timeout: int = 60,
+                 hop: int = 0) -> str:
     """Copy one progressive source with a single HTTP GET: no yt-dlp, no ffmpeg.
 
     The apitera CDNs list plain MP4s, and a plain copy cannot trip over a
-    post-processor. Answers that are not media (an HTML or JSON refusal, a playlist
-    manifest) are refused here, so the caller can try the next route, and a partial
-    file is removed so the next route starts clean.
+    post-processor. An answer that is a link rather than the bytes (leech routes
+    often answer ``{"url": …}``) is followed, exactly as a leech bot does. Answers
+    that are neither (an HTML page, a playlist manifest) are refused here, so the
+    caller can try the next route, and a partial file is removed so the next route
+    starts clean.
     """
     suffix = os.path.splitext(urlsplit(url).path)[1].lower()
     if suffix not in LEECH_SUFFIXES:
@@ -1004,8 +1076,21 @@ def leech_parciv(url: str, out_dir: str, on_bytes, stop: threading.Event,
             raise ParcivError(brief(exc)) from exc
         with response:
             kind = str(response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if any(bad in kind for bad in REFUSED_TYPES):
-                raise ParcivError(f"the answer is {kind or 'not media'}, not a video")
+            if "json" in kind:
+                body = response.read(1024 * 1024)
+                try:
+                    payload = json.loads(body)
+                except ValueError:
+                    raise ParcivError("the answer is not usable JSON") from None
+                link = json_media_link(payload)
+                if link and hop < LEECH_HOPS:
+                    LOG.info("The answer is a link; following it (%s)", brief(url))
+                    return leech_parciv(link, out_dir, on_bytes, stop, proxy=proxy,
+                                        headers=headers, label=label, duration=duration,
+                                        timeout=timeout, hop=hop + 1)
+                raise ParcivError("the answer is a JSON message, not a video")
+            if kind and any(bad in kind for bad in REFUSED_TYPES):
+                raise ParcivError(f"the answer is {kind}, not a video")
             try:
                 total = int(response.headers.get("Content-Length") or 0)
             except ValueError:

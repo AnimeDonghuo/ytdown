@@ -51,7 +51,7 @@ from .social import (MAX_SOCIAL_LINKS, SOCIAL_API_URL, SOCIAL_HOSTS, SocialBatch
 from .parciv import (AUTO_SECTIONS, DM_SCAN_LIMIT, MAX_AUTO_LIMIT, MAX_PARCIV_BYTES, PARCIV_API_URL,
                      PARCIV_SECTIONS, PARCIV_STREAM_SECTIONS, ParcivApi, ParcivError, ParcivItem,
                      ParcivMedia,
-                     ParcivSource, download_parciv, family_base, is_parciv_media_endpoint,
+                     ParcivSource, brief, download_parciv, family_base, is_parciv_media_endpoint,
                      matches_words, parse_catalogue, parse_detail, parse_parciv_source, parse_post,
                      parse_sections, parse_stream, pick_media, search_url_for, title_variants)
 from .apitera import (AUTO_INTERVAL_DEFAULT, AUTO_INTERVAL_MIN, CataloguePage, ParcivBatch,
@@ -368,6 +368,18 @@ def normalize_api_endpoint(raw: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", urlencode(params), ""))
 
 
+class ApiJsonError(json.JSONDecodeError):
+    """An API answered with something that is not JSON.
+
+    It stays a `JSONDecodeError` (the retry logic looks for one), but the message
+    carries the HTTP status and the beginning of the answer, so a 200-with-HTML
+    page from an unsupported call shape is recognisable at once.
+    """
+
+    def __str__(self) -> str:
+        return self.msg
+
+
 async def fetch_json_api(session: aiohttp.ClientSession, api_endpoint: str, url: str = "",
                          max_bytes: int = 2_000_000,
                          timeout: aiohttp.ClientTimeout | None = None,
@@ -397,7 +409,12 @@ async def fetch_json_api(session: aiohttp.ClientSession, api_endpoint: str, url:
             data = await response.content.read(max_bytes + 1)
             if len(data) > max_bytes:
                 raise ValueError("The link provider returned too much data.")
-            return json.loads(data)
+            try:
+                return json.loads(data)
+            except json.JSONDecodeError as exc:
+                snippet = " ".join(data[:200].decode("utf-8", "replace").split())
+                raise ApiJsonError(f"answered non-JSON (HTTP {response.status})"
+                                   + (f": {snippet[:110]}" if snippet else ""), "", 0) from exc
     raise ValueError("Too many API redirects.")
 
 
@@ -517,11 +534,36 @@ async def fetch_parciv_catalogue(session: aiohttp.ClientSession, api: ParcivApi,
                          items=parse_catalogue(payload, section, api))
 
 
+async def fetch_parciv_post(session: aiohttp.ClientSession, api: ParcivApi,
+                            item: ParcivItem) -> ParcivMedia:
+    """An Anime/Donghua episode: whichever lookup call actually answers with media.
+
+    Each shape of the family's lookup (`?slug=`, `?id=`, `?url=`, `detail`) is tried
+    in turn; a shape that answers without media is remembered and the next one is
+    asked. Every attempt's reason is kept, so the user reads what the API said
+    instead of one bare library name.
+    """
+    problems: list[str] = []
+    for label, url in api.post_candidates(item.section, item):
+        try:
+            payload = await fetch_parciv_json(session, url)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+            problems.append(f"{label}: {brief(str(exc) or type(exc).__name__)}")
+            continue
+        try:
+            return parse_post(payload, item)
+        except ParcivError as exc:
+            problems.append(f"{label}: {brief(str(exc))}")
+            continue
+    reason = "; ".join(problems[:4]) or "this entry carries no id to look up"
+    raise ParcivError(f"no lookup call for {item.title} answered with media ({reason})")
+
+
 async def fetch_parciv_media(session: aiohttp.ClientSession, api: ParcivApi,
                              item: ParcivItem) -> ParcivMedia:
     """The media of one item: the stream answer, or the post call for Anime/Donghua."""
     if item.section in PARCIV_STREAM_SECTIONS:
-        return parse_post(await fetch_parciv_json(session, api.post(item.section, item)), item)
+        return await fetch_parciv_post(session, api, item)
     payload = await fetch_parciv_json(session, api.stream(item.subject_id))
     return pick_media(parse_stream(payload, item.subject_id), item)
 
@@ -3504,8 +3546,11 @@ class DownloaderBot:
                 media = await self.parciv_media(uid, api, item)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
                 failed += 1
-                reasons.append(f"{item.title}: {type(exc).__name__}")
-                LOG.warning("apitera lookup failed for %s: %s", item.title, type(exc).__name__)
+                # Our own readers and the ladder explain themselves; a bare library
+                # name is only for the cases that have nothing to say.
+                detail = str(exc) if str(exc) and len(str(exc)) < 160 else type(exc).__name__
+                reasons.append(f"{item.title}: {detail}")
+                LOG.warning("apitera lookup failed for %s: %s", item.title, detail)
                 continue
             if batch.check_dm and already_uploaded(media.title, dm_keys):
                 skipped += 1
@@ -3579,14 +3624,15 @@ class DownloaderBot:
         if too_large:
             summary += f" {too_large} file(s) are over the size limit."
         if failed:
-            summary += f" {failed} failed ({' · '.join(reasons[:3])})."
+            summary += f" {failed} failed ({' · '.join(reasons[:4])})."
         await self.progress(job, summary, force=True)
 
     async def parciv_media(self, uid: int, api: ParcivApi, item: ParcivItem) -> ParcivMedia:
         """One item's media, with the detail call first so the name is the API's own."""
         session = self.http_for(uid)
         try:
-            item = await fetch_parciv_item(session, api, item)
+            if item.section not in PARCIV_STREAM_SECTIONS:
+                item = await fetch_parciv_item(session, api, item)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
             # The catalogue name is good enough to upload under; the stream call is next.
             LOG.info("apitera detail for %s failed (%s); using the catalogue name", item.title,
