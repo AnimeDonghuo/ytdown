@@ -30,7 +30,10 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+import shutil
+import subprocess
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
@@ -877,6 +880,8 @@ def ffmpeg_ready() -> bool:
 LEECH_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 LEECH_CHUNK = 256 * 1024
+ARIA2_POLL = 0.25  # Seconds between the aria2c progress readings.
+ARIA2_CONNECTIONS = 4  # Parallel connections per source; these CDNs allow a few.
 LEECH_SUFFIXES = (".mp4", ".mkv", ".webm", ".ts", ".m4v", ".mov", ".avi", ".flv", ".mp3", ".m4a")
 # Content types that mean "this is a page or a manifest, not the video".
 REFUSED_TYPES = ("text/", "application/json", "application/xml", "+xml", "mpegurl")
@@ -903,6 +908,72 @@ def brief(exc: object, limit: int = 70) -> str:
     """One short line for an error, so several routes fit in one message."""
     text = " ".join(str(exc).split()) or type(exc).__name__
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def aria2_path() -> str:
+    """The aria2c binary this host has, if any (`ARIA2_PATH` overrides the lookup)."""
+    return os.getenv("ARIA2_PATH") or shutil.which("aria2c") or ""
+
+
+def aria2_parciv(url: str, out_dir: str, on_bytes, stop: threading.Event,
+                 proxy: str | None = None, headers: Iterable[tuple[str, str]] = (),
+                 label: str = "", duration: int = 0, timeout: int = 60) -> str:
+    """Copy one progressive source with aria2c: several connections, resumes, no ffmpeg.
+
+    aria2c is the most reliable plain downloader for these CDNs, and it is the
+    route to reach for when yt-dlp gets in the way (post-processing, extractor
+    refusals). The file size is polled while it runs so the job's progress bar
+    keeps moving, `stop` terminates the process, and the result is checked like
+    every other route. Raises `ParcivError` when this host has no aria2c, so the
+    caller can fall back to the built-in copy.
+    """
+    aria2 = aria2_path()
+    if not aria2:
+        raise ParcivError("aria2c is not installed on this host")
+    target = os.path.join(out_dir, "stream.mp4")
+    args = [aria2, "--dir", out_dir, "--out", os.path.basename(target),
+            "--allow-overwrite=true", "--auto-file-renaming=false", "--continue=true",
+            "--file-allocation=none", "--console-log-level=warn", "--summary-interval=0",
+            f"--max-connection-per-server={ARIA2_CONNECTIONS}", f"--split={ARIA2_CONNECTIONS}",
+            "--min-split-size=1M", "--max-tries=3", "--retry-wait=2",
+            f"--connect-timeout={min(60, timeout)}", f"--timeout={timeout}"]
+    if proxy:
+        args.append(f"--all-proxy={proxy}")
+    for name, value in headers:
+        args.append(f"--header={name}: {value}")
+    args.append(url)
+    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        while process.poll() is None:
+            if stop.is_set():
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                raise DownloadCancelled("Cancelled")
+            if os.path.exists(target):
+                on_bytes(os.path.getsize(target), 0)
+            time.sleep(ARIA2_POLL)
+        output = (process.stdout.read() if process.stdout else "") or ""
+        if process.returncode:
+            reason = next((line.strip() for line in reversed(output.splitlines())
+                           if line.strip()), "")
+            raise ParcivError(f"aria2c exited {process.returncode}"
+                              + (f": {brief(reason)}" if reason else ""))
+        problem = media_problem(target, duration)
+        if problem:
+            raise ParcivError(f"did not come back as a video ({problem})")
+        return target
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        for leftover in (target, target + ".aria2"):
+            try:
+                os.remove(leftover)
+            except OSError:
+                pass
+        raise
 
 
 def leech_parciv(url: str, out_dir: str, on_bytes, stop: threading.Event,
@@ -1027,10 +1098,11 @@ def download_parciv(url: str, out_dir: str, on_bytes, stop: threading.Event,
                     dash: bool = False) -> str:
     """Download one apitera source, trying every route that reaches it.
 
-    1. **A plain HTTP copy** of the source URL: the CDNs list progressive MP4s, so one
-       GET is the fastest route and the only one that cannot fail in a yt-dlp
-       post-processor or need ffmpeg (some hosts have none).
-    2. **yt-dlp**, for manifests (DASH/HLS) and the odd source a plain copy cannot take.
+    1. **A direct copy** of the source URL: **aria2c** when the host has it (parallel
+       connections and resumes), otherwise the built-in single GET. These CDNs list
+       progressive MP4s, so this needs neither yt-dlp nor ffmpeg and cannot fail in a
+       post-processor (some hosts have no ffmpeg at all).
+    2. **yt-dlp**, for manifests (DASH/HLS) and the odd source a copy cannot take.
     3. **The API's own leech** (``…/<family>/stream?url=``): the worker fetches the
        source itself — the route to use when yt-dlp fails and the CDN refuses the bot.
 
@@ -1042,13 +1114,16 @@ def download_parciv(url: str, out_dir: str, on_bytes, stop: threading.Event,
     manifest = dash or plain.endswith((".mpd", ".m3u8", ".mpd/"))
     reasons: list[str] = []
     if not manifest:
-        try:
-            return leech_parciv(url, out_dir, on_bytes, stop, proxy=proxy, headers=headers,
-                                label=label, duration=duration)
-        except DownloadCancelled:
-            raise
-        except ParcivError as exc:
-            reasons.append(f"direct copy: {brief(exc)}")
+        attempts = [("aria2c", aria2_parciv)] if aria2_path() else []
+        attempts.append(("direct copy", leech_parciv))
+        for name, fetcher in attempts:
+            try:
+                return fetcher(url, out_dir, on_bytes, stop, proxy=proxy, headers=headers,
+                               label=label, duration=duration)
+            except DownloadCancelled:
+                raise
+            except ParcivError as exc:
+                reasons.append(f"{name}: {brief(exc)}")
     try:
         return download_with_ytdlp(url, out_dir, on_bytes, stop, proxy=proxy, headers=headers,
                                    label=label, duration=duration, title=title)

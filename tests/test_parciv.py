@@ -455,6 +455,9 @@ class StandInCdn:
             def log_message(self, *args):  # Keep the test output quiet.
                 pass
 
+            def handle_error(self, *args):  # A cancelled client is not a test failure.
+                pass
+
             def do_GET(self):
                 outer.seen.append(self.path)
                 if self.path.startswith("/video") or "/stream?" in self.path:
@@ -490,8 +493,51 @@ class StandInCdn:
         self.server.server_close()
 
 
+class FakeAria2:
+    """A stand-in aria2c process: it writes the file, or fails, exactly as told."""
+
+    def __init__(self, target: str, *, body: bytes = b"", returncode: int = 0, output: str = "",
+                 alive_reads: int = 0):
+        self.target, self.body, self.returncode, self.output = target, body, returncode, output
+        self.alive_reads = alive_reads           # How many polls see it still running.
+        self.terminated = False
+        self.args: list[str] = []
+        self.stdout = None                       # What Popen would hand back.
+        if body:
+            with open(target, "wb") as handle:
+                handle.write(body)
+
+    def poll(self):
+        if self.alive_reads > 0:
+            self.alive_reads -= 1
+            return None
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.terminated = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def fake_popen(factory):
+    """Build a Popen replacement that records the command it was handed."""
+    calls = []
+
+    def popen(args, **kwargs):
+        calls.append(args)
+        return factory(args)
+
+    return popen, calls
+
+
 class LeechTests(unittest.TestCase):
-    """One source, three routes: a plain copy, yt-dlp, and the API's own leech."""
+    """One source, four routes: aria2c, a plain copy, yt-dlp, and the API's leech."""
 
     def setUp(self):
         self.out = tempfile.mkdtemp(prefix="ytdown-parciv-leech-")
@@ -500,6 +546,11 @@ class LeechTests(unittest.TestCase):
         self.addCleanup(self.cdn.stop)
         self.stop = threading.Event()
         self.progress = []
+        # These tests exercise the built-in copy unless they say otherwise, so the
+        # host's own aria2c can never change what they measure.
+        self.aria = patch("ytdown.parciv.aria2_path", return_value="")
+        self.aria.start()
+        self.addCleanup(self.aria.stop)
 
     def on_bytes(self, done, total):
         self.progress.append((done, total))
@@ -520,6 +571,75 @@ class LeechTests(unittest.TestCase):
         self.assertEqual(parsed.label, "360p")
         # The API's own calls keep the strict rule: https only.
         self.assertEqual(media_url({"poster": "http://example.com/p.jpg"}), "")
+
+    def test_aria2_is_used_when_the_host_has_it(self):
+        target = os.path.join(self.out, "stream.mp4")
+        body = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * (2 * 1024 * 1024)
+        fake = FakeAria2(target, body=body, alive_reads=1)
+        popen, calls = fake_popen(lambda args: fake)
+        with patch("ytdown.parciv.aria2_path", return_value="/usr/bin/aria2c"), \
+                patch("ytdown.parciv.subprocess.Popen", new=popen), \
+                patch("ytdown.parciv.yt_dlp") as ytdlp:
+            path = download_parciv(self.cdn.url("/video/360.mp4"), self.out, self.on_bytes, self.stop,
+                                   proxy="http://127.0.0.1:9999",
+                                   headers=(("Cookie", "CloudFront-Policy=x"),), label="360p")
+        self.assertTrue(path.endswith("stream.mp4"))
+        self.assertEqual(self.cdn.seen, [])        # aria2c fetched it, not the built-in copy.
+        ytdlp.YoutubeDL.assert_not_called()
+        command = calls[0]
+        self.assertEqual(command[0], "/usr/bin/aria2c")
+        self.assertIn("--header=Cookie: CloudFront-Policy=x", command)
+        self.assertIn("--all-proxy=http://127.0.0.1:9999", command)
+        self.assertIn("--max-connection-per-server=4", command)
+        self.assertTrue(command[-1].endswith("/video/360.mp4"))
+        self.assertEqual(self.progress[-1], (len(body), 0))  # The bar moves while it runs.
+
+    def test_aria2_failing_falls_back_to_the_built_in_copy(self):
+        target = os.path.join(self.out, "stream.mp4")
+        fake = FakeAria2(target, returncode=3, output="status=3, error=403 Forbidden")
+        popen, calls = fake_popen(lambda args: fake)
+        with patch("ytdown.parciv.aria2_path", return_value="/usr/bin/aria2c"), \
+                patch("ytdown.parciv.subprocess.Popen", new=popen), \
+                patch("ytdown.parciv.yt_dlp") as ytdlp:
+            path = download_parciv(self.cdn.url("/video/720.mp4"), self.out, self.on_bytes, self.stop,
+                                   label="720p")
+        self.assertTrue(path.endswith("stream.mp4"))
+        self.assertEqual(self.cdn.seen, ["/video/720.mp4"])  # The copy took over.
+        ytdlp.YoutubeDL.assert_not_called()
+        self.assertEqual(os.listdir(self.out), ["stream.mp4"])  # No aria2 leftovers.
+
+    def test_aria2_is_terminated_when_the_job_is_cancelled(self):
+        target = os.path.join(self.out, "stream.mp4")
+        fake = FakeAria2(target, alive_reads=10_000)  # Never finishes on its own.
+        popen, _ = fake_popen(lambda args: fake)
+        self.stop.set()
+        with patch("ytdown.parciv.aria2_path", return_value="/usr/bin/aria2c"), \
+                patch("ytdown.parciv.subprocess.Popen", new=popen):
+            with self.assertRaises(DownloadCancelled):
+                download_parciv(self.cdn.url("/video/1080.mp4"), self.out, self.on_bytes, self.stop)
+        self.assertTrue(fake.terminated)
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_every_route_including_aria2_reports_its_reason(self):
+        target = os.path.join(self.out, "stream.mp4")
+        fake = FakeAria2(target, returncode=3, output="error=403 Forbidden")
+        popen, _ = fake_popen(lambda args: fake)
+        ytdlp = MagicMock()
+        ytdlp.YoutubeDL.return_value.__enter__.return_value.download.side_effect = (
+            RuntimeError("Postprocessing: ffmpeg not found"))
+        with patch("ytdown.parciv.aria2_path", return_value="/usr/bin/aria2c"), \
+                patch("ytdown.parciv.subprocess.Popen", new=popen), \
+                patch("ytdown.parciv.yt_dlp", ytdlp):
+            with self.assertRaises(ParcivError) as caught:
+                download_parciv(self.cdn.url("/refused/06-360p.mp4"), self.out, self.on_bytes,
+                                self.stop, label="360p", api=ParcivApi("http://127.0.0.1:1/"),
+                                section="donghua")
+        message = str(caught.exception)
+        self.assertIn("aria2c: aria2c exited 3", message)
+        self.assertIn("direct copy: HTTP 403", message)
+        self.assertIn("yt-dlp: ", message)
+        self.assertIn("via the API: ", message)
+        self.assertLess(len(message), 420)
 
     def test_the_api_leech_url_is_built_from_the_family(self):
         api = ParcivApi(PARCIV_API_URL)
