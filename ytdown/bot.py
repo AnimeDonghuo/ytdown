@@ -4173,6 +4173,11 @@ class DownloaderBot:
         The name carries the API's title, its audio language tags and its subtitle
         language before the quality: "PAW Patrol_ The Dino Movie [Hindi] [Eng Sub]
         [360p].mp4", from a file already on disk (DASH streams need ffmpeg to mux).
+
+        When the API did not list a language or subtitle, ffprobe runs on the
+        file and the tags it found are added to the name. The probe is skipped
+        when both API fields are already populated, so a Koyeb free instance
+        does not pay a second ffprobe per file.
         """
         title = media.display_title(source)
         # Brackets stay: the language tags are part of the name the user asked for.
@@ -4195,6 +4200,15 @@ class DownloaderBot:
                     thumb = frame
                     LOG.info("Prepared a frame thumbnail for %s (%d bytes)", media.title,
                              len(frame[0]))
+        else:
+            # The API gave both: only ffprobe again when at least one language
+            # or subtitle tag is missing, so the file's actual tracks land in
+            # the name when the API forgot them.
+            if (not (media.langs or source.langs)) or not media.subtitles:
+                info = await probe_file(final)
+        # Re-derive the title now that ffprobe may have filled in missing tags.
+        title = media.display_title(source, extra_langs=info.audio_langs,
+                                    extra_subtitles=info.subtitle_langs)
         thumb_file = None
         if thumb:
             thumb_file = io.BytesIO(thumb[0])

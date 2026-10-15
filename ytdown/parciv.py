@@ -871,20 +871,41 @@ class ParcivMedia:
     sources: tuple[ParcivSource, ...] = ()
     subject_id: str = ""
 
-    def name_tags(self, source: ParcivSource | None = None) -> str:
-        """The tags the user asked for: audio language(s), then the subtitle language."""
+    def name_tags(self, source: ParcivSource | None = None, *,
+                  extra_langs: tuple[str, ...] = (),
+                  extra_subtitles: tuple[str, ...] = ()) -> str:
+        """The tags the user asked for: audio language(s), then the subtitle language.
+
+        ``extra_langs`` and ``extra_subtitles`` come from ffprobe on the file
+        itself and are appended after what the API listed, so the filename
+        always reflects what the downloaded file actually carries. ffprobe
+        gives raw 639-2 codes (``jpn``, ``eng``), which are translated to the
+        same display names the catalogue uses (``Japanese``, ``English``).
+        """
         langs = list(self.langs)
         if source is not None:
             langs += [name for name in source.langs if name not in langs]
+        for code in extra_langs:
+            name = language_name(code) or str(code)
+            if name and name not in langs:
+                langs.append(name)
+        sub_names: list[str] = list(self.subtitles)
+        for code in extra_subtitles:
+            name = language_name(code) or str(code)
+            if name and name not in sub_names:
+                sub_names.append(name)
         parts = [f"[{name}]" for name in langs[:2]]
-        sub = subtitle_tag(self.subtitles)
+        sub = subtitle_tag(tuple(sub_names))
         if sub:
             parts.append(sub)
         return " ".join(parts)
 
-    def display_title(self, source: ParcivSource | None = None) -> str:
+    def display_title(self, source: ParcivSource | None = None, *,
+                      extra_langs: tuple[str, ...] = (),
+                      extra_subtitles: tuple[str, ...] = ()) -> str:
         """The upload title: the catalogue name plus its language tags."""
-        tags = self.name_tags(source)
+        tags = self.name_tags(source, extra_langs=extra_langs,
+                              extra_subtitles=extra_subtitles)
         return f"{self.title} {tags}".strip()
 
     def labelled_sources(self) -> tuple[ParcivSource, ...]:

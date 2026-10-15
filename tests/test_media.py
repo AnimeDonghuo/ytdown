@@ -38,6 +38,27 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         with patch("ytdown.media.asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
             self.assertEqual(await probe.inspect(), MediaInfo(61, 1080, 1920))
 
+    async def test_probe_reads_audio_and_subtitle_language_tags(self):
+        probe = MediaProbe()
+        probe.add(b"container" * 100)
+        # A multi-track file: Japanese audio, English audio, an undetermined
+        # default track (which must be ignored), and two subtitle streams.
+        output = (b'{"streams":['
+                  b'{"codec_type":"video","width":1280,"height":720},'
+                  b'{"codec_type":"audio","tags":{"language":"jpn"}},'
+                  b'{"codec_type":"audio","tags":{"language":"eng"}},'
+                  b'{"codec_type":"audio","tags":{"language":"und"}},'
+                  b'{"codec_type":"subtitle","tags":{"language":"eng"}},'
+                  b'{"codec_type":"subtitle","tags":{"language":"ind"}}'
+                  b'],"format":{"duration":"120.0"}}')
+        proc = SimpleNamespace(communicate=AsyncMock(return_value=(output, b"")),
+                               returncode=0, kill=MagicMock())
+        with patch("ytdown.media.asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+            info = await probe.inspect()
+        self.assertEqual(info.audio_langs, ("jpn", "eng"))
+        self.assertEqual(info.subtitle_langs, ("eng", "ind"))
+        self.assertEqual(info.duration, 120)
+
     async def test_bounded_terabox_frame_preview(self):
         from pathlib import Path
         probe = MediaProbe(".mkv")

@@ -27,6 +27,8 @@ class MediaInfo:
     duration: int = 0
     width: int = 0
     height: int = 0
+    audio_langs: tuple[str, ...] = ()
+    subtitle_langs: tuple[str, ...] = ()
 
 
 class MediaProbe:
@@ -173,7 +175,13 @@ def jpeg_preview(data: bytes) -> tuple[bytes, int, int] | None:
 
 
 def parse_probe(stdout: bytes) -> MediaInfo:
-    """ffprobe's JSON answer as a MediaInfo (zeroes when it cannot be read)."""
+    """ffprobe's JSON answer as a MediaInfo (zeroes when it cannot be read).
+
+    Audio and subtitle language tags are read from every stream — when the
+    API omits a language, the file's own metadata is the next best source.
+    Unknown / und tracks are skipped, duplicates are collapsed, and the case
+    is normalised to lower case.
+    """
     if not stdout or len(stdout) > 64 * 1024:
         return MediaInfo()
     try:
@@ -182,17 +190,31 @@ def parse_probe(stdout: bytes) -> MediaInfo:
         return MediaInfo()
     if not isinstance(info, dict):
         return MediaInfo()
-    stream = (info.get("streams") or [{}])[0]
-    width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
-    rotation = (stream.get("tags") or {}).get("rotate", 0)
-    for side_data in stream.get("side_data_list") or []:
+    streams = info.get("streams") or [{}]
+    video = next((stream for stream in streams
+                  if stream.get("codec_type") == "video"), streams[0] if streams else {})
+    width, height = int(video.get("width") or 0), int(video.get("height") or 0)
+    rotation = (video.get("tags") or {}).get("rotate", 0)
+    for side_data in video.get("side_data_list") or []:
         rotation = side_data.get("rotation", rotation)
     if int(float(rotation)) % 180:
         width, height = height, width
-    duration = float((info.get("format") or {}).get("duration") or stream.get("duration") or 0)
+    duration = float((info.get("format") or {}).get("duration") or video.get("duration") or 0)
     if not (0 < width <= 16384 and 0 < height <= 16384):
         width = height = 0
-    return MediaInfo(int(duration) if 0 < duration < 7 * 86400 else 0, width, height)
+    audio_langs: list[str] = []
+    subtitle_langs: list[str] = []
+    for stream in streams:
+        kind = stream.get("codec_type")
+        lang = str((stream.get("tags") or {}).get("language") or "").strip().lower()
+        if not lang or lang in ("und", "unknown"):
+            continue
+        if kind == "audio" and lang not in audio_langs:
+            audio_langs.append(lang)
+        elif kind == "subtitle" and lang not in subtitle_langs:
+            subtitle_langs.append(lang)
+    return MediaInfo(int(duration) if 0 < duration < 7 * 86400 else 0, width, height,
+                     tuple(audio_langs), tuple(subtitle_langs))
 
 
 def media_tool(name: str) -> str:

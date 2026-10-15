@@ -50,7 +50,7 @@ def movie_item(name="PAW Patrol: The Dino Movie", section="movies", subject_id=M
 
 def movie_media():
     return ParcivMedia(title="PAW Patrol: The Dino Movie", poster="https://pbcdnw.aoneroom.com/poster.jpg",
-                       duration=5800, subtitles=("English",),
+                       duration=5800, langs=("English",), subtitles=("English",),
                        sources=(ParcivSource("360p", "https://bcdnt.hakunaymatata.com/bt/360.mp4",
                                              size=40 * 1024 * 1024, duration=5800),
                                 ParcivSource("1080p", "https://bcdnt.hakunaymatata.com/res/1080.mp4",
@@ -548,9 +548,13 @@ class RunParcivTests(BotCase):
                           "https://bcdnt.hakunaymatata.com/res/1080.mp4"])
         self.assertEqual(self.client.send_file.await_count, 2)
         first = self.client.send_file.call_args_list[0]
-        self.assertTrue(first.args[1].endswith("PAW Patrol_ The Dino Movie [English Sub] [360p].mp4"),
-                        first.args[1])
-        self.assertEqual(first.kwargs["caption"], "PAW Patrol: The Dino Movie [English Sub] [360p]")
+        # The filename carries the API's audio language, the subtitle tag and
+        # the quality. Both are English here, so the file reads "English
+        # English Sub", exactly the form the user asked for.
+        self.assertTrue(first.args[1].endswith(
+            "PAW Patrol_ The Dino Movie [English] [English Sub] [360p].mp4"), first.args[1])
+        self.assertEqual(first.kwargs["caption"],
+                         "PAW Patrol: The Dino Movie [English] [English Sub] [360p]")
         self.assertEqual(first.kwargs["attributes"][0].duration, 5800)
         self.assertEqual(first.kwargs["attributes"][0].h, 360)
         self.assertIn("Uploaded 2 file(s)", self.service.progress.call_args.args[1])
@@ -645,6 +649,31 @@ class RunParcivTests(BotCase):
         probe.assert_not_awaited()   # The API already said both: no ffmpeg work at all.
         frame.assert_not_awaited()
         self.assertEqual(self.client.send_file.call_args.kwargs["attributes"][0].duration, 5800)
+
+    async def test_probe_languages_are_added_to_the_filename_when_the_api_didnt_list_them(self):
+        # The API gave no language or subtitle, so the file on disk is the
+        # only source of truth. ffprobe tells the bot it has Japanese audio
+        # and an English subtitle; the upload's caption carries both.
+        from dataclasses import replace
+        media = replace(movie_media(), langs=(), subtitles=())
+        batch = ParcivBatch(items=(movie_item(),), check_dm=False)
+        job = await self.job(batch)
+        tmpdir = tempfile.mkdtemp(prefix="ytdown-test-")
+        path = os.path.join(tmpdir, "stream.mp4")
+        with open(path, "wb") as handle:
+            handle.write(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * (2 * 1024 * 1024))
+        probe_info = MediaInfo(duration=5800, width=1280, height=720,
+                               audio_langs=("jpn",), subtitle_langs=("eng",))
+        with patch("ytdown.bot.probe_file", new=AsyncMock(return_value=probe_info)), \
+                patch("ytdown.bot.file_preview_jpeg", new=AsyncMock()), \
+                patch("ytdown.bot.thumbnail_jpeg",
+                      new=AsyncMock(return_value=(b"\xff\xd8cover", 640, 360))):
+            await self.service.send_parciv_file(job, media, media.sources[0], path, tmpdir)
+        caption = self.client.send_file.call_args.kwargs["caption"]
+        # The new tags land in the caption, translated from the raw codes
+        # ffprobe returned ("jpn" -> Japanese, "eng" -> English Sub).
+        self.assertIn("[Japanese]", caption)
+        self.assertIn("[English Sub]", caption)
 
     async def test_only_the_chosen_qualities_are_sent(self):
         batch = ParcivBatch(items=(movie_item(),), qualities=("1080p",), check_dm=False)
