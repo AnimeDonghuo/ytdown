@@ -18,8 +18,8 @@ from ytdown.parciv import (AUTO_SECTIONS, PARCIV_API_URL, ParcivApi, ParcivError
                            leech_parciv, leech_url, media_url, message_titles, public_media_url,
                            normalize_section, parse_catalogue, parse_detail, parse_parciv_source,
                            parse_post, parse_sections, parse_stream, pick_media, quality_label,
-                           item_from_dict, json_media_link, size_of, source_from_dict, title_key,
-                           titles_match)
+                           file_title, item_from_dict, json_media_link, leech_link_media,
+                           media_file_url, size_of, source_from_dict, title_key, titles_match)
 
 # The real answers, trimmed: /moviebox/movies page 1 and /moviebox/stream?id=….
 MOVIES = {"page": 1, "results": [
@@ -598,6 +598,25 @@ class PostLookupTests(unittest.TestCase):
         self.assertEqual(item.extra["media_url"], raw["mediaUrl"])
         # An API-host URL is not media, and a media URL is not a lookup call.
         self.assertNotIn("poster", item.extra)
+
+    def test_a_leech_link_is_read_as_one_file(self):
+        source = "http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/06-360p.mp4"
+        self.assertEqual(file_title(source), "KuangWang2 06")
+        self.assertEqual(file_title("https://cdn.example.com/movie/PAW Patrol_ The Dino Movie.mp4"),
+                         "movie PAW Patrol_ The Dino Movie")
+        self.assertEqual(file_title(""), "apitera file")
+        self.assertTrue(media_file_url(source))
+        self.assertTrue(media_file_url("https://sacdn.hakunaymatata.com/dash/index_web.mpd"))
+        self.assertFalse(media_file_url("https://api.parciv.workers.dev/anime/latest"))
+        self.assertFalse(media_file_url("http://127.0.0.1:8080/a.mp4"))
+        media = leech_link_media(source, ParcivItem(subject_id="", name=file_title(source),
+                                                   section="donghua",
+                                                   langs=("Japanese",), episode="Episode 6"))
+        self.assertEqual(media.title, "KuangWang2 06")
+        self.assertEqual(media.episode, "Episode 6")
+        self.assertEqual(media.langs, ("Japanese",))
+        self.assertEqual([(source_.label, source_.url) for source_ in media.sources],
+                         [("360p", source)])
 
     def test_a_json_answer_naming_a_link_is_read(self):
         self.assertEqual(json_media_link({"status": "ok", "url":

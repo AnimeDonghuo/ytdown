@@ -303,6 +303,51 @@ class LookupLadderTests(BotCase):
         self.assertTrue(detail.await_count)
 
 
+class LeechLinkTests(BotCase):
+    """A `/<family>/stream?url=<file>` link is a leech command, not a catalogue."""
+
+    async def test_a_leech_link_queues_that_file(self):
+        source = "http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/06-360p.mp4"
+        link = ("https://api.parciv.workers.dev/donghua/stream?url="
+                + source.replace(":", "%3A").replace("/", "%2F"))
+        self.service.queue_parciv_job = AsyncMock(return_value=None)
+        event = self.event(link)
+        await self.service.on_link(event)
+        batch = self.service.queue_parciv_job.call_args.args[2]
+        self.assertEqual(len(batch.items), 1)
+        item = batch.items[0]
+        self.assertEqual(item.section, "donghua")
+        self.assertEqual(item.name, "KuangWang2 06")
+        self.assertEqual(item.extra["media_url"], source)
+        self.assertFalse(batch.check_dm)
+        self.assertEqual(batch.source_url, link)
+
+    async def test_such_an_item_needs_no_lookup_call(self):
+        source = "http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/06-360p.mp4"
+        item = ParcivItem(subject_id="", name="KuangWang2 06", section="donghua",
+                          extra={"media_url": source})
+        with patch("ytdown.bot.fetch_parciv_post", new=AsyncMock()) as post, \
+                patch("ytdown.bot.fetch_parciv_json", new=AsyncMock()) as json_call:
+            media = await self.service.parciv_media(7, ParcivApi(PARCIV_API_URL), item)
+        post.assert_not_awaited()
+        json_call.assert_not_awaited()
+        self.assertEqual(media.title, "KuangWang2 06")
+        self.assertEqual(media.sources[0].url, source)
+        self.assertEqual(media.sources[0].label, "360p")
+
+    async def test_a_url_that_is_not_a_file_still_list_or_looks_up_as_before(self):
+        """A `?url=` pointing at a page must not be treated as a download."""
+        link = ("https://api.parciv.workers.dev/anime/stream?url="
+                "https%3A%2F%2Fapi.parciv.workers.dev%2Fanime%2Flatest")
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        with patch("ytdown.bot.fetch_parciv_json",
+                   new=AsyncMock(return_value={"results": [
+                       {"subjectId": "1", "name": "One Piece", "year": "1999"}]})) as fetch:
+            await self.service.on_link(self.event(link, notice=notice))
+        fetch.assert_awaited_once()
+        self.assertIn("🔎 apitera — page 1 of Anime", notice.edit.call_args.args[0])
+
+
 class JsonAnswerTests(unittest.IsolatedAsyncioTestCase):
     """An HTML answer from a wrong call shape must be recognisable, not a bare error."""
 

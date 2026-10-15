@@ -307,6 +307,35 @@ def titles_match(left: object, right: object) -> bool:
     return False
 
 
+def media_file_url(value: object) -> bool:
+    """True when a URL names a media file (so a leech link is a file, not a page)."""
+    if not public_media_url(value):
+        return False
+    return urlsplit(str(value)).path.lower().endswith(LEECH_SUFFIXES + (".mpd", ".m3u8"))
+
+
+def file_title(url: object) -> str:
+    """A readable title from a file URL: `…/KuangWang2/06-360p.mp4` → `KuangWang2 06`."""
+    parts = [part for part in urlsplit(str(url)).path.split("/") if part]
+    stem = ""
+    if parts:
+        stem = os.path.splitext(parts[-1])[0]
+        stem = re.sub(r"[_\s-]*\d{3,4}[pP]$", "", stem).strip("-_ ") or stem
+    folder = parts[-2] if len(parts) > 1 else ""
+    text = " ".join(dict.fromkeys(part for part in (folder, stem) if part))
+    return (text or stem or "apitera file")[:120]
+
+
+def leech_link_media(url: str, item: "ParcivItem") -> ParcivMedia:
+    """The media of a direct file link: one source, no lookup call needed."""
+    path = urlsplit(str(url)).path
+    label = quality_label(item.name, path) or "video"
+    return ParcivMedia(title=item.name or file_title(url), poster=item.poster,
+                       summary=item.summary, episode=item.episode, langs=item.langs,
+                       sources=(ParcivSource(label=label, url=url),),
+                       subject_id=item.subject_id)
+
+
 def matches_words(title: object, words: str) -> bool:
     """True when every word of a search query appears in this title.
 

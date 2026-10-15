@@ -51,9 +51,10 @@ from .social import (MAX_SOCIAL_LINKS, SOCIAL_API_URL, SOCIAL_HOSTS, SocialBatch
 from .parciv import (AUTO_SECTIONS, DM_SCAN_LIMIT, MAX_AUTO_LIMIT, MAX_PARCIV_BYTES, PARCIV_API_URL,
                      PARCIV_SECTIONS, PARCIV_STREAM_SECTIONS, ParcivApi, ParcivError, ParcivItem,
                      ParcivMedia,
-                     ParcivSource, brief, download_parciv, family_base, is_parciv_media_endpoint,
-                     matches_words, parse_catalogue, parse_detail, parse_parciv_source, parse_post,
-                     parse_sections, parse_stream, pick_media, search_url_for, title_variants)
+                     ParcivSource, brief, download_parciv, family_base, file_title,
+                     is_parciv_media_endpoint, leech_link_media, matches_words, media_file_url,
+                     parse_catalogue, parse_detail, parse_parciv_source, parse_post, parse_sections,
+                     parse_stream, pick_media, search_url_for, title_variants)
 from .apitera import (AUTO_INTERVAL_DEFAULT, AUTO_INTERVAL_MIN, CataloguePage, ParcivBatch,
                       already_uploaded, interval_text, limit_text, listing_lines, new_items,
                       normalise_sections, parse_interval, parse_limit, parse_search, past_titles,
@@ -2703,6 +2704,21 @@ class DownloaderBot:
                      f"{limit_text(self.auto_limits.get(uid, self.auto_limit_default))}")
         return "\n".join(lines)
 
+    async def leech_link_flow(self, uid: int, peer, notice, target: str, section: str,
+                              link: str) -> None:
+        """A `/<family>/stream?url=<file>` link: the API's own copy of one file.
+
+        This is the shape a leech command takes, so the bot simply downloads that
+        file — through the same three routes as every other apitera source — and
+        uploads it, instead of trying to read it as a catalogue.
+        """
+        item = ParcivItem(subject_id="", name=file_title(target), section=section,
+                          extra={"media_url": target})
+        batch = ParcivBatch(items=(item,), check_dm=False, source_url=link, sections=(section,))
+        LOG.info("apitera leech link for user %s: %s", uid, link)
+        await self.queue_parciv_job(uid, peer, batch, notice=notice,
+                                    note="From a leech link.")
+
     async def parciv_link_flow(self, event, uid: int, peer, link: str, notice=None) -> None:
         """A hand-sent apitera link: a catalogue page lists, one item offers its qualities."""
         api = ParcivApi(self.api_for(uid, "parciv"))
@@ -2710,6 +2726,13 @@ class DownloaderBot:
         path = parts.path.rstrip("/").lower()
         query = dict(pair.split("=", 1) for pair in parts.query.split("&") if "=" in pair)
         section = next((name for name in PARCIV_STREAM_SECTIONS if path.startswith(f"/{name}")), "")
+        if path.endswith("/stream") and query.get("url"):
+            # The leech shape: `<family>/stream?url=<file>` is the file itself.
+            target = unquote(query["url"])
+            if media_file_url(target):
+                notice = notice or await event.respond("Downloading that apitera file…")
+                await self.leech_link_flow(uid, peer, notice, target, section or "movies", link)
+                return
         if section and (path.endswith("/post") or query.get("slug")):
             item = ParcivItem(subject_id=query.get("id") or query.get("slug", ""), name="",
                               section=section, post_url=link)
@@ -3629,6 +3652,10 @@ class DownloaderBot:
 
     async def parciv_media(self, uid: int, api: ParcivApi, item: ParcivItem) -> ParcivMedia:
         """One item's media, with the detail call first so the name is the API's own."""
+        own = item.extra.get("media_url", "")
+        if own and media_file_url(own):
+            # The listing (or a leech link) handed over the file itself: no lookup.
+            return leech_link_media(own, item)
         session = self.http_for(uid)
         try:
             if item.section not in PARCIV_STREAM_SECTIONS:
