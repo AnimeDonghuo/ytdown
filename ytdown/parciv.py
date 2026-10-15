@@ -325,6 +325,78 @@ def titles_match(left: object, right: object) -> bool:
     return False
 
 
+URL_TITLE_SKIP = frozenset({
+    "2024", "2025", "2026", "2027", "2028", "Donghua", "Anime", "Animation", "Cartoon",
+    "Cartoons", "Kids", "Movie", "Movies", "TV", "Shows", "Series", "Sub", "Dub",
+    "downloads", "files", "cdn", "videos", "video", "media", "stream", "streams",
+    "movie", "tv", "show", "donghua", "anime", "moviebox", "source", "sources",
+    "apitera", "parciv", "episodes", "episode", "latest", "trending", "new",
+    "english", "hindi", "japanese", "chinese", "korean", "indonesian", "subbed", "dubbed",
+    "1080p", "720p", "480p", "360p", "240p", "manifest", "playlist", "master", "index",
+    "output", "hls", "dash", "segment", "segments", "chunk", "chunks", "api",
+})
+
+
+def url_title_token(url: object) -> str:
+    """The most title-like folder name in a media URL's path, else "".
+
+    `…/Donghua/KuangWang2/06-480p.mp4` → `KuangWang2`. Used to catch the data-mismatch
+    case where the API hands back a file that lives in someone else's folder.
+    """
+    parts = [part for part in urlsplit(str(url or "")).path.split("/") if part]
+    if not parts:
+        return ""
+    # The token is the folder just before the file, unless that folder is generic.
+    folder = ""
+    for part in parts[:-1]:
+        if part in URL_TITLE_SKIP:
+            continue
+        if re.match(r"^\d+$", part):
+            continue
+        folder = part
+    if folder:
+        return folder
+    # Fall back to the file's stem (after stripping a leading episode/quality number).
+    stem = os.path.splitext(parts[-1])[0]
+    if stem.lower() in URL_TITLE_SKIP:
+        return ""
+    cleaned = re.sub(r"^[-\d_\s]+", "", stem).strip("-_ ")
+    if not cleaned or len(cleaned) < 4 or cleaned.lower() in URL_TITLE_SKIP:
+        return ""
+    return cleaned
+
+
+def url_token_matches_title(token: str, title: str) -> bool:
+    """True when a token from a URL (e.g. `KuangWang2`) plausibly names `title` (e.g. `Kuang Wang 2`).
+
+    Abbreviations (≤3 chars, or a common acronym like `op`, `bw`) are accepted because
+    short tokens are not informative enough to refuse on. Otherwise the two are split
+    into word bags (case + digit boundaries for the token) and at least one token word
+    must start the title.
+    """
+    if not token or not title:
+        return True
+    # "KuangWang2" → "kuang wang 2"
+    left = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|(?<=[a-zA-Z])(?=\d)|(?<=\d)(?=[a-zA-Z])",
+                  " ", token)
+    left = re.sub(r"[_\-]+", " ", left).lower()
+    left_words = [word for word in re.split(r"\s+", left) if word]
+    # The right side is the listing's title (already words).
+    right_words = [word for word in re.split(r"\s+", re.sub(r"[_\-]+", " ", title.lower())) if word]
+    if not left_words or not right_words:
+        return True
+    # Abbreviations and numeric words: too short or non-linguistic to be sure, accept.
+    meaningful = [word for word in left_words if len(word) > 3 and not word.isdigit()]
+    if not meaningful:
+        return True
+    # At least one full token word must appear in the title (or the first 4 chars of one).
+    for word in meaningful:
+        for candidate in right_words:
+            if word == candidate or word.startswith(candidate[:4]):
+                return True
+    return False
+
+
 def media_file_url(value: object) -> bool:
     """True when a URL names a media file (so a leech link is a file, not a page)."""
     if not public_media_url(value):
@@ -1041,6 +1113,14 @@ def parse_post(payload: object, item: "ParcivItem | None" = None,
     # keeps looking — the listing's name and the file the API hands over must agree.
     if item is not None and title and item.title and not titles_match(title, item.name):
         raise ParcivError(f"the answer is for {title!r}, not {item.title!r}")
+    # The same data-mismatch case can also live in the file path: the API says it is
+    # "Kuang Wang 2" but the URL points at "…/Naruto/01-720p.mp4". The folder a CDN
+    # URL lives in is the title that file really is; refuse when the two disagree.
+    if item is not None and item.title:
+        for source in sources:
+            other = url_title_token(source.url)
+            if other and not url_token_matches_title(other, item.title):
+                raise ParcivError(f"the answer's file names {other!r}, not {item.title!r}")
     return ParcivMedia(
         title=title,
         poster=url_value(raw, "poster", "image", "thumbnail", "cover") or (item.poster if item else ""),

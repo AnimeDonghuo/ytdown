@@ -625,6 +625,45 @@ class StreamLinkTests(unittest.TestCase):
         self.assertEqual([source.url for source in media.sources],
                          ["http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/06-480p.mp4"])
 
+    def test_an_answer_whose_file_path_names_a_different_title_is_refused(self):
+        """The other half of the data-mismatch case: title matches, but the URL is for someone else.
+
+        A `/post?id=` whose server-side id points to Naruto still answers with the listing's
+        own title (the API does not know the URL is wrong), so the title check would not
+        fire. The folder a CDN URL lives in is the file's real identity: it is refused
+        when that name does not match the listing. Abbreviated URLs (`op-360.mp4` for
+        One Piece) and short tokens (under 4 chars) are still accepted as too short to
+        be sure.
+        """
+        item = ParcivItem(subject_id="7788", name="Kuang Wang 2", section="donghua",
+                          extra={"slug": "kuang-wang-2"})
+        # Title matches, but the URL points at Naruto's folder.
+        mismatch = {"title": "Kuang Wang 2", "id": "7788",
+                    "url": "http://santol.whatbox.ca:29318/2026/Donghua/Naruto/01-720p.mp4"}
+        with self.assertRaises(ParcivError) as caught:
+            parse_post(mismatch, item)
+        self.assertIn("not 'Kuang Wang 2'", str(caught.exception))
+        # A correct URL in the same folder style is still accepted.
+        ok = {"title": "Kuang Wang 2", "id": "7788",
+              "url": "http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/06-480p.mp4"}
+        media = parse_post(ok, item)
+        self.assertEqual([source.url for source in media.sources],
+                         ["http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/06-480p.mp4"])
+        # An abbreviated URL (the existing test fixture) is still accepted.
+        op_item = ParcivItem(subject_id="op-1130", name="One Piece", section="anime",
+                             extra={"slug": "one-piece-1130"})
+        abbrev = {"data": {"title": "One Piece Episode 1130", "videos": [
+            {"quality": "360p", "url": "https://cdn.example.com/op-360.mp4", "size": 42000000},
+            {"quality": "720p", "url": "https://cdn.example.com/op-720.mp4", "size": 130000000}]}}
+        media = parse_post(abbrev, op_item)
+        self.assertEqual(len(media.sources), 2)
+        # A bare file stem with no folder that is too short to be sure is also accepted.
+        short = {"title": "One Piece Episode 1130", "id": "op-1130",
+                 "url": "https://cdn.example.com/1130-720p.mp4"}
+        media = parse_post(short, op_item)
+        self.assertEqual([source.url for source in media.sources],
+                         ["https://cdn.example.com/1130-720p.mp4"])
+
     def test_every_quality_a_listing_entry_carries_is_kept(self):
         api = ParcivApi(PARCIV_API_URL)
         cdn = "http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/"
