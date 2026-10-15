@@ -2311,8 +2311,7 @@ class DownloaderBot:
         head, _, tail = arg.partition(" ")
         head, tail = head.lower(), tail.strip()
         if not arg:
-            token = secrets.token_hex(4)
-            self.auto_tokens[uid] = token
+            token = self.apitera_token(uid)
             on = self.auto_enabled.get(uid, False)
             buttons = [[Button.inline("⏸ Turn off" if on else "▶️ Turn on",
                                       data=f"a:{token}:{'off' if on else 'on'}".encode())],
@@ -2434,12 +2433,24 @@ class DownloaderBot:
             await self.safe_edit(notice, f"No catalogue entries came back: {reason}.")
             return
         keys = await self.dm_titles(peer)
-        token = secrets.token_hex(4)
-        self.auto_tokens[uid] = token
+        token = self.apitera_token(uid)
         self.latest_panels[uid] = LatestPanel(peer, getattr(notice, "id", 0), token, items,
                                               sections, page)
         await self.safe_edit(notice, self.latest_panel_text(uid, items, keys, sections, page),
                              buttons=self.latest_buttons(uid, token, items, keys), parse_mode=None)
+
+    def apitera_token(self, uid: int) -> str:
+        """The button token for this user's apitera panels.
+
+        /auto, /latest, /search and a listing link all hand out the same one, so a
+        panel opened a moment ago keeps working after another one opens: tapping an
+        older panel's button must never answer "expired".
+        """
+        token = self.auto_tokens.get(uid)
+        if not token:
+            token = secrets.token_hex(4)
+            self.auto_tokens[uid] = token
+        return token
 
     def latest_panel_text(self, uid: int, items: tuple[ParcivItem, ...], keys: set[str],
                           sections: tuple[str, ...], page: int) -> str:
@@ -2588,8 +2599,7 @@ class DownloaderBot:
         if not items:
             raise ParcivError("That apitera URL listed no items.")
         keys = await self.dm_titles(peer)
-        token = secrets.token_hex(4)
-        self.auto_tokens[uid] = token
+        token = self.apitera_token(uid)
         self.latest_panels[uid] = LatestPanel(peer, getattr(notice, "id", 0), token, items,
                                               (section,), page, url=url)
         words = unquote(query.get("query") or query.get("q") or query.get("search") or "").strip()
@@ -2611,8 +2621,7 @@ class DownloaderBot:
                                          f"{sections_text(sections)}: {reason}.")
             return
         keys = await self.dm_titles(peer)
-        token = secrets.token_hex(4)
-        self.auto_tokens[uid] = token
+        token = self.apitera_token(uid)
         self.latest_panels[uid] = LatestPanel(peer, getattr(notice, "id", 0), token, items,
                                               sections, 1, words=words)
         await self.safe_edit(notice, self.search_panel_text(uid, items, keys, words, sections,

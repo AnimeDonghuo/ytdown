@@ -729,6 +729,24 @@ class AutoStatusTests(BotCase):
         self.assertLess(first, second)
         self.assertEqual([kind for kind, _ in order].count("lookup"), 2)
 
+    async def test_a_panel_button_keeps_working_after_another_panel_opens(self):
+        """Both /auto and /latest hand out the same token, so neither goes stale."""
+        notice = SimpleNamespace(id=21, edit=AsyncMock())
+        await self.service.handle_auto(self.event(), "/auto")
+        token = self.service.auto_tokens[7]
+        with patch("ytdown.bot.fetch_parciv_catalogue",
+                   new=AsyncMock(return_value=CataloguePage("movies", 1,
+                                                            parse_catalogue(MOVIES, "movies")))):
+            await self.service.handle_latest(self.event(notice=notice), "/latest movies")
+        self.assertEqual(self.service.auto_tokens[7], token)  # Unchanged, not re-minted.
+        click = SimpleNamespace(sender_id=7, data=f"a:{token}:now".encode(), is_private=True,
+                                message_id=21, answer=AsyncMock(), edit=AsyncMock(),
+                                get_input_chat=AsyncMock(return_value="peer"))
+        self.service.auto_peers[7] = "peer"
+        self.service.run_auto_check = AsyncMock(return_value="Nothing new: 0 listed title(s).")
+        await self.service.callback(click)
+        self.assertEqual(click.answer.call_args.args[0], "Checking now…")  # Not "expired".
+
     async def test_a_watcher_check_while_a_batch_runs_queues_nothing(self):
         job = Job(7, "peer", 21, Source("parciv", PARCIV_API_URL), ("All",), None,
                   parciv=ParcivBatch(items=(movie_item(),)))
