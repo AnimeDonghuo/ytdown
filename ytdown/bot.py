@@ -50,18 +50,19 @@ from .social import (MAX_SOCIAL_LINKS, SOCIAL_API_URL, SOCIAL_HOSTS, SocialBatch
                      parse_social_source, social_choices, social_source)
 from .parciv import (AUTO_SECTIONS, DM_SCAN_LIMIT, MAX_AUTO_LIMIT, MAX_PARCIV_BYTES, PARCIV_API_URL,
                      PARCIV_SECTIONS, PARCIV_STREAM_SECTIONS, ParcivApi, ParcivError, ParcivItem,
-                     ParcivMedia,
-                     ParcivSource, brief, download_parciv, family_base, file_title,
+                     ParcivMedia, ParcivSource, brief, download_parciv, family_base, file_title,
                      is_downloadable_url, is_parciv_media_endpoint, leech_link_file,
-                     leech_link_media, matches_words,
-                     parse_catalogue, parse_detail, parse_parciv_source, parse_post, parse_sections,
-                     parse_stream, pick_media, search_url_for, title_variants)
+                     link_media, matches_words, media_sources_anywhere,
+                     merged_media, parse_catalogue, parse_detail, parse_parciv_source, parse_post,
+                     parse_sections, parse_stream, pick_media, quality_label, search_url_for,
+                     title_variants)
 from .apitera import (AUTO_INTERVAL_DEFAULT, AUTO_INTERVAL_MIN, CataloguePage, ParcivBatch,
                       already_uploaded, interval_text, limit_text, listing_lines, new_items,
                       describe_payload, normalise_sections, parse_interval, parse_limit,
                       parse_search, past_titles, sections_text, SEARCH_SECTIONS)
 from .metrics import ContainerMetrics, human_size
-from .media import MediaProbe, thumbnail_jpeg, usable_still
+from .media import (MediaInfo, MediaProbe, file_preview_jpeg, probe_file, thumbnail_jpeg,
+                    usable_still)
 from .proxy import (CHECK_TARGETS, KNOWN_TARGETS, MAX_PROXIES, MIN_LATENCY_MS, SERVICE_KEYS, TOO_FAST,
                     CheckResult, CheckStats, CheckTarget, Proxy, ProxyPool, ProxyRouter, ProxyState,
                     export_text, parse_proxies, parse_proxy_marks, proxy_fault, resolve_targets,
@@ -3759,28 +3760,46 @@ class DownloaderBot:
             summary += f" {failed} failed ({' · '.join(reasons[:4])})."
         await self.progress(job, summary, force=True)
 
-    async def parciv_media(self, uid: int, api: ParcivApi, item: ParcivItem) -> ParcivMedia:
-        """One item's media, with the detail call first so the name is the API's own."""
+    @staticmethod
+    def item_sources(item: ParcivItem) -> tuple[ParcivSource, ...]:
+        """Every file link this listing entry carries — one source per file it listed."""
         own = item.extra.get("media_url", "")
-        if own and is_downloadable_url(own):
-            # The listing (or a leech link) handed over the file itself: no lookup.
-            return leech_link_media(own, item)
-        inline = item.extra.get("raw")
-        if isinstance(inline, dict):
-            try:
-                # Some listings carry their media list inline (servers/videos/…).
-                return parse_post(inline, item)
-            except (ParcivError, ValueError):
-                pass
+        raw = item.extra.get("raw")
+        sources = tuple(item.extra.get("media_sources") or ())
+        if not sources and isinstance(raw, dict):
+            sources = media_sources_anywhere(raw)
+        if not sources and own and is_downloadable_url(own):
+            sources = (ParcivSource(label=quality_label(leech_link_file(own) or own), url=own),)
+        return tuple(source for source in sources if is_downloadable_url(source.url))
+
+    async def parciv_media(self, uid: int, api: ParcivApi, item: ParcivItem) -> ParcivMedia:
+        """One item's media: the API's own answer, with the listing's own links kept too."""
+        sources = self.item_sources(item)
+        own = tuple(source.url for source in sources)
+        stream_section = item.section in PARCIV_STREAM_SECTIONS
         session = self.http_for(uid)
-        try:
-            if item.section not in PARCIV_STREAM_SECTIONS:
+        if own and not (stream_section and item.subject_id):
+            # A leech link, or a listing that handed its file over with no id to look up:
+            # download exactly those files — no lookup call at all.
+            return link_media(own, item)
+        if not stream_section:
+            try:
                 item = await fetch_parciv_item(session, api, item)
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
-            # The catalogue name is good enough to upload under; the stream call is next.
-            LOG.info("apitera detail for %s failed (%s); using the catalogue name", item.title,
-                     type(exc).__name__)
-        return await fetch_parciv_media(session, api, item)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+                # The catalogue name is good enough to upload under; the stream call is next.
+                LOG.info("apitera detail for %s failed (%s); using the catalogue name", item.title,
+                         type(exc).__name__)
+            return await fetch_parciv_media(session, api, item)
+        try:
+            # The API's own answer for this title: every quality it lists, its cover and
+            # its duration. The links the listing handed over are kept as extra qualities.
+            return merged_media(await fetch_parciv_media(session, api, item), sources)
+        except ParcivError:
+            if not own:
+                raise
+            LOG.info("apitera lookup for %s found nothing; using the listing's own links",
+                     item.title)
+            return link_media(own, item)
 
     async def send_parciv_file(self, job: Job, media: ParcivMedia, source: ParcivSource,
                                path: str, tmpdir: str) -> None:
@@ -3799,6 +3818,18 @@ class DownloaderBot:
         duration = media.duration or source.duration
         thumb = (await thumbnail_jpeg(self.http_for(job.user_id), media.poster)
                  if media.poster else None)
+        info = MediaInfo()
+        if not duration or not thumb:
+            # A link-only entry carries no duration and no cover of its own, so the file
+            # that was just downloaded answers for both: its real length and a frame of it.
+            info = await probe_file(final)
+            duration = duration or info.duration
+            if not thumb:
+                frame = await file_preview_jpeg(final, info.duration)
+                if frame:
+                    thumb = frame
+                    LOG.info("Prepared a frame thumbnail for %s (%d bytes)", media.title,
+                             len(frame[0]))
         thumb_file = None
         if thumb:
             thumb_file = io.BytesIO(thumb[0])
@@ -3815,8 +3846,9 @@ class DownloaderBot:
             job.peer, final, caption=media_name(title, source.label, 750), parse_mode=None,
             mime_type="video/webm" if suffix == ".webm" else "video/mp4", supports_streaming=True,
             thumb=thumb_file,
-            attributes=[types.DocumentAttributeVideo(duration=duration, w=source.width or 1280,
-                                                     h=source.height or 720, supports_streaming=True)],
+            attributes=[types.DocumentAttributeVideo(
+                duration=duration, w=source.width or info.width or 1280,
+                h=source.height or info.height or 720, supports_streaming=True)],
             progress_callback=on_upload)
         LOG.info("Sent apitera %s %s (%d bytes, cover %s)", media.title, source.label,
                  job.total_bytes, "yes" if thumb else "no")

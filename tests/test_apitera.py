@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +15,7 @@ from ytdown.apitera import SEARCH_SECTIONS, CataloguePage, ParcivBatch, parse_se
 from ytdown.bot import (DEFAULT_APIS, DownloaderBot, Job, MODE_LABELS, is_media_link,
                         normalize_api_endpoint)
 from ytdown.core import Source
+from ytdown.media import MediaInfo
 from ytdown.parciv import (PARCIV_API_URL, ParcivApi, ParcivError, ParcivItem, ParcivMedia,
                            ParcivSource, parse_catalogue)
 from tests.test_parciv import MOVIES
@@ -432,6 +434,28 @@ class DebugTests(BotCase):
         self.assertIn("HTTP 200", notice.edit.call_args.args[0])
 
 
+class ProbeHelperTests(unittest.IsolatedAsyncioTestCase):
+    """The file-level ffprobe/ffmpeg helpers, and their quiet behaviour without them."""
+
+    async def test_without_ffmpeg_on_the_host_they_say_nothing_and_return_nothing(self):
+        from ytdown import media as media_module
+        path = os.path.join(tempfile.mkdtemp(prefix="ytdown-test-"), "clip.mp4")
+        with open(path, "wb") as handle:
+            handle.write(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 1024)
+        with patch.object(media_module.shutil, "which", return_value=None):
+            self.assertEqual(await media_module.probe_file(path), MediaInfo())
+            self.assertIsNone(await media_module.file_preview_jpeg(path))
+        self.assertEqual(await media_module.probe_file("/does/not/exist.mp4"), MediaInfo())
+
+    async def test_an_ffprobe_answer_becomes_a_duration_and_a_frame_size(self):
+        from ytdown.media import parse_probe
+        answer = (b'{"streams": [{"width": 640, "height": 360, "duration": "95.400000"}],'
+                  b' "format": {"duration": "95.400000"}}')
+        self.assertEqual(parse_probe(answer), MediaInfo(95, 640, 360))
+        self.assertEqual(parse_probe(b"not json at all"), MediaInfo())
+        self.assertEqual(parse_probe(b""), MediaInfo())
+
+
 class JsonAnswerTests(unittest.IsolatedAsyncioTestCase):
     """An HTML answer from a wrong call shape must be recognisable, not a bare error."""
 
@@ -530,6 +554,97 @@ class RunParcivTests(BotCase):
         self.assertEqual(first.kwargs["attributes"][0].duration, 5800)
         self.assertEqual(first.kwargs["attributes"][0].h, 360)
         self.assertIn("Uploaded 2 file(s)", self.service.progress.call_args.args[1])
+
+    async def test_a_listing_entry_with_several_qualities_uploads_them_all(self):
+        links = ("http://santol.whatbox.ca:29318/KuangWang2/06-360p.mp4",
+                 "http://santol.whatbox.ca:29318/KuangWang2/06-480p.mp4",
+                 "http://santol.whatbox.ca:29318/KuangWang2/06-720p.mp4")
+        item = ParcivItem(subject_id="", name="Kuang Wang 2", section="donghua",
+                          extra={"media_sources": tuple(ParcivSource(quality, url)
+                                                       for quality, url in
+                                                       zip(("360p", "480p", "720p"), links))})
+        batch = ParcivBatch(items=(item,), check_dm=False)
+        job = await self.job(batch)
+        with patch("ytdown.bot.download_parciv", new=self.fake_download), \
+                patch("ytdown.bot.thumbnail_jpeg", new=AsyncMock(return_value=None)):
+            await self.service.run_parciv(job)
+        self.assertEqual([url for url, _ in self.downloaded], list(links))
+        self.assertEqual(self.client.send_file.await_count, 3)
+        self.assertIn("480p", self.client.send_file.call_args_list[1].args[1])
+        self.assertIn("Uploaded 3 file(s)", self.service.progress.call_args.args[1])
+
+    async def test_a_catalogue_title_keeps_the_apis_qualities_and_the_listings_link(self):
+        link = "http://santol.whatbox.ca:29318/KuangWang2/06-360p.mp4"
+        item = ParcivItem(subject_id="7788", name="Kuang Wang 2", section="donghua",
+                          extra={"media_url": link})
+        api = ParcivApi(PARCIV_API_URL)
+        better = ParcivMedia(title="Kuang Wang 2", poster="https://pbcdnw.aoneroom.com/k.jpg",
+                             duration=1400,
+                             sources=(ParcivSource("480p", "http://santol.whatbox.ca:29318/06-480p.mp4"),
+                                      ParcivSource("1080p", "http://santol.whatbox.ca:29318/06-1080p.mp4")))
+        with patch("ytdown.bot.fetch_parciv_media", new=AsyncMock(return_value=better)) as lookup:
+            media = await self.service.parciv_media(7, api, item)
+        lookup.assert_awaited()  # A title with an id is looked up: it knows the qualities.
+        self.assertEqual([source.label for source in media.sources], ["480p", "1080p", "360p"])
+        self.assertEqual(media.duration, 1400)
+        self.assertEqual(media.poster, "https://pbcdnw.aoneroom.com/k.jpg")
+
+    async def test_a_lookup_that_finds_nothing_still_uses_the_listings_link(self):
+        link = "http://santol.whatbox.ca:29318/KuangWang2/06-360p.mp4"
+        item = ParcivItem(subject_id="7788", name="Kuang Wang 2", section="donghua",
+                          extra={"media_url": link})
+        with patch("ytdown.bot.fetch_parciv_media",
+                   new=AsyncMock(side_effect=ParcivError("nothing there"))):
+            media = await self.service.parciv_media(7, ParcivApi(PARCIV_API_URL), item)
+        self.assertEqual([(source.label, source.url) for source in media.sources], [("360p", link)])
+
+    async def test_a_leech_link_is_never_looked_up(self):
+        link = "https://api.parciv.workers.dev/donghua/stream?url=http%3A%2F%2Fsantol.whatbox.ca" \
+               "%3A29318%2F2026%2FDonghua%2FKuangWang2%2F06-480p.mp4"
+        item = ParcivItem(subject_id="", name="KuangWang2 06", section="donghua",
+                          extra={"media_url": link})
+        with patch("ytdown.bot.fetch_parciv_media", new=AsyncMock()) as lookup:
+            media = await self.service.parciv_media(7, ParcivApi(PARCIV_API_URL), item)
+        lookup.assert_not_awaited()
+        self.assertEqual([(source.label, source.url) for source in media.sources], [("480p", link)])
+
+    async def test_a_title_with_no_durationor_cover_reads_them_fromthe_file(self):
+        media = ParcivMedia(title="Kuang Wang 2", sources=(ParcivSource("360p", "http://x/y.mp4"),))
+        batch = ParcivBatch(items=(ParcivItem(subject_id="", name="Kuang Wang 2",
+                                             section="donghua"),), check_dm=False)
+        job = await self.job(batch)
+        tmpdir = tempfile.mkdtemp(prefix="ytdown-test-")
+        path = os.path.join(tmpdir, "stream.mp4")
+        with open(path, "wb") as handle:
+            handle.write(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * (2 * 1024 * 1024))
+        jpeg = (b"\xff\xd8frame", 320, 180)
+        with patch("ytdown.bot.probe_file",
+                   new=AsyncMock(return_value=MediaInfo(duration=95, width=640, height=360))), \
+                patch("ytdown.bot.file_preview_jpeg", new=AsyncMock(return_value=jpeg)), \
+                patch("ytdown.bot.thumbnail_jpeg", new=AsyncMock(return_value=None)):
+            await self.service.send_parciv_file(job, media, media.sources[0], path, tmpdir)
+        sent = self.client.send_file.call_args
+        self.assertEqual(sent.kwargs["attributes"][0].duration, 95)   # Not 0:00 any more.
+        self.assertEqual((sent.kwargs["attributes"][0].w, sent.kwargs["attributes"][0].h),
+                         (640, 360))
+        self.assertEqual(sent.kwargs["thumb"].getvalue(), jpeg[0])    # A frame, as a cover.
+
+    async def test_an_api_cover_and_duration_are_left_alone(self):
+        media = movie_media()
+        batch = ParcivBatch(items=(movie_item(),), check_dm=False)
+        job = await self.job(batch)
+        tmpdir = tempfile.mkdtemp(prefix="ytdown-test-")
+        path = os.path.join(tmpdir, "stream.mp4")
+        with open(path, "wb") as handle:
+            handle.write(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * (2 * 1024 * 1024))
+        with patch("ytdown.bot.probe_file", new=AsyncMock()) as probe, \
+                patch("ytdown.bot.file_preview_jpeg", new=AsyncMock()) as frame, \
+                patch("ytdown.bot.thumbnail_jpeg",
+                      new=AsyncMock(return_value=(b"\xff\xd8cover", 640, 360))):
+            await self.service.send_parciv_file(job, media, media.sources[0], path, tmpdir)
+        probe.assert_not_awaited()   # The API already said both: no ffmpeg work at all.
+        frame.assert_not_awaited()
+        self.assertEqual(self.client.send_file.call_args.kwargs["attributes"][0].duration, 5800)
 
     async def test_only_the_chosen_qualities_are_sent(self):
         batch = ParcivBatch(items=(movie_item(),), qualities=("1080p",), check_dm=False)

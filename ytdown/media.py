@@ -5,6 +5,7 @@ import asyncio
 import io
 import json
 import logging
+import shutil
 import tempfile
 from collections import deque
 from dataclasses import dataclass
@@ -79,20 +80,7 @@ class MediaProbe:
                     process.kill()
                     await process.communicate()
                     return MediaInfo()
-            if process.returncode != 0 or len(stdout) > 64 * 1024:
-                return MediaInfo()
-            info = json.loads(stdout)
-            stream = (info.get("streams") or [{}])[0]
-            width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
-            rotation = (stream.get("tags") or {}).get("rotate", 0)
-            for side_data in stream.get("side_data_list") or []:
-                rotation = side_data.get("rotation", rotation)
-            if int(float(rotation)) % 180:
-                width, height = height, width
-            duration = float((info.get("format") or {}).get("duration") or stream.get("duration") or 0)
-            if not (0 < width <= 16384 and 0 < height <= 16384):
-                width = height = 0
-            return MediaInfo(int(duration) if 0 < duration < 7 * 86400 else 0, width, height)
+            return parse_probe(stdout)
         except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
             LOG.info("Could not probe media metadata: %s", exc)
             return MediaInfo()
@@ -182,6 +170,99 @@ def jpeg_preview(data: bytes) -> tuple[bytes, int, int] | None:
         return None
     except (OSError, ValueError, UnidentifiedImageError, Image.DecompressionBombError):
         return None
+
+
+def parse_probe(stdout: bytes) -> MediaInfo:
+    """ffprobe's JSON answer as a MediaInfo (zeroes when it cannot be read)."""
+    if not stdout or len(stdout) > 64 * 1024:
+        return MediaInfo()
+    try:
+        info = json.loads(stdout)
+    except ValueError:
+        return MediaInfo()
+    if not isinstance(info, dict):
+        return MediaInfo()
+    stream = (info.get("streams") or [{}])[0]
+    width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
+    rotation = (stream.get("tags") or {}).get("rotate", 0)
+    for side_data in stream.get("side_data_list") or []:
+        rotation = side_data.get("rotation", rotation)
+    if int(float(rotation)) % 180:
+        width, height = height, width
+    duration = float((info.get("format") or {}).get("duration") or stream.get("duration") or 0)
+    if not (0 < width <= 16384 and 0 < height <= 16384):
+        width = height = 0
+    return MediaInfo(int(duration) if 0 < duration < 7 * 86400 else 0, width, height)
+
+
+def media_tool(name: str) -> str:
+    """The ffmpeg/ffprobe binary this host has, if any."""
+    return shutil.which(name) or ""
+
+
+async def probe_file(path: str | Path, *, timeout: float = 15) -> MediaInfo:
+    """ffprobe one file already on disk: its duration and frame size.
+
+    The API's own numbers are used when it gave any; a source that came from a bare
+    link has none, and this is what keeps the upload from showing "0:00". Without
+    ffprobe on the host the file is uploaded, its length just stays unknown.
+    """
+    binary = media_tool("ffprobe")
+    if not binary or not path or not Path(path).exists():
+        return MediaInfo()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            binary, "-v", "error", "-threads", "1", "-probesize", "8388608",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration:stream_tags=rotate:"
+                             "stream_side_data=rotation:format=duration",
+            "-of", "json", str(path), stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            return MediaInfo()
+    except OSError as exc:
+        LOG.info("Could not probe %s: %s", path, exc)
+        return MediaInfo()
+    return parse_probe(stdout) if process.returncode == 0 else MediaInfo()
+
+
+async def file_preview_jpeg(path: str | Path, duration: int = 0,
+                            *, timeout: float = 20) -> tuple[bytes, int, int] | None:
+    """One frame of a video on disk, as a Telegram JPEG.
+
+    These families ship no cover for their link-only entries (and Telegram then shows
+    a blank tile), so the video's own frame is used instead — the same thing the
+    Terabox mode does with a decoded sample.
+    """
+    binary = media_tool("ffmpeg")
+    if not binary or not path or not Path(path).exists():
+        return None
+    at = min(3.0, max(0.0, (duration or 10) * 0.25))  # A quarter in, but never past 3s.
+    try:
+        process = await asyncio.create_subprocess_exec(
+            binary, "-v", "error", "-threads", "1", "-ss", f"{at:.2f}", "-i", str(path),
+            "-an", "-sn", "-frames:v", "1",
+            "-vf", "scale=320:320:force_original_aspect_ratio=decrease",
+            "-vcodec", "mjpeg", "-f", "image2pipe", "pipe:1",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        try:
+            image, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            return None
+        except asyncio.CancelledError:
+            process.kill()
+            await process.communicate()
+            raise
+    except OSError as exc:
+        LOG.info("Could not prepare a frame thumbnail: %s", exc)
+        return None
+    return jpeg_preview(image) if process.returncode == 0 else None
 
 
 async def thumbnail_jpeg(session: aiohttp.ClientSession, url: str) -> tuple[bytes, int, int] | None:

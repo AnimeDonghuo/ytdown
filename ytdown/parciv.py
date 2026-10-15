@@ -409,6 +409,28 @@ def leech_link_media(url: str, item: "ParcivItem") -> ParcivMedia:
                        subject_id=item.subject_id)
 
 
+def merged_media(media: ParcivMedia, sources: Iterable[ParcivSource]) -> ParcivMedia:
+    """`media` with every source it does not already list added (by URL).
+
+    The API's own answer for a title and the links its listing handed over are both
+    kept: each one is a file, and a quality that is only in one of them would
+    otherwise be lost.
+    """
+    known = {source.url for source in media.sources}
+    extra = tuple(source for source in sources if source.url and source.url not in known)
+    return replace(media, sources=media.sources + extra) if extra else media
+
+
+def link_media(urls: Iterable[str], item: "ParcivItem") -> ParcivMedia:
+    """The media of one or more direct file links: one source per link, no lookup call."""
+    links = tuple(dict.fromkeys(str(url) for url in urls if url))
+    if not links:
+        raise ParcivError("That link names no downloadable file.")
+    rest = tuple(ParcivSource(label=quality_label(leech_link_file(url) or url), url=url)
+                 for url in links[1:])
+    return merged_media(leech_link_media(links[0], item), rest)
+
+
 def matches_words(title: object, words: str) -> bool:
     """True when every word of a search query appears in this title.
 
@@ -1066,6 +1088,13 @@ def item_from_dict(raw: dict, section: str, api: "ParcivApi | None" = None) -> P
     if not subject_id:
         return None
     year = _text(first(raw, "year", "release_year", "releaseYear", "released"), 8)
+    # Every file this entry carries: a listing that gives several qualities is kept whole
+    # instead of downloading whichever link happened to be first.
+    files = tuple(source for source in (media_sources(raw) or media_sources_anywhere(raw))
+                  if is_downloadable_url(source.url))
+    if not files and own_media:
+        files = (ParcivSource(label=quality_label(leech_link_file(own_media) or own_media),
+                              url=own_media),)
     extra = {key: _text(raw.get(key), 60) for key in
              ("postId", "post_id", "episodeId", "id", "subjectId") if raw.get(key) not in (None, "")}
     if slug:
@@ -1074,13 +1103,16 @@ def item_from_dict(raw: dict, section: str, api: "ParcivApi | None" = None) -> P
         extra["url"] = post_url  # Some builds answer /post?url=<their own link>.
     if own_media:
         extra["media_url"] = own_media  # The listing handed the file itself over.
+    if files:
+        extra["media_sources"] = files  # …and these are all its files, one source each.
     extra["raw"] = raw  # Kept whole: many listings carry the media list inline.
     return ParcivItem(
         subject_id=subject_id,
         name=name,
         section=section,
         year=year if re.fullmatch(r"(?:19|20)\d{2}", year or "") else "",
-        poster=url_value(raw, "poster", "image", "thumbnail", "cover", "posterUrl"),
+        poster=url_value(raw, "poster", "image", "thumbnail", "cover", "posterUrl",
+                         "coverUrl", "cover_url", "imageUrl", "thumbnailUrl", "img"),
         episode=episode_label(raw),
         summary=_text(first(raw, "desc", "description", "synopsis", "overview", "summary"), 900),
         langs=media_langs(raw),

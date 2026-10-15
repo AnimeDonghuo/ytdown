@@ -13,6 +13,7 @@ from ytdown.dailymotion import DownloadCancelled
 from ytdown.apitera import (already_uploaded, listing_lines, new_items, parse_interval, parse_limit,
                             past_titles, interval_text)
 from ytdown.parciv import (AUTO_SECTIONS, PARCIV_API_URL, ParcivApi, ParcivError, ParcivItem,
+                           ParcivSource, link_media, merged_media,
                             family_base, matches_words, search_url,  # noqa: F401 (used below)
                            download_parciv, download_with_ytdlp, is_parciv_media_endpoint,
                            leech_parciv, leech_url, media_url, message_titles, public_media_url,
@@ -598,6 +599,36 @@ class StreamLinkTests(unittest.TestCase):
             parse_post({"videos": [{"title": "Another Show", "url": other},
                                    {"title": "Third Show", "url": other}]}, item)
         self.assertIn("lists no entry for Kuang Wang 2", str(caught.exception))
+
+    def test_every_quality_a_listing_entry_carries_is_kept(self):
+        api = ParcivApi(PARCIV_API_URL)
+        cdn = "http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/"
+        raw = {"title": "Kuang Wang 2", "id": "7788", "episode": "Episode 06",
+               "qualities": [{"url": cdn + "06-360p.mp4", "resolution": "360p"},
+                             {"url": cdn + "06-480p.mp4", "resolution": "480p"},
+                             {"url": self.LINK}]}
+        item = item_from_dict(raw, "donghua", api)
+        self.assertEqual([source.url for source in item.extra["media_sources"]],
+                         [cdn + "06-360p.mp4", cdn + "06-480p.mp4", self.LINK])
+        self.assertEqual([source.label for source in item.extra["media_sources"]],
+                         ["360p", "480p", "360p"])  # The leech link's own file names it.
+        # …and the same entry as one source per link, in order, no lookup needed.
+        media = link_media((cdn + "06-360p.mp4", cdn + "06-480p.mp4"), item)
+        self.assertEqual([(source.label, source.url) for source in media.sources],
+                         [("360p", cdn + "06-360p.mp4"), ("480p", cdn + "06-480p.mp4")])
+        self.assertEqual(media.title, "Kuang Wang 2")
+        with self.assertRaises(ParcivError):
+            link_media((), item)
+
+    def test_merging_keeps_the_apis_own_answers_and_the_listings_links(self):
+        item = ParcivItem(subject_id="7788", name="Kuang Wang 2", section="donghua")
+        first = "http://santol.whatbox.ca:29318/KuangWang2/06-360p.mp4"
+        second = "http://santol.whatbox.ca:29318/KuangWang2/06-480p.mp4"
+        media = merged_media(leech_link_media(first, item),
+                             (ParcivSource("360p", first), ParcivSource("480p", second)))
+        self.assertEqual([source.url for source in media.sources], [first, second])
+        # Nothing new means the same object, so callers can compare cheaply.
+        self.assertIs(merged_media(media, (ParcivSource("360p", first),)), media)
 
     def test_an_answer_of_unknown_shape_still_yields_its_files(self):
         from ytdown.parciv import media_sources_anywhere, parse_post
