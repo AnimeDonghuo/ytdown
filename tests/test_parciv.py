@@ -18,9 +18,10 @@ from ytdown.parciv import (AUTO_SECTIONS, PARCIV_API_URL, ParcivApi, ParcivError
                            download_parciv, download_with_ytdlp, is_parciv_media_endpoint,
                            leech_parciv, leech_url, media_url, message_titles, public_media_url,
                            normalize_section, parse_catalogue, parse_detail, parse_parciv_source,
-                           parse_post, parse_sections, parse_stream, pick_media, quality_label,
-                           file_title, item_from_dict, json_media_link, leech_link_media,
-                           media_file_url, size_of, source_from_dict, title_key, titles_match)
+                           parse_post, parse_sections, parse_stream, pick_media, post_video_sources,
+                           quality_label, file_title, item_from_dict, json_media_link,
+                           leech_link_media, media_file_url, size_of, source_from_dict, title_key,
+                           titles_match, search_url_for, episode_from_title)
 
 # The real answers, trimmed: /moviebox/movies page 1 and /moviebox/stream?id=….
 MOVIES = {"page": 1, "results": [
@@ -126,6 +127,29 @@ class CatalogueTests(unittest.TestCase):
         self.assertEqual(items[0].subject_id, "dong-1")
         self.assertEqual(items[0].langs, ("Indonesian",))
         self.assertEqual(items[0].kind, "Donghua")
+
+    def test_moviebox_sections_envelope_is_flattened(self):
+        # The builder's Moviebox pages nest the titles one level down, inside each
+        # section's own items (banners, ranked lists). Every title is surfaced and
+        # the section banners themselves are never mistaken for titles.
+        payload = {"tabId": "MOVIE", "page": 1, "sections": [
+            {"type": "TV_OPS_BANNER", "title": None, "hasMore": False, "items": [
+                {"subjectId": "4595946777374883024", "name": "Ain", "year": "2026",
+                 "poster": "https://pbcdn.aoneroom.com/ain.jpg", "genre": "Horror"}]},
+            {"type": "TV_OPS_SUBJECT_LIST", "title": "Film Terpopuler Saat Ini", "hasMore": False,
+             "items": [
+                 {"subjectId": "6026412232966389904", "name": "Spider-Man: Hari Baru",
+                  "year": "2026", "poster": "https://pbcdnw.aoneroom.com/sp.jpg", "rating": "8.0"},
+                 {"subjectId": "3594709590157448016", "name": "Kung Fu Soccer", "year": "2026",
+                  "rating": "5.5"}]},
+        ]}
+        items = parse_catalogue(payload, "movies", ParcivApi(PARCIV_API_URL))
+        self.assertEqual([item.subject_id for item in items],
+                         ["4595946777374883024", "6026412232966389904", "3594709590157448016"])
+        self.assertEqual(items[0].title, "Ain (2026)")
+        self.assertEqual(items[1].title, "Spider-Man: Hari Baru (2026)")
+        self.assertEqual(items[2].title, "Kung Fu Soccer (2026)")
+        self.assertEqual(items[0].poster, "https://pbcdn.aoneroom.com/ain.jpg")
 
     def test_an_answer_without_entries_is_empty_not_an_error(self):
         self.assertEqual(parse_catalogue({"status": True, "data": {}}, "anime"), ())
@@ -240,6 +264,31 @@ class PostTests(unittest.TestCase):
         with self.assertRaises(ParcivError):
             parse_post({"data": {"title": "Nothing here"}})
 
+    def test_flat_video_urls_fan_out_to_one_source_per_quality(self):
+        # The builder's newer post shape is a flat record, one URL per quality,
+        # instead of a streams list.
+        post = {"video_title": "Naruto Eps 01",
+                "video_url": "http://melon.example.ca:29318/Naruto/001.mkv",
+                "video_url_minihd": "",
+                "video_url_hd": "http://skathi.example.ca:29318/Naruto/1.mp4",
+                "video_url_fullhd": "http://rambutan.example.ca:29318/NarutoFHD/1.mp4",
+                "video_url_eng": "",
+                "video_url_hdeng": ""}
+        sources = post_video_sources(post)
+        self.assertEqual([source.label for source in sources], ["360p", "720p", "1080p"])
+        self.assertEqual(sources[0].url, "http://melon.example.ca:29318/Naruto/001.mkv")
+
+    def test_a_post_wrapped_in_a_post_object_is_unwrapped(self):
+        # The whole answer wraps the flat record in `post: {…}`.
+        payload = {"status": "ok", "post": {
+            "video_title": "Kuang Wang 2 Eps 06",
+            "video_url": "http://melon.example.ca:29318/KuangWang2/06-360p.mp4",
+            "video_url_hd": "http://skathi.example.ca:29318/KuangWang2/06-720p.mp4"},
+            "items": []}
+        media = parse_post(payload)
+        self.assertEqual(media.title, "Kuang Wang 2 Eps 06")
+        self.assertEqual([source.label for source in media.sources], ["360p", "720p"])
+
 
 class TitleMatchTests(unittest.TestCase):
     def test_a_catalogue_name_matches_an_uploaded_file(self):
@@ -253,6 +302,15 @@ class TitleMatchTests(unittest.TestCase):
     def test_a_short_common_start_does_not_match(self):
         self.assertFalse(titles_match("Paw", "Paw Patrol The Movie [360p].mp4"))
         self.assertEqual(title_key("A_ B"), "a b")
+
+    def test_the_episode_number_is_read_from_the_title(self):
+        # The builder's search rows carry no episode field; the number is in the
+        # title. It is recovered for the picker's row label and numeric order.
+        self.assertEqual(episode_from_title("Kuang Wang 2 Eps 06"), (6, "Eps 6"))
+        self.assertEqual(episode_from_title("Boruto Eps 1130"), (1130, "Eps 1130"))
+        self.assertEqual(episode_from_title("Some Series Episode 3"), (3, "Eps 3"))
+        self.assertEqual(episode_from_title("No number here"), (0, ""))
+        self.assertEqual(episode_from_title(""), (0, ""))
 
     def test_message_titles_reads_the_file_name_and_the_caption(self):
         message = stored_file("One Piece [Hindi] [720p].mp4", "One Piece Episode 1130")
@@ -279,7 +337,14 @@ class ApiUrlTests(unittest.TestCase):
                          "https://api.parciv.workers.dev/moviebox/"):
             api = ParcivApi(endpoint)
             self.assertEqual(api.section("movies"), "https://api.parciv.workers.dev/moviebox/movies?page=1")
-            self.assertEqual(api.section("anime"), "https://api.parciv.workers.dev/anime/latest")
+            # The builder's ``/latest`` answers one series per page, so the
+            # listings use the multi-item-per-page endpoints: Anime ``/new``
+            # (~49 newest per page), Donghua ``/trending`` (its only paginated
+            # multi-item list; its ``/new`` is one series per page).
+            self.assertEqual(api.section("anime"),
+                             "https://api.parciv.workers.dev/anime/new?page=1")
+            self.assertEqual(api.section("donghua"),
+                             "https://api.parciv.workers.dev/donghua/trending?page=1")
             self.assertEqual(api.stream("42"), "https://api.parciv.workers.dev/moviebox/stream?id=42")
             self.assertEqual(api.detail("42"), "https://api.parciv.workers.dev/moviebox/detail?subjectId=42")
 
@@ -1084,21 +1149,35 @@ class SearchTests(unittest.TestCase):
 
     def test_a_family_search_uses_that_family_base(self):
         api = ParcivApi(PARCIV_API_URL)
+        # Moviebox and Donghua read ``q``; Anime is the odd one out and reads
+        # ``query``. The new apitera builder ignores the other parameter.
         self.assertEqual(search_url(api, "movies", "paw patrol"),
-                         "https://api.parciv.workers.dev/moviebox/search?query=paw%20patrol")
+                         "https://api.parciv.workers.dev/moviebox/search?q=paw%20patrol")
         self.assertEqual(search_url(api, "tvshows", "the office"),
-                         "https://api.parciv.workers.dev/moviebox/search?query=the%20office")
+                         "https://api.parciv.workers.dev/moviebox/search?q=the%20office")
         self.assertEqual(search_url(api, "anime", "one piece 1130"),
                          "https://api.parciv.workers.dev/anime/search?query=one%20piece%201130")
         self.assertEqual(search_url(api, "donghua", "battle through"),
-                         "https://api.parciv.workers.dev/donghua/search?query=battle%20through")
+                         "https://api.parciv.workers.dev/donghua/search?q=battle%20through")
 
     def test_a_users_own_endpoint_keeps_its_own_base(self):
         api = ParcivApi("https://example.com/api/moviebox")
         self.assertEqual(family_base(api, "kids"), "https://example.com/api/moviebox")
         self.assertEqual(family_base(api, "anime"), "https://example.com/anime")
         self.assertEqual(search_url(api, "kids", "paw"),
-                         "https://example.com/api/moviebox/search?query=paw")
+                         "https://example.com/api/moviebox/search?q=paw")
+
+    def test_a_wider_search_page_appends_the_count(self):
+        # The builder's search does not paginate, so the per-series picker asks for
+        # a wide page; the default call stays a plain search.
+        self.assertEqual(search_url_for("https://api.parciv.workers.dev/donghua", "kuang wang"),
+                         "https://api.parciv.workers.dev/donghua/search?q=kuang%20wang")
+        self.assertEqual(search_url_for("https://api.parciv.workers.dev/donghua",
+                                        "kuang wang", count=100),
+                         "https://api.parciv.workers.dev/donghua/search?q=kuang%20wang&count=100")
+        self.assertEqual(search_url_for("https://api.parciv.workers.dev/anime",
+                                        "one piece", count=100),
+                         "https://api.parciv.workers.dev/anime/search?query=one%20piece&count=100")
 
     def test_every_word_has_to_appear_in_the_title(self):
         self.assertTrue(matches_words("PAW Patrol: The Dino Movie (2026)", "paw patrol"))

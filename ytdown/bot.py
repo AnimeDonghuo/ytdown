@@ -51,12 +51,12 @@ from .social import (MAX_SOCIAL_LINKS, SOCIAL_API_URL, SOCIAL_HOSTS, SocialBatch
 from .parciv import (AUTO_SECTIONS, DM_SCAN_LIMIT, MAX_AUTO_LIMIT, MAX_PARCIV_BYTES, PARCIV_API_URL,
                      PARCIV_SECTIONS, PARCIV_STREAM_SECTIONS, ParcivApi, ParcivError, ParcivItem,
                      ParcivMedia, ParcivSource, brief, download_parciv, family_base, file_title,
-                     find_dicts, is_downloadable_url, is_parciv_media_endpoint, item_from_dict,
-                     leech_link_file,
+                     is_downloadable_url, is_parciv_media_endpoint, leech_link_file,
                      link_media, matches_words, media_sources_anywhere,
-                     merged_media, parse_catalogue, parse_detail, parse_parciv_source, parse_post,
+                     episode_from_title, merged_media, parse_catalogue, parse_detail,
+                     parse_parciv_source, parse_post,
                      parse_sections, parse_stream, pick_media, quality_label, search_url_for,
-                     titles_match, title_variants)
+                     title_variants)
 from .apitera import (AUTO_INTERVAL_DEFAULT, AUTO_INTERVAL_MIN, CataloguePage, ParcivBatch,
                       already_uploaded, interval_text, limit_text, listing_lines, new_items,
                       describe_payload, normalise_sections, parse_interval, parse_limit,
@@ -90,7 +90,10 @@ RESET_WORDS = ("reset", "remove", "default")
 MAX_WAITING = 4
 MAX_SELECTIONS = 100
 SEARCH_LIMIT = 12  # How many matches one /search reply shows (and downloads at most).
-SEARCH_PAGES = 2  # Catalogue pages scanned per family when the API has no search call.
+SEARCH_PAGES = 5  # Catalogue pages scanned per family when the API has no search call.
+# The apitera builder's Anime and Donghua endpoints answer about 49 series
+# per page on ``/new``; a few pages is enough for the catalogue-scan fallback
+# to find a common word, and it is still cheap (one HTTP call per page).
 SESSION_SECONDS = 1800
 # Telegram clients limit uploads to 4,000 parts of 512 KiB (2,000 MiB).
 # 2,047 MiB would need 4,094 parts and can fail near the end of an upload.
@@ -547,10 +550,33 @@ def mega_wait_text(attempt: int, delay: int, attempts: int) -> str:
             f"idle and can take a minute to wake — waiting {delay}s and asking again…")
 
 
+PARCIV_RETRY_DELAYS = (1, 3)  # Seconds before the 2nd and 3rd attempts of an apitera read.
+
+
 async def fetch_parciv_json(session: aiohttp.ClientSession, url: str,
                            params: dict | None = None):
-    """One apitera endpoint (catalogue page, detail, stream or post) as JSON."""
-    return await fetch_json_api(session, url, "", MAX_PARCIV_BYTES, params=params or {})
+    """One apitera endpoint (catalogue page, detail, stream or post) as JSON.
+
+    The builder's upstream is flaky — it has been seen answering a catalogue
+    page with a truncated body (HTTP 200 that is not valid JSON) — so quick
+    transient failures are retried a couple of times before the read fails.
+    """
+    for attempt in range(len(PARCIV_RETRY_DELAYS) + 1):
+        try:
+            return await fetch_json_api(session, url, "", MAX_PARCIV_BYTES,
+                                        params=params or {})
+        except aiohttp.ClientResponseError as exc:
+            transient = exc.status in (408, 425, 429) or exc.status >= 500
+            reason = f"HTTP {exc.status}"
+        except (json.JSONDecodeError, ValueError) as exc:  # Non-JSON, or a truncated body.
+            transient, reason = True, type(exc).__name__
+        except aiohttp.ClientConnectionError as exc:
+            transient, reason = True, type(exc).__name__
+        if not transient or attempt == len(PARCIV_RETRY_DELAYS):
+            raise
+        LOG.info("apitera read attempt %d failed (%s); retrying in %ss", attempt + 1,
+                 reason, PARCIV_RETRY_DELAYS[attempt])
+        await asyncio.sleep(PARCIV_RETRY_DELAYS[attempt])
 
 
 async def fetch_parciv_catalogue(session: aiohttp.ClientSession, api: ParcivApi, section: str,
@@ -2711,6 +2737,10 @@ class DownloaderBot:
         A search call that answers with matches is believed; anything else (a
         refused call, an answer this API does not serve, no match at all) falls
         back to reading that family's catalogue pages and filtering them here.
+
+        Anime and Donghua answers are per-episode (``catId`` is the series id,
+        ``id`` is the episode id); the user wants one button per series, so the
+        results are collapsed on the series id before the reply.
         """
         session = self.http_for(uid)
         answered = False  # Whether this family has a search call at all.
@@ -2721,8 +2751,10 @@ class DownloaderBot:
                      sections_text(sections), type(exc).__name__)
         else:
             answered = True
-            found = tuple(item for item in parse_catalogue(payload, sections[0], api)
-                          if matches_words(item.title, words))
+            found = self._collapse_search_results(
+                tuple(item for item in parse_catalogue(payload, sections[0], api)
+                      if matches_words(item.title, words)),
+                sections[0])
             if found:
                 return found[:SEARCH_LIMIT], ""
         reads = await asyncio.gather(
@@ -2744,6 +2776,7 @@ class DownloaderBot:
                     continue
                 seen.add(key)
                 matches.append(item)
+        matches = self._collapse_search_results(matches, sections[0])
         if not matches and failed == len(reads):
             raise ParcivError(f"{sections_text(sections)} could not be read")
         note = ""
@@ -2753,6 +2786,44 @@ class DownloaderBot:
             if failed:
                 note += f" ({failed} read(s) failed)"
         return tuple(matches[:SEARCH_LIMIT]), note
+
+    @staticmethod
+    def _collapse_search_results(items: tuple[ParcivItem, ...],
+                                 section: str) -> list[ParcivItem]:
+        """One ParcivItem per series for Anime/Donghua, the input order otherwise.
+
+        The apitera builder's search answer lists every episode as its own
+        row; a search for "Naruto" returns 220 episode items. ``catId`` is the
+        series id, ``id`` is the episode id, ``series`` is the series name —
+        the first row we see for a series wins, and the series id is what the
+        episode picker scopes its rows on.
+        """
+        if section not in PARCIV_STREAM_SECTIONS:
+            return list(items)
+        seen: set[str] = set()
+        collapsed: list[ParcivItem] = []
+        for item in items:
+            cat = str(item.extra.get("catId") or "")
+            if not cat:
+                # An item without ``catId`` is already series-level (the
+                # catalogue page answers one row per series). Keep it as is.
+                key = item.subject_id or item.title
+                if key in seen:
+                    continue
+                seen.add(key)
+                collapsed.append(item)
+                continue
+            if cat in seen:
+                continue
+            seen.add(cat)
+            # Use the series name when the search answer gave one ("Naruto"
+            # beats "Naruto Eps 220" as the title the user picks). Fall back
+            # to the existing item name when the API did not.
+            series_name = str(item.extra.get("series") or "").strip()
+            display = series_name or item.name
+            collapsed.append(replace(item, subject_id=cat, name=display,
+                                     episode="", summary=item.summary or ""))
+        return collapsed
 
     async def search_catalogue(self, uid: int, api: ParcivApi, sections: tuple[str, ...],
                                words: str) -> tuple[tuple[ParcivItem, ...], tuple[str, ...]]:
@@ -3164,51 +3235,52 @@ class DownloaderBot:
                                             ParcivApi(self.api_for(uid, "parciv")), item,
                                             notice=event)
             return
-        # Donghua / Anime: try to read the per-title episode list.
+        # Donghua / Anime: read the per-title episode list. The apitera
+        # builder's per-series calls are not trustworthy — ``/post?id=…`` takes
+        # an episode id (not the series id) and its ``items`` are a suggested
+        # subset that can belong to another series, while ``/category?id=…``
+        # and ``/videos?subjectId=…`` are broken or unscoped. The one call that
+        # is really scoped is the family's own search: its rows carry ``catId``
+        # (the series), so we keep only the rows of this series and build the
+        # picker from them. A wide ``count`` asks for the whole series in one
+        # page (the builder does not paginate its search).
         api = ParcivApi(self.api_for(uid, "parciv"))
         session = self.http_for(uid)
         await event.answer(f"Reading {match.title}…")
         try:
-            payload = await fetch_parciv_json(session, api.videos_subject_id(match.section,
-                                                                              subject_id))
+            payload = await fetch_parciv_json(
+                session, search_url_for(family_base(api, match.section), match.name, count=100))
+            rows = list(parse_catalogue(payload, match.section, api))
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
             await self.safe_edit(event, f"Could not read {match.title} "
                                         f"({type(exc).__name__}).")
             return
-        try:
-            media = parse_post(payload, match)
-        except ParcivError as exc:
-            await self.safe_edit(event, f"{match.title}: {exc}")
-            return
-        # ``parse_post`` returned one ``ParcivMedia`` for the matched entry; its
-        # sources come from that single file. The episode picker wants every
-        # episode of the title, so re-read the same answer and pick every entry
-        # that shares this title.
-        entries = list(find_dicts(payload))
         episode_items: list[ParcivItem] = []
-        for raw in entries:
-            if not isinstance(raw, dict):
+        for row in rows:
+            if str(row.extra.get("catId") or "") != str(match.subject_id):
                 continue
-            try:
-                item = item_from_dict(raw, match.section, api)
-            except Exception:  # noqa: BLE001 — the reader is best-effort here.
-                continue
-            if item is None:
-                continue
-            if not titles_match(item.name, match.name):
-                continue
-            episode_items.append(item)
+            # The row's title carries the episode number ("… Eps 06"); recover
+            # it so the picker rows are labelled and sortable in order.
+            if not row.episode:
+                number, label = episode_from_title(row.name)
+                if label:
+                    row = replace(row, episode=label)
+            episode_items.append(row)
         if not episode_items:
-            # The catalogue returned no episodes (or the answer was a single entry
-            # the reader already collapsed). Fall back to the quality picker.
+            # The search did not answer with this series (the Anime endpoint
+            # ignores the query upstream). Fall back to the quality picker:
+            # its lookup ladder refuses an answer that names a different title
+            # rather than downloading it.
             item = ParcivItem(subject_id=match.subject_id, name=match.name,
                               section=match.section, year=match.year, poster=match.poster,
                               episode=match.episode, langs=match.langs, summary=match.summary,
                               extra=dict(match.extra))
             await self.parciv_item_selection(event, uid, panel.peer, api, item, notice=event)
             return
-        # Sort episodes by their episode label, so a button list reads in order.
-        episode_items.sort(key=lambda item: (item.episode or "", item.subject_id or ""))
+        # Numeric episode order (the label alone would sort "Eps 10" before
+        # "Eps 9"); the row id breaks ties.
+        episode_items.sort(key=lambda item: (episode_from_title(item.name)[0] or 10**9,
+                                             item.subject_id or ""))
         token = secrets.token_hex(4)
         self.auto_tokens[uid] = token
         self.episode_panels[uid] = EpisodePanel(peer=panel.peer,
@@ -3319,14 +3391,6 @@ class DownloaderBot:
                 await event.answer("Proxy panel expired. Send /proxy again.", alert=True)
                 return
             await self.proxy_action(event, uid, parts[2])
-            return
-        if parts[0] == "a":
-            if (not event.is_private or len(parts) != 3 or self.auto_tokens.get(uid) != parts[1]
-                    or parts[2] not in ("on", "off", "now", "latest", "go", "all")):
-                await event.answer("These apitera buttons expired. Send /auto or /latest again.",
-                                   alert=True)
-                return
-            await self.auto_action(event, uid, parts[2])
             return
         if parts[0] == "a":
             if (not event.is_private or len(parts) != 3 or self.auto_tokens.get(uid) != parts[1]
@@ -4138,14 +4202,26 @@ class DownloaderBot:
         return tuple(source for source in sources if is_downloadable_url(source.url))
 
     async def parciv_media(self, uid: int, api: ParcivApi, item: ParcivItem) -> ParcivMedia:
-        """One item's media: the API's own answer, with the listing's own links kept too."""
+        """One item's media: the API's own answer, with the listing's own links kept too.
+
+        An entry whose listing already handed over its files (a per-episode row of
+        the apitera builder's post answer carries one ``streams`` link per
+        quality) downloads exactly those — a lookup on top would fetch the same
+        files again under their direct CDN addresses and upload each quality
+        twice. The lookup is only for entries that carry an id but no file.
+        """
         sources = self.item_sources(item)
         own = tuple(source.url for source in sources)
         stream_section = item.section in PARCIV_STREAM_SECTIONS
         session = self.http_for(uid)
-        if own and not (stream_section and item.subject_id):
-            # A leech link, or a listing that handed its file over with no id to look up:
-            # download exactly those files — no lookup call at all.
+        if own and (len(own) > 1 or not (stream_section and item.subject_id)):
+            # A leech link, or a listing that handed over the whole quality list
+            # (a per-episode row, whose streams already are that episode's files):
+            # download exactly those — a lookup on top would fetch the same files
+            # again under their direct CDN addresses and upload each quality
+            # twice. A single listing link plus a stream-section id is the one
+            # case the lookup still earns its cost: the API knows the other
+            # qualities of that file.
             return link_media(own, item)
         if not stream_section:
             try:

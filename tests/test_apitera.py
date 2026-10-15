@@ -974,10 +974,11 @@ class SearchTests(BotCase):
         self.assertIn("🔁 Refresh", button_texts)
         urls = [call.args[1] for call in fetch.await_args_list]
         # One call per family: the six Moviebox sections share one search call.
+        # Moviebox and Donghua read ``q``; Anime reads ``query``.
         self.assertEqual(sorted(urls),
                          ["https://api.parciv.workers.dev/anime/search?query=paw%20patrol",
-                          "https://api.parciv.workers.dev/donghua/search?query=paw%20patrol",
-                          "https://api.parciv.workers.dev/moviebox/search?query=paw%20patrol"])
+                          "https://api.parciv.workers.dev/donghua/search?q=paw%20patrol",
+                          "https://api.parciv.workers.dev/moviebox/search?q=paw%20patrol"])
         panel = self.service.latest_panels[7]
         self.assertEqual(panel.words, "paw patrol")
         self.assertEqual([item.title for item in panel.items],
@@ -995,7 +996,9 @@ class SearchTests(BotCase):
         self.assertIn("1. ⬇️ PAW Patrol: The Dino Movie (2026)", text)
         self.assertIn("⚠️", text)
         self.assertIn("scanned", text)
-        self.assertEqual(pages.await_count, 2)
+        # ``SEARCH_PAGES`` is the number of pages per family; the ``movies``
+        # family alone is one section over that many pages.
+        self.assertEqual(pages.await_count, 5)
 
     async def test_a_title_listed_in_several_families_is_kept_once(self):
         notice = SimpleNamespace(id=21, edit=AsyncMock())
@@ -1008,8 +1011,32 @@ class SearchTests(BotCase):
         text = notice.edit.call_args.args[0]
         self.assertIn("1. ⬇️ PAW Patrol: The Dino Movie (2026)", text)
         self.assertNotIn("2. ", text)
-        # Six Moviebox sections + Anime + Donghua, two pages each.
-        self.assertEqual(pages.await_count, 16)
+        # Six Moviebox sections + Anime + Donghua, ``SEARCH_PAGES`` pages each.
+        self.assertEqual(pages.await_count, 8 * 5)
+
+    def test_search_results_collapse_to_one_button_per_series(self):
+        # The builder's search answers one row per *episode*; the reply must show
+        # one row per series, keyed by the series id, under the series name.
+        rows = (
+            ParcivItem(subject_id="61821", name="Xi Xing Ji: Kuang Wang Eps 01",
+                       section="donghua",
+                       extra={"catId": "3833", "series": "Xi Xing Ji: Kuang Wang",
+                              "kind": "episode"}),
+            ParcivItem(subject_id="61822", name="Xi Xing Ji: Kuang Wang Eps 02",
+                       section="donghua",
+                       extra={"catId": "3833", "series": "Xi Xing Ji: Kuang Wang",
+                              "kind": "episode"}),
+            ParcivItem(subject_id="61960", name="Other Series Eps 01", section="donghua",
+                       extra={"catId": "8899", "series": "Other Series", "kind": "episode"}),
+        )
+        collapsed = self.service._collapse_search_results(rows, "donghua")
+        self.assertEqual([item.subject_id for item in collapsed], ["3833", "8899"])
+        self.assertEqual(collapsed[0].name, "Xi Xing Ji: Kuang Wang")
+        # Moviebox rows pass through untouched (there is no series to collapse to).
+        movies = (ParcivItem(subject_id="1", name="A Movie", section="movies"),
+                  ParcivItem(subject_id="2", name="B Movie", section="movies"))
+        kept = self.service._collapse_search_results(movies, "movies")
+        self.assertEqual([item.subject_id for item in kept], ["1", "2"])
 
     async def test_a_search_without_words_shows_the_usage(self):
         event = self.event()
@@ -1205,23 +1232,34 @@ class EpisodePickerTests(BotCase):
     """`/search` → tap a donghua title → episode picker → download selected."""
 
     async def test_tapping_a_donghua_title_opens_the_episode_picker(self):
-        # The search panel finds Kuang Wang 2.
-        donghua_latest = {"status": "ok", "data": {"list": [
-            {"subjectId": "7788", "name": "Kuang Wang 2", "year": "2026",
-             "episode": "Episode 06"}]}}
-        # The /videos?subjectId=7788 answer is a list of every episode.
-        donghua_videos = {"status": "ok", "data": [
-            {"title": "Kuang Wang 2", "id": "06-360p", "episode": "Episode 06",
-             "url": "http://cdn.example.com/06-360p.mp4"},
-            {"title": "Kuang Wang 2", "id": "06-480p", "episode": "Episode 06",
-             "url": "http://cdn.example.com/06-480p.mp4"},
-            {"title": "Kuang Wang 2", "id": "07-360p", "episode": "Episode 07",
-             "url": "http://cdn.example.com/07-360p.mp4"}]}
+        # The search panel finds Kuang Wang 2. The builder's search answers with
+        # one row per *episode* (``catId`` names the series, ``id`` the episode),
+        # each carrying its own quality list inline. Both the /search call and the
+        # picker's wider search return these rows.
+        donghua_search = {"status": "ok", "items": [
+            {"id": 60001, "catId": 7788, "kind": "episode", "series": "Kuang Wang 2",
+             "title": "Kuang Wang 2 Eps 06", "year": "2026",
+             "thumbnail": "https://cdn.example.com/cover.jpg",
+             "streams": [{"quality": "360p", "url": "http://cdn.example.com/06-360p.mp4"},
+                         {"quality": "480p", "url": "http://cdn.example.com/06-480p.mp4"}]},
+            {"id": 60002, "catId": 7788, "kind": "episode", "series": "Kuang Wang 2",
+             "title": "Kuang Wang 2 Eps 07", "year": "2026",
+             "thumbnail": "https://cdn.example.com/cover.jpg",
+             "streams": [{"quality": "360p", "url": "http://cdn.example.com/07-360p.mp4"},
+                         {"quality": "480p", "url": "http://cdn.example.com/07-480p.mp4"}]},
+            {"id": 60003, "catId": 7788, "kind": "episode", "series": "Kuang Wang 2",
+             "title": "Kuang Wang 2 Eps 08", "year": "2026",
+             "thumbnail": "https://cdn.example.com/cover.jpg",
+             "streams": [{"quality": "360p", "url": "http://cdn.example.com/08-360p.mp4"}]}]}
+        # A second series in the same answer: the picker must keep only 7788's rows.
+        donghua_search["items"].append({
+            "id": 70001, "catId": 8899, "kind": "episode", "series": "Other Series",
+            "title": "Other Series Eps 01", "year": "2026",
+            "thumbnail": "https://cdn.example.com/other.jpg",
+            "streams": [{"quality": "360p", "url": "http://cdn.example.com/other-360p.mp4"}]})
         async def fake_fetch(session, url, *args, **kwargs):
-            if "/donghua/videos" in url and "subjectId=7788" in url:
-                return donghua_videos
-            if url.endswith("/donghua/latest"):
-                return donghua_latest
+            if "/donghua/search" in url:
+                return donghua_search
             return {"status": "ok", "data": []}
         notice = SimpleNamespace(id=21, edit=AsyncMock(), delete=AsyncMock())
         self.client.iter_messages = MagicMock(return_value=FakeHistory([]))
@@ -1233,8 +1271,8 @@ class EpisodePickerTests(BotCase):
             panel = self.service.latest_panels[7]
             self.assertEqual(panel.words, "kuang wang 2")
             token = self.service.auto_tokens[7]
-            # Tap the title: the bot reads /donghua/videos?subjectId=7788 and
-            # builds the episode picker. The patch must still be active.
+            # Tap the title: the bot reads the family's own search (wide count)
+            # and builds the episode picker from this series' rows only.
             ep_event = SimpleNamespace(sender_id=7, is_private=True, message_id=99,
                                        data=f"s:{token}:title:7788".encode(),
                                        answer=AsyncMock(), edit=AsyncMock())
@@ -1242,15 +1280,19 @@ class EpisodePickerTests(BotCase):
         ep_panel = self.service.episode_panels[7]
         self.assertIsNotNone(ep_panel)
         self.assertTrue(ep_panel.title.startswith("Kuang Wang 2"))
+        # The other series' row (catId 8899) is excluded.
         self.assertEqual({item.subject_id for item in ep_panel.episodes},
-                         {"06-360p", "06-480p", "07-360p"})
+                         {"60001", "60002", "60003"})
+        # The episode number is recovered from the row title for the label.
+        self.assertEqual([item.episode for item in ep_panel.episodes],
+                         ["Eps 6", "Eps 7", "Eps 8"])
         # Tap two episodes and "Download selected (2)".
-        for ep_id in ("06-360p", "07-360p"):
+        for ep_id in ("60001", "60002"):
             await self.service.callback(SimpleNamespace(
                 sender_id=7, is_private=True, message_id=99,
                 data=f"s:{ep_panel.token}:ep:7788:{ep_id}".encode(),
                 answer=AsyncMock(), edit=AsyncMock()))
-        self.assertEqual(ep_panel.selected, {"06-360p", "07-360p"})
+        self.assertEqual(ep_panel.selected, {"60001", "60002"})
         await self.service.callback(SimpleNamespace(
             sender_id=7, is_private=True, message_id=99,
             data=f"s:{ep_panel.token}:go".encode(),
@@ -1260,13 +1302,13 @@ class EpisodePickerTests(BotCase):
                 if j.parciv and j.parciv.items]
         self.assertEqual(len(jobs), 1)
         queued = {item.subject_id for item in jobs[0].parciv.items}
-        self.assertEqual(queued, {"06-360p", "07-360p"})
+        self.assertEqual(queued, {"60001", "60002"})
 
     async def test_tapping_a_movie_skips_the_episode_step(self):
         # A movie search match: a single result, no episodes, no subject_id that
         # belongs to an anime/donghua family. The tap should fall through to
         # the existing quality picker, not the episode picker.
-        movies = {"status": "ok", "data": [{
+        movies = {"status": "ok", "items": [{
             "subjectId": MOVIE_ID, "name": "PAW Patrol: The Dino Movie",
             "year": "2026"}]}
         stream = {"status": "ok", "data": [{
@@ -1276,7 +1318,9 @@ class EpisodePickerTests(BotCase):
         async def fake_fetch(session, url, *args, **kwargs):
             if "/moviebox/stream" in url:
                 return stream
-            return movies
+            if "/moviebox/search" in url:
+                return movies
+            return {"status": "ok", "items": []}
         notice = SimpleNamespace(id=21, edit=AsyncMock(), delete=AsyncMock())
         self.client.iter_messages = MagicMock(return_value=FakeHistory([]))
         with patch("ytdown.bot.fetch_json_api", new=AsyncMock(side_effect=fake_fetch)):

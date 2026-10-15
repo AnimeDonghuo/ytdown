@@ -113,7 +113,16 @@ class ParcivApi:
         if section in PARCIV_SECTIONS:
             return f"{self.moviebox}/{PARCIV_SECTIONS[section]}?page={max(1, int(page))}"
         if section in PARCIV_STREAM_SECTIONS:
-            return f"{self.root}/{PARCIV_STREAM_SECTIONS[section]}/latest"
+            # The builder's Anime/Donghua ``/latest`` and ``/new`` answer one
+            # series per page, which makes ``/latest`` and the search fallback
+            # miss almost everything. The listing endpoints differ between the
+            # two families: Anime's ``/new`` lists ~49 newest series per page,
+            # while Donghua's ``/new`` is one per page and only ``/trending``
+            # is a paginated multi-item list. The query is harmless when the
+            # endpoint does not honour it.
+            listing = "new" if section == "anime" else "trending"
+            return (f"{self.root}/{PARCIV_STREAM_SECTIONS[section]}/{listing}"
+                    f"?page={max(1, int(page))}")
         raise ParcivError(f"Unknown apitera section {section!r}.")
 
     def detail(self, subject_id: str) -> str:
@@ -185,18 +194,6 @@ class ParcivApi:
             raise ParcivError("This apitera entry carries no id to look up.")
         return candidates[0][1]
 
-    def videos_subject_id(self, section: str, subject_id: str) -> str:
-        """`<family>/videos?subjectId=<id>` — the per-title episode list.
-
-        The lookup ladder already builds this URL as one of its candidates, but
-        the search-result title picker wants it without the rest of the ladder:
-        the answer is the parent catalogue scoped to that title.
-        """
-        if section not in PARCIV_STREAM_SECTIONS:
-            raise ParcivError(f"videos_subject_id is only for anime/donghua, not {section!r}")
-        return f"{self.root}/{PARCIV_STREAM_SECTIONS[section]}/videos?subjectId={quote(str(subject_id))}"
-
-
 def normalize_section(value: str) -> str:
     """Accept `anime`, `moviebox/animation`, `tv-posts`… as the section they name."""
     text = " ".join(str(value or "").split()).strip().lower().replace("_", " ")
@@ -233,18 +230,28 @@ def family_base(api: "ParcivApi", section: str) -> str:
     return api.moviebox
 
 
-def search_url_for(base: str, words: str) -> str:
-    """A family's own search call, `…/<family>/search?query=…`.
+def search_url_for(base: str, words: str, count: int = 0) -> str:
+    """A family's own search call, `…/<family>/search?q=…`.
 
-    Whether the family really has a search call is the API's business: a refusal
-    is answered by scanning its catalogue pages instead.
+    ``q`` is the parameter the apitera builder's Moviebox and Donghua families
+    read; Anime is the odd one out and reads ``query`` instead (the same
+    endpoint answers empty for the other name), so a base that ends in
+    ``/anime`` gets ``query``. ``count`` raises the per-page result limit —
+    the builder's answer does not paginate (``pages`` stays 1), so the picker
+    asks for a wide page to see a whole series' episodes. When the API does
+    not serve a search call, ``search_family`` falls back to scanning the
+    family's catalogue pages and filtering them here.
     """
     query = quote(" ".join(str(words or "").split()), safe="")
-    return f"{str(base).rstrip('/')}/search?query={query}"
+    name = "query" if urlsplit(str(base)).path.rstrip("/").endswith("/anime") else "q"
+    url = f"{str(base).rstrip('/')}/search?{name}={query}"
+    if count > 1:
+        url += f"&count={int(count)}"
+    return url
 
 
 def search_url(api: "ParcivApi", section: str, words: str) -> str:
-    """That section's family search call (see `search_url_for`)."""
+    """That section's family search call (see :func:`search_url_for`)."""
     return search_url_for(family_base(api, section), words)
 
 
@@ -677,12 +684,26 @@ LIST_KEYS = ("items", "data", "result", "list", "movies", "tv", "tvshows", "anim
 
 
 def find_dicts(payload: object, keys: tuple[str, ...] = LIST_KEYS) -> list[dict]:
-    """The first list of dicts this answer holds under one of the known keys."""
+    """The first list of dicts this answer holds under one of the known keys.
+
+    The Moviebox catalogue answers with ``{"tabId": "MOVIE", "sections":
+    [{"type": "TV_OPS_BANNER", "title": ..., "items": [...]}, ...]}`` — the
+    titles live one level deeper, inside each section's own ``items``. Those
+    are flattened here; the section dicts themselves (which carry a banner
+    ``title`` and no media) are never returned, so they cannot be mistaken
+    for a title.
+    """
     data = unwrap(payload)
     if isinstance(data, list):
         return [item for item in data if isinstance(item, dict)]
     if not isinstance(data, dict):
         return []
+    sections = data.get("sections")
+    if isinstance(sections, list):
+        nested = [item for section in sections if isinstance(section, dict)
+                  for item in (section.get("items") or ()) if isinstance(item, dict)]
+        if nested:
+            return nested
     for key in keys:
         found = dict_list(data.get(key))
         if found:
@@ -795,6 +816,23 @@ def episode_label(raw: dict) -> str:
     if episode:
         return f"Episode {episode}"
     return ""
+
+
+EPISODE_TITLE_RE = re.compile(r"\bep(?:s|isode)?\s*(\d{1,4})\b", re.IGNORECASE)
+
+
+def episode_from_title(title: object) -> tuple[int, str]:
+    """The episode number a title names: "Kuang Wang 2 Eps 06" → (6, "Eps 06").
+
+    The builder's search rows carry no episode field — the number is baked into
+    the title ("… Eps 06") — so the picker recovers it here, both for the row
+    label and for a numeric sort.
+    """
+    match = EPISODE_TITLE_RE.search(str(title or ""))
+    if not match:
+        return 0, ""
+    number = int(match.group(1))
+    return number, f"Eps {number}"
 
 
 @dataclass(frozen=True)
@@ -923,6 +961,33 @@ class ParcivMedia:
 
     def source(self, label: str) -> ParcivSource | None:
         return next((item for item in self.labelled_sources() if item.label == label), None)
+
+
+def post_video_sources(raw: dict) -> tuple[ParcivSource, ...]:
+    """Every quality the apitera builder's ``/post?id=…`` answer carries.
+
+    The new post shape is a flat record with one URL per quality
+    (``video_url``, ``video_url_minihd``, ``video_url_hd``, ``video_url_fullhd``,
+    ``video_url_eng``, ``video_url_hdeng``) and a matching duration in
+    seconds. Older builds answered with a ``streams`` list, which
+    :func:`media_sources` already understands; this helper exists so a
+    single post answer can fan out to one source per quality.
+    """
+    duration = _int(first(raw, "video_duration_sec", "duration_sec", "seconds"))
+    if not duration:
+        duration = _int(first(raw, "video_duration"))  # "Complete" / "OnGoing" — not seconds.
+    pairs = (("360p", "video_url"),
+             ("480p", "video_url_minihd"),
+             ("720p", "video_url_hd"),
+             ("1080p", "video_url_fullhd"),
+             ("English Sub", "video_url_eng"),
+             ("English Sub HD", "video_url_hdeng"))
+    found: list[ParcivSource] = []
+    for label, key in pairs:
+        url = _text(raw.get(key), 2048)
+        if public_media_url(url):
+            found.append(ParcivSource(label=label, url=url, duration=duration))
+    return tuple(found)
 
 
 def source_from_dict(raw: dict, dash: bool = False,
@@ -1065,7 +1130,8 @@ def media_langs(payload: dict) -> tuple[str, ...]:
 
 def media_title(payload: dict, fallback: str = "") -> str:
     """The API's own title, with its "_360P" style suffix taken off."""
-    raw = _text(first(payload, "title", "name", "subjectName", "anime_title", "postTitle"), 200)
+    raw = _text(first(payload, "title", "name", "subjectName", "anime_title", "postTitle",
+                      "video_title"), 200)
     if not raw:
         return fallback
     cleaned = re.sub(r"[_ ]\d{3,4}[pP]$", "", raw).strip(" _-")
@@ -1110,6 +1176,10 @@ def parse_post(payload: object, item: "ParcivItem | None" = None,
 
     When the answer is really a whole catalogue (`/videos` answers every title at
     once), only this item's own entry is read — never every title's files.
+
+    The apitera builder's newer post shape wraps the per-episode media in a
+    ``post: {video_url, video_url_hd, …}`` object — :func:`post_video_sources`
+    fans that out to one :class:`ParcivSource` per quality.
     """
     if item is not None and _depth < 2:
         entries = catalogue_entries(payload)
@@ -1120,6 +1190,10 @@ def parse_post(payload: object, item: "ParcivItem | None" = None,
                                   f"lists no entry for {item.title}")
             return parse_post(entry, item, _depth + 1)
     data = unwrap(payload)
+    # The new answer wraps a single episode in `post: {…}`.
+    post = data.get("post") if isinstance(data, dict) else None
+    if isinstance(post, dict) and "video_url" in post:
+        return parse_post(post, item, _depth + 1)
     raw = data
     if isinstance(data, list):
         # A list is a catalogue (a `/videos` family answer): take this item's own entry.
@@ -1135,7 +1209,7 @@ def parse_post(payload: object, item: "ParcivItem | None" = None,
         raw = entry
     if not isinstance(raw, dict):
         raise ParcivError("The apitera answer for this episode was not usable.")
-    sources = media_sources(raw) or media_sources_anywhere(raw)
+    sources = post_video_sources(raw) or media_sources(raw) or media_sources_anywhere(raw)
     if not sources:
         raise ParcivError("The apitera answer for this episode listed no downloadable files.")
     duration = _int(first(raw, "duration", "seconds", "total_duration")) or max(
@@ -1221,7 +1295,8 @@ def item_from_dict(raw: dict, section: str, api: "ParcivApi | None" = None) -> P
         files = (ParcivSource(label=quality_label(leech_link_file(own_media) or own_media),
                               url=own_media),)
     extra = {key: _text(raw.get(key), 60) for key in
-             ("postId", "post_id", "episodeId", "id", "subjectId") if raw.get(key) not in (None, "")}
+             ("postId", "post_id", "episodeId", "id", "subjectId", "catId", "series",
+              "kind") if raw.get(key) not in (None, "")}
     if slug:
         extra["slug"] = slug  # The /post call of these families often wants the slug.
     if post_url:
