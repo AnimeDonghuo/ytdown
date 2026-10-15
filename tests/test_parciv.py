@@ -547,6 +547,72 @@ def fake_popen(factory):
     return popen, calls
 
 
+class StreamLinkTests(unittest.TestCase):
+    """The API's own leech links: the file a leech command downloads."""
+
+    LINK = ("https://api.parciv.workers.dev/donghua/stream?url=http%3A%2F%2Fsantol.whatbox.ca"
+            "%3A29318%2F2026%2FDonghua%2FKuangWang2%2F06-360p.mp4")
+    FILE = "http://santol.whatbox.ca:29318/2026/Donghua/KuangWang2/06-360p.mp4"
+
+    def test_a_leech_link_is_read_as_the_file_it_carries(self):
+        from ytdown.parciv import find_media_url, is_downloadable_url, leech_link_file, media_file_url
+        self.assertEqual(leech_link_file(self.LINK), self.FILE)
+        self.assertTrue(is_downloadable_url(self.LINK))
+        self.assertFalse(media_file_url(self.LINK))  # Its own path is not a file.
+        self.assertEqual(file_title(self.LINK), "KuangWang2 06")  # Named after the file.
+        self.assertFalse(is_downloadable_url("https://api.parciv.workers.dev/donghua/post?slug=x"))
+        self.assertEqual(find_media_url({"items": [{"stream": self.LINK}]}), self.LINK)
+        self.assertEqual(leech_link_file("https://api.parciv.workers.dev/donghua/stream?url=junk"), "")
+
+    def test_a_listing_that_hands_over_a_leech_link_needs_no_lookup(self):
+        api = ParcivApi(PARCIV_API_URL)
+        item = item_from_dict({"title": "Kuang Wang 2", "episode": "Episode 06",
+                               "url": self.LINK}, "donghua", api)
+        self.assertEqual(item.extra["media_url"], self.LINK)
+        self.assertEqual(item.post_url, "")  # The link is the file, not a page to look up.
+        media = leech_link_media(item.extra["media_url"], item)
+        self.assertEqual(media.sources[0].label, "360p")  # From the file inside the link.
+        self.assertEqual(media.title, "Kuang Wang 2")
+
+    def test_a_quality_is_read_from_the_file_name_not_the_folder_or_port(self):
+        from ytdown.parciv import quality_label
+        self.assertEqual(quality_label(), "Video")
+        self.assertEqual(quality_label("DASH"), "DASH")
+        self.assertEqual(quality_label("http://santol.whatbox.ca:29318/2026/Donghua/K/06-480p.mp4"),
+                         "480p")
+        self.assertEqual(quality_label("https://api.parciv.workers.dev/x/07-1080p.mp4"), "1080p")
+
+    def test_a_whole_videos_catalogue_is_matched_by_title(self):
+        item = ParcivItem(subject_id="kuang-wang-2", name="Kuang Wang 2", section="donghua",
+                          extra={"slug": "kuang-wang-2"})
+        other = "http://santol.whatbox.ca:29318/Other/01-720p.mp4"
+        catalogue = {"status": "ok", "videos": [{"title": "Another Show", "url": other},
+                                               {"title": "Kuang Wang 2", "episode": "Episode 06",
+                                                "url": self.LINK}]}
+        media = parse_post(catalogue, item)
+        self.assertEqual([source.label for source in media.sources], ["360p"])
+        self.assertEqual(media.sources[0].url, self.LINK)
+        self.assertNotIn(other, [source.url for source in media.sources])
+        # The same answer without this item's entry is refused, not mixed with the rest.
+        with self.assertRaises(ParcivError) as caught:
+            parse_post({"videos": [{"title": "Another Show", "url": other},
+                                   {"title": "Third Show", "url": other}]}, item)
+        self.assertIn("lists no entry for Kuang Wang 2", str(caught.exception))
+
+    def test_an_answer_of_unknown_shape_still_yields_its_files(self):
+        from ytdown.parciv import media_sources_anywhere, parse_post
+        item = ParcivItem(subject_id="kuang-wang-2", name="Kuang Wang 2", section="donghua")
+        deep = {"data": {"season": "1", "episodes": [{"episode": "06", "servers": [
+            {"label": "360p", "stream": self.LINK}]}]}}
+        media = parse_post(deep, item)
+        self.assertEqual([source.label for source in media.sources], ["360p"])
+        self.assertEqual(media.sources[0].url, self.LINK)
+        self.assertEqual(media_sources_anywhere(
+            {"weird": [{}, {"file": "http://x.example.com/a/01-720p.mp4"}]})[0].label, "720p")
+        # A page link is not a file, whatever it is called.
+        self.assertEqual(media_sources_anywhere({"url": "https://example.com/watch/1"}), ())
+
+
 class PostLookupTests(unittest.TestCase):
     """The Anime/Donghua lookup ladder: every shape of the call, best guess first."""
 
@@ -555,8 +621,14 @@ class PostLookupTests(unittest.TestCase):
         item = ParcivItem(subject_id="kamen-rider-kiva", name="Kamen Rider Kiva", section="anime",
                           extra={"slug": "kamen-rider-kiva-movie"})
         labels = [label for label, _ in api.post_candidates("anime", item)]
-        self.assertEqual(labels, ["slug", "subject id", "subject id param", "detail"])
-        self.assertEqual(api.post_candidates("anime", item)[2][1],
+        self.assertEqual(labels, ["slug", "subject id", "videos slug", "videos subject id",
+                                  "subject id param", "videos", "detail"])
+        self.assertIn(("videos slug",
+                       "https://api.parciv.workers.dev/anime/videos?slug=kamen-rider-kiva-movie"),
+                      api.post_candidates("anime", item))
+        self.assertIn(("videos", "https://api.parciv.workers.dev/anime/videos"),
+                      api.post_candidates("anime", item))
+        self.assertEqual(api.post_candidates("anime", item)[4][1],
                          "https://api.parciv.workers.dev/anime/post?subjectId=kamen-rider-kiva")
         self.assertEqual(api.post_candidates("anime", item)[0][1],
                          "https://api.parciv.workers.dev/anime/post?slug=kamen-rider-kiva-movie")

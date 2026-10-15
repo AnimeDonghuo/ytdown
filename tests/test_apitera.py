@@ -285,6 +285,8 @@ class LookupLadderTests(BotCase):
         self.assertIn("no lookup call for Dark Machine answered with media", message)
         self.assertIn("slug: The apitera answer", message)
         self.assertIn("subject id: answered non-JSON (HTTP 200)", message)
+        self.assertIn("videos slug: The apitera answer", message)
+        self.assertIn("videos: ", message)     # The whole-catalogue shape is in there too.
         self.assertIn("detail: ", message)
 
     async def test_a_stream_item_never_waits_for_the_moviebox_detail_call(self):
@@ -348,6 +350,10 @@ class LeechLinkTests(BotCase):
         self.assertIn("🔎 apitera — page 1 of Anime", notice.edit.call_args.args[0])
 
 
+DEBUG_STREAM_LINK = ("https://api.parciv.workers.dev/donghua/stream?url=http%3A%2F%2F"
+                     "santol.whatbox.ca%3A29318%2F2026%2FDonghua%2FKuangWang2%2F06-360p.mp4")
+
+
 class DebugTests(BotCase):
     """`/debug <url>`: what an endpoint really answers, so a wrong guess is visible."""
 
@@ -369,12 +375,45 @@ class DebugTests(BotCase):
         self.assertIn("item 2:", text)
         self.assertLess(len(text.splitlines()), 30)
 
-    async def test_without_a_url_it_suggests_the_families(self):
+    async def test_without_an_argument_it_explains_both_forms(self):
         event = self.event("/debug")
         await self.service.handle_debug(event, "/debug")
-        self.assertIn("Send /debug <apitera URL>", event.respond.call_args.args[0])
-        self.assertIn("https://api.parciv.workers.dev/donghua/latest",
-                      event.respond.call_args.args[0])
+        text = event.respond.call_args.args[0]
+        self.assertIn("Two ways to use /debug", text)
+        self.assertIn("/debug <section> <id or slug>", text)
+        self.assertIn("https://api.parciv.workers.dev/donghua/videos", text)
+        self.assertIn("https://api.parciv.workers.dev/donghua/latest", text)
+
+    async def test_a_stream_link_is_named_as_the_file_it_is(self):
+        link = DEBUG_STREAM_LINK
+        event = self.event("/debug " + link)
+        await self.service.handle_debug(event, "/debug " + link)
+        text = event.respond.call_args.args[0]
+        self.assertIn("the video file itself, not a JSON endpoint", text)
+        self.assertIn("KuangWang2 06", text)
+        self.assertIn("/parciv <link>", text)
+
+    async def test_a_section_and_a_slug_report_every_shape(self):
+        notice = SimpleNamespace(id=22, edit=AsyncMock())
+        videos = "https://api.parciv.workers.dev/donghua/videos"
+        TITLE = "Dark Machine: The Animation"
+
+        async def answers(session, url, *args, **kwargs):
+            if url == videos:
+                return {"status": "ok", "videos": [
+                    {"title": TITLE, "url": "http://santol.whatbox.ca:29318/Dark/01-360p.mp4"}]}
+            raise bot.ApiJsonError("answered non-JSON (HTTP 200): <!DOCTYPE html>", "", 0)
+
+        with patch("ytdown.bot.fetch_parciv_json", new=answers):
+            await self.service.handle_debug(
+                self.event("/debug donghua " + TITLE, notice=notice), "/debug donghua " + TITLE)
+        lines = notice.edit.call_args.args[0].splitlines()
+        self.assertEqual(lines[0], f"Lookup shapes for {TITLE}:")
+        self.assertTrue(any(line.startswith("❌ slug:") for line in lines), lines)
+        found = [line for line in lines if line.startswith("✅ ")]
+        self.assertEqual(len(found), 1)
+        self.assertIn("✅ videos: 1 file(s) — 360p", found[0])
+        self.assertLess(len(lines), 36)
 
     async def test_another_site_is_refused(self):
         event = self.event("/debug https://example.com/x")

@@ -52,7 +52,8 @@ from .parciv import (AUTO_SECTIONS, DM_SCAN_LIMIT, MAX_AUTO_LIMIT, MAX_PARCIV_BY
                      PARCIV_SECTIONS, PARCIV_STREAM_SECTIONS, ParcivApi, ParcivError, ParcivItem,
                      ParcivMedia,
                      ParcivSource, brief, download_parciv, family_base, file_title,
-                     is_parciv_media_endpoint, leech_link_media, matches_words, media_file_url,
+                     is_downloadable_url, is_parciv_media_endpoint, leech_link_file,
+                     leech_link_media, matches_words,
                      parse_catalogue, parse_detail, parse_parciv_source, parse_post, parse_sections,
                      parse_stream, pick_media, search_url_for, title_variants)
 from .apitera import (AUTO_INTERVAL_DEFAULT, AUTO_INTERVAL_MIN, CataloguePage, ParcivBatch,
@@ -556,7 +557,9 @@ async def fetch_parciv_post(session: aiohttp.ClientSession, api: ParcivApi,
         except ParcivError as exc:
             problems.append(f"{label}: {brief(str(exc))}")
             continue
-    reason = "; ".join(problems[:4]) or "this entry carries no id to look up"
+    # Every shape's reason stays in the message (the log and `/debug` use it); the
+    # chat line only shows the first part of it.
+    reason = "; ".join(problems) or "this entry carries no id to look up"
     raise ParcivError(f"no lookup call for {item.title} answered with media ({reason})")
 
 
@@ -1744,6 +1747,7 @@ class DownloaderBot:
                 "/latest [movies,anime,donghua] [count] [page=2] — browse the catalogue now\n"
                 "/search [movies,anime] <words> — find a title in every apitera catalogue\n"
                 "/debug <apitera URL> — show what that endpoint really answers\n"
+                "/debug <section> <id or slug> — try every lookup shape and report it\n"
                 "/parciv <apitera link or subject id> — read and queue one item\n"
                 "/proxy — proxy mode ON/OFF, pool status, re-check or clear the pool\n"
                 "/limits — size and queue limits\n/help — these instructions\n\n"
@@ -2451,15 +2455,48 @@ class DownloaderBot:
                             f"/auto limit <1-{MAX_AUTO_LIMIT}>, or /auto every 15m.")
 
     async def handle_debug(self, event, text: str) -> None:
-        """`/debug <apitera url>` — show the structure one endpoint really answers with."""
+        """`/debug <apitera url>`, or `/debug <section> <id|slug>` for the whole ladder.
+
+        A URL shows what that endpoint really answers (its keys, its lists, its first
+        entries). A section with an id or slug tries every lookup shape for that item
+        and reports what each one answered: that is how a wrong call shape becomes
+        visible instead of a one-line error.
+        """
         argument = text.partition(" ")[2].strip()
         if not argument:
             await event.respond(
-                "Send /debug <apitera URL> and I will show what that endpoint really "
-                "answers: its keys, the lists it holds and the first two entries.\n"
-                "Useful ones:\n"
-                + "\n".join(f"• https://api.parciv.workers.dev/{family}/latest"
-                             for family in ("moviebox/movies", "anime", "donghua", "iptv")),
+                "Two ways to use /debug:\n"
+                "• /debug <apitera URL> — what that endpoint really answers: its keys, "
+                "the lists it holds and its first two entries.\n"
+                "• /debug <section> <id or slug> — every lookup shape for one item and "
+                "what each one answered.\n"
+                "Useful URLs:\n"
+                "• https://api.parciv.workers.dev/donghua/videos — the Donghua stream "
+                "links, every title\n"
+                "• https://api.parciv.workers.dev/donghua/latest\n"
+                "• https://api.parciv.workers.dev/anime/latest\n"
+                "• https://api.parciv.workers.dev/moviebox/movies",
+                parse_mode=None)
+            return
+        uid = event.sender_id
+        first = argument.split()[0]
+        if "://" not in first:
+            sections, query = parse_search(text)
+            if not query:
+                await event.respond("Send it as /debug <section> <id or slug>, for example "
+                                    "/debug donghua kuang-wang-2.")
+                return
+            notice = await event.respond(f"Trying every lookup shape for {query} …")
+            lines = await self.debug_shapes(uid, normalise_sections(sections)[:2], query)
+            await self.safe_edit(notice, "\n".join(lines), parse_mode=None)
+            return
+        if is_downloadable_url(first):
+            inner = leech_link_file(first)
+            await event.respond(
+                "That link is the video file itself, not a JSON endpoint, so there is "
+                "nothing to describe.\n"
+                + (f"It carries {file_title(inner)}.\n" if inner else "")
+                + "Send it as /parciv <link> and the bot downloads and uploads it.",
                 parse_mode=None)
             return
         try:
@@ -2469,13 +2506,42 @@ class DownloaderBot:
             return
         notice = await event.respond(f"Reading {url} …")
         try:
-            payload = await fetch_parciv_json(self.http_for(event.sender_id), url)
+            payload = await fetch_parciv_json(self.http_for(uid), url)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
             detail = " ".join(str(exc).split()) or type(exc).__name__
             await self.safe_edit(notice, f"Could not read that URL: {detail[:150]}")
             return
         lines = describe_payload(payload, url)
         await self.safe_edit(notice, "\n".join(lines), parse_mode=None)
+
+    async def debug_shapes(self, uid: int, sections: tuple[str, ...], query: str) -> list[str]:
+        """Every lookup shape for one id or slug, with what each one answered."""
+        sections = sections or ("donghua", "anime")
+        api = ParcivApi(parciv_endpoint(self.api_for(uid, "parciv")))
+        session = self.http_for(uid)
+        lines = [f"Lookup shapes for {query}:"]
+        for section in sections[:2]:
+            item = ParcivItem(subject_id=query, name=query, section=section,
+                              extra={"slug": query, "id": query, "postId": query})
+            lines.append(f"{section}:")
+            for label, url in api.post_candidates(section, item):
+                try:
+                    payload = await fetch_parciv_json(session, url)
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+                    lines.append(f"❌ {label}: {brief(exc, 90)}")
+                    continue
+                try:
+                    media = parse_post(payload, item)
+                except ParcivError as exc:
+                    lines.append(f"❌ {label}: {brief(exc, 90)}")
+                    continue
+                files = ", ".join(source.label for source in media.sources[:8])
+                lines.append(f"✅ {label}: {len(media.sources)} file(s) — {files}")
+                lines += describe_payload(payload)[1:9]
+                return lines[:34]
+        lines.append("Nothing answered with media. Send this reply and the exact shape "
+                     "can be added.")
+        return lines[:34]
 
     async def handle_latest(self, event, text: str) -> None:
         """`/latest [sections] [count] [page=2]` — browse page 1 of the catalogue by hand."""
@@ -2759,7 +2825,7 @@ class DownloaderBot:
         if path.endswith("/stream") and query.get("url"):
             # The leech shape: `<family>/stream?url=<file>` is the file itself.
             target = unquote(query["url"])
-            if media_file_url(target):
+            if is_downloadable_url(target):
                 notice = notice or await event.respond("Downloading that apitera file…")
                 await self.leech_link_flow(uid, peer, notice, target, section or "movies", link)
                 return
@@ -2768,7 +2834,18 @@ class DownloaderBot:
                               section=section, post_url=link)
             await self.parciv_item_selection(event, uid, peer, api, item, notice=notice)
             return
-        if path.endswith(("/latest", "/videos", "/trending")) and section:
+        if path.endswith("/videos") and section:
+            # The /videos page of a family lists every title with its own stream link, so
+            # the page itself is read (and each entry downloads that link — no lookup).
+            notice = notice or await event.respond("Reading that apitera listing…")
+            try:
+                await self.show_listing_url(uid, peer, notice, link, section)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as exc:
+                LOG.warning("apitera /videos listing failed: %s", type(exc).__name__)
+                await self.safe_edit(notice, f"That apitera URL listed nothing "
+                                             f"({type(exc).__name__}).")
+            return
+        if path.endswith(("/latest", "/trending")) and section:
             notice = notice or await event.respond(f"Reading {sections_text((section,))}…")
             await self.show_latest(uid, peer, notice, (section,), 1, self.auto_limit_default)
             return
@@ -3685,7 +3762,7 @@ class DownloaderBot:
     async def parciv_media(self, uid: int, api: ParcivApi, item: ParcivItem) -> ParcivMedia:
         """One item's media, with the detail call first so the name is the API's own."""
         own = item.extra.get("media_url", "")
-        if own and media_file_url(own):
+        if own and is_downloadable_url(own):
             # The listing (or a leech link) handed over the file itself: no lookup.
             return leech_link_media(own, item)
         inline = item.extra.get("raw")

@@ -40,7 +40,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
 from typing import Iterable
-from urllib.parse import quote, urlparse, urlsplit
+from urllib.parse import parse_qs, quote, urlparse, urlsplit
 
 import yt_dlp
 
@@ -157,10 +157,26 @@ class ParcivApi:
         own = item.extra.get("url", "")
         if own:
             add("api url", f"{base}/post?url={quote(own, safe='')}")
+        for key in ("slug", "post_slug", "postSlug"):
+            value = item.extra.get(key, "")
+            if value:
+                add("videos slug", f"{base}/videos?slug={quote(str(value))}")
+                break
+        for key in ("postId", "post_id", "episodeId", "id"):
+            value = item.extra.get(key, "")
+            if value:
+                add("videos id", f"{base}/videos?id={quote(str(value))}")
+                break
+        if item.subject_id:
+            add("videos subject id", f"{base}/videos?subjectId={quote(item.subject_id)}")
         if item.subject_id:
             add("subject id param", f"{base}/post?subjectId={quote(item.subject_id)}")
-        add("detail", f"{base}/detail?id={quote(item.subject_id)}")
-        return tuple(candidates[:7])
+        if item.subject_id:
+            # The whole catalogue: every entry with its stream link, matched by title.
+            add("videos", f"{base}/videos")
+        if item.subject_id:
+            add("detail", f"{base}/detail?id={quote(item.subject_id)}")
+        return tuple(candidates[:11])
 
     def post(self, section: str, item: "ParcivItem") -> str:
         """The episode-detail call for one Anime/Donghua entry (the first shape)."""
@@ -316,8 +332,38 @@ def media_file_url(value: object) -> bool:
     return urlsplit(str(value)).path.lower().endswith(LEECH_SUFFIXES + (".mpd", ".m3u8"))
 
 
+def leech_link_file(value: object) -> str:
+    """The media file inside the API's own leech link, else "".
+
+    ``…/donghua/stream?url=http%3A%2F%2Fsantol.whatbox.ca%3A29318%2F…%2F06-360p.mp4``
+    is not a page: fetching it hands back the video itself, exactly like a leech
+    command does. The ``/videos`` catalogue hands out links of this shape, so the
+    bot reads them as the file they carry.
+    """
+    if not isinstance(value, str) or len(value) > 2048:
+        return ""
+    if not any(host in value for host in PARCIV_HOSTS):
+        return ""
+    try:
+        query = parse_qs(urlsplit(value).query)
+    except ValueError:
+        return ""
+    for inner in query.get("url", []):
+        if media_file_url(inner):
+            return inner
+    return ""
+
+
+def is_downloadable_url(value: object) -> bool:
+    """True for the URL of a file this bot can fetch: a media file or a leech link."""
+    return media_file_url(value) or bool(leech_link_file(value))
+
+
 def file_title(url: object) -> str:
     """A readable title from a file URL: `…/KuangWang2/06-360p.mp4` → `KuangWang2 06`."""
+    inner = leech_link_file(url)
+    if inner:
+        return file_title(inner)  # A leech link names the route, not the file.
     parts = [part for part in urlsplit(str(url)).path.split("/") if part]
     stem = ""
     if parts:
@@ -339,7 +385,7 @@ def find_media_url(value: object, depth: int = 0) -> str:
     if depth > 5:  # Deep enough for `episodes[] → servers[] → url`.
         return ""
     if isinstance(value, str):
-        return value if media_file_url(value) else ""
+        return value if is_downloadable_url(value) else ""
     if isinstance(value, dict):
         for entry in value.values():
             found = find_media_url(entry, depth + 1)
@@ -355,8 +401,8 @@ def find_media_url(value: object, depth: int = 0) -> str:
 
 def leech_link_media(url: str, item: "ParcivItem") -> ParcivMedia:
     """The media of a direct file link: one source, no lookup call needed."""
-    path = urlsplit(str(url)).path
-    label = quality_label(item.name, path) or "video"
+    target = leech_link_file(url) or str(url)  # A leech link's own file names the quality.
+    label = quality_label(item.name, target) or "video"
     return ParcivMedia(title=item.name or file_title(url), poster=item.poster,
                        summary=item.summary, episode=item.episode, langs=item.langs,
                        sources=(ParcivSource(label=label, url=url),),
@@ -588,15 +634,25 @@ def media_url(raw: dict, *keys: str) -> str:
 
 
 def quality_label(*values: object) -> str:
-    """One "1080p" style label from whatever the API called the resolution."""
+    """One "1080p" style label from whatever the API called the resolution.
+
+    A URL is read by its own file name: `…/2026/Donghua/KuangWang2/06-360p.mp4` is
+    "360p", not "2026p" from the folder or the port next to it.
+    """
+    named: list[tuple[str, bool]] = []
     for value in values:
-        text = _text(value, 40)
+        text = _text(value, 300)
+        was_url = "://" in text
+        if was_url:
+            text = urlsplit(text).path.rsplit("/", 1)[-1]
+        named.append((text, was_url))
+    for text, _ in named:
         match = re.search(r"(\d{3,4})\s*[pP]\b", text) or re.search(r"\b(\d{3,4})\b", text)
         if match and 120 <= int(match.group(1)) <= 4320:
             return f"{int(match.group(1))}p"
-    for value in values:  # No resolution: keep the API's own word (DASH, HLS, …).
-        text = _text(value, 24)
-        if text and "://" not in text:
+    for text, was_url in named:  # No resolution: keep the API's own word (DASH, HLS, …).
+        text = _text(text, 24)
+        if text and not was_url:
             return text.upper() if text.lower() in ("dash", "hls") else text
     return "Video"
 
@@ -743,13 +799,21 @@ class ParcivMedia:
         return next((item for item in self.labelled_sources() if item.label == label), None)
 
 
-def source_from_dict(raw: dict, dash: bool = False) -> ParcivSource | None:
-    """Read one media entry of a ``streams``/``resources``/``videos`` list."""
+def source_from_dict(raw: dict, dash: bool = False,
+                     strict: bool = False) -> ParcivSource | None:
+    """Read one media entry of a ``streams``/``resources``/``videos`` list.
+
+    In ``strict`` mode the URL must be a media file or a leech link, so scanning an
+    unknown answer cannot mistake a page or a catalogue link for the video.
+    """
     url = media_url(raw, "url", "link", "src", "file", "stream_url", "streamUrl", "download_url")
     if not url:
         return None
+    if strict and not is_downloadable_url(url):
+        return None
+    named = leech_link_file(url) or url
     label = quality_label(first(raw, "resolution", "label", "quality", "height", "name"),
-                          first(raw, "format", "type", "linkType"), raw.get("url"))
+                          first(raw, "format", "type", "linkType"), named)
     if dash and label.endswith("p"):
         label = f"{label} DASH"  # The same height can exist as both an MP4 and a DASH stream.
     duration = _int(first(raw, "duration", "seconds", "length"))
@@ -782,6 +846,68 @@ def media_sources(payload: dict) -> tuple[ParcivSource, ...]:
         if source.url not in {item.url for item in unique}:
             unique.append(source)
     return tuple(unique)
+
+
+def media_sources_anywhere(payload: object, depth: int = 0) -> tuple[ParcivSource, ...]:
+    """Every file this answer holds, whatever key or nesting the API used.
+
+    The Anime/Donghua answers are not consistent between builds: one lists its files
+    under ``videos``, another as a flat list of qualities, another as one file per
+    episode. When `media_sources` (the known keys) finds nothing, the whole answer is
+    walked instead — and a file link the API's own leech route carries counts as a
+    file, because fetching it hands back the video.
+    """
+    if depth > 5:
+        return ()
+    found: list[ParcivSource] = []
+    if isinstance(payload, dict):
+        entry = source_from_dict(payload, strict=True)
+        if entry is not None:
+            found.append(entry)
+        else:
+            for value in payload.values():
+                found.extend(media_sources_anywhere(value, depth + 1))
+    elif isinstance(payload, list):
+        for value in payload[:40]:
+            found.extend(media_sources_anywhere(value, depth + 1))
+    elif is_downloadable_url(payload):
+        found.append(ParcivSource(label=quality_label(leech_link_file(payload) or payload),
+                                  url=str(payload)))
+    unique: list[ParcivSource] = []
+    for source in found:
+        if source.url not in {item.url for item in unique}:
+            unique.append(source)
+    return tuple(unique)
+
+
+def catalogue_entries(payload: object) -> list[dict]:
+    """The entries of an answer that is a whole catalogue, not one episode.
+
+    The `/videos` family answers every title at once. Reading such an answer as one
+    episode would download the other titles' files, so it is only a catalogue when
+    its entries carry their own titles.
+    """
+    entries = find_dicts(payload)
+    if len(entries) >= 2 and sum(1 for entry in entries if media_title(entry)) >= 2:
+        return entries
+    return []
+
+
+def catalogue_entry(payload: object, item: "ParcivItem | None") -> dict | None:
+    """This item's own entry when an answer is a whole catalogue (a plain /videos list)."""
+    if item is None:
+        return None
+    handles = {item.subject_id, str(item.extra.get("slug", "")), str(item.extra.get("id", "")),
+               str(item.extra.get("postId", ""))}
+    handles.discard("")
+    for entry in find_dicts(payload):
+        if handles & {str(entry.get(key, "")) for key in
+                      ("id", "slug", "subjectId", "postId", "episodeId", "animeId", "donghuaId")}:
+            return entry
+        name = media_title(entry)
+        if name and item.name and titles_match(name, item.name):
+            return entry
+    return None
 
 
 def media_subtitles(payload: dict) -> tuple[str, ...]:
@@ -852,13 +978,30 @@ def parse_stream(payload: object, subject_id: str = "") -> tuple[ParcivMedia, ..
     return tuple(media)
 
 
-def parse_post(payload: object, item: "ParcivItem | None" = None) -> ParcivMedia:
-    """One Anime/Donghua episode: its title, cover, media list and subtitles."""
+def parse_post(payload: object, item: "ParcivItem | None" = None,
+               _depth: int = 0) -> ParcivMedia:
+    """One Anime/Donghua episode: its title, cover, media list and subtitles.
+
+    When the answer is really a whole catalogue (`/videos` answers every title at
+    once), only this item's own entry is read — never every title's files.
+    """
+    if item is not None and _depth < 2:
+        entries = catalogue_entries(payload)
+        if entries:
+            entry = catalogue_entry(payload, item)
+            if entry is None:
+                raise ParcivError(f"the answer is a catalogue of {len(entries)} titles and "
+                                  f"lists no entry for {item.title}")
+            return parse_post(entry, item, _depth + 1)
     data = unwrap(payload)
-    raw = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else data
+    raw = data
+    if isinstance(data, list):
+        # A list is a catalogue (a `/videos` family answer): take this item's own entry.
+        entries = [entry for entry in data if isinstance(entry, dict)]
+        raw = catalogue_entry(payload, item) or (entries[0] if entries else {})
     if not isinstance(raw, dict):
         raise ParcivError("The apitera answer for this episode was not usable.")
-    sources = media_sources(raw)
+    sources = media_sources(raw) or media_sources_anywhere(raw)
     if not sources:
         raise ParcivError("The apitera answer for this episode listed no downloadable files.")
     duration = _int(first(raw, "duration", "seconds", "total_duration")) or max(
@@ -897,10 +1040,14 @@ def item_from_dict(raw: dict, section: str, api: "ParcivApi | None" = None) -> P
     own_media = (media_url(raw, "media", "mediaUrl", "play_url", "playUrl", "video_url",
                            "videoUrl")
                  or find_media_url(raw))
-    if own_media and any(host in own_media for host in PARCIV_HOSTS):
-        own_media = ""  # An API link is a lookup call, not the file.
+    if own_media and not is_downloadable_url(own_media):
+        own_media = ""  # An API page link is a lookup call, not the file.
     post_url = url_value(raw, "url", "link", "endpoint", "href")
     if post_url and not post_url.startswith(api.root if api else "https://"):
+        post_url = ""
+    if post_url and is_downloadable_url(post_url):
+        # The link the entry carries is the file itself, not a page to look up.
+        own_media = own_media or post_url
         post_url = ""
     if not post_url:
         path = _text(first(raw, "path", "endpoint_path", "permalink_path"), 200)
